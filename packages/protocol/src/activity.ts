@@ -15,9 +15,10 @@ export const ActivityRecordSchema = z
     startedAt: z.string().max(64),
     endedAt: z.string().max(64).nullable(),
     code: z.string().max(40).nullable(),
-    url: z.string().transform(redactUrl).pipe(z.string().max(2048)).nullable(),
+    url: z.string().max(4096).transform(redactUrl).pipe(z.string().max(2048)).nullable(),
     title: z
       .string()
+      .max(4096)
       .transform((value) => boundedText(value, 200))
       .pipe(z.string().max(200))
       .nullable(),

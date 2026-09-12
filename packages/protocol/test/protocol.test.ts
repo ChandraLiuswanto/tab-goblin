@@ -295,6 +295,34 @@ describe("privacy-safe diagnostics", () => {
     expect(record.title?.endsWith(ELLIPSIS)).toBe(true);
   });
 
+  it.each([
+    {
+      field: "url",
+      url: "https://example.com/a?" + "q".repeat(4097),
+      title: null,
+    },
+    {
+      field: "title",
+      url: null,
+      title: C1_CSI.repeat(4097),
+    },
+  ])("rejects oversized raw activity $field before sanitizing", ({ url, title }) => {
+    expect(
+      ActivityRecordSchema.safeParse({
+        operationId: "op1",
+        source: "agent:a1",
+        tabId: "t1",
+        action: "navigate",
+        status: "ok",
+        startedAt: "2026-09-12T00:00:00.000Z",
+        endedAt: null,
+        code: null,
+        url,
+        title,
+      }).success,
+    ).toBe(false);
+  });
+
   it("keeps network diagnostics body-free and redacts their URL", () => {
     expect(
       NetworkDiagnosticSchema.parse({

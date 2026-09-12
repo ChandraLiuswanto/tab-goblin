@@ -2,7 +2,6 @@ import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, mkdirSync, open
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createTabGoblinSettingsSchema, type ConnectionDefaults, type TabGoblinSettings } from "../shared/settings.js";
-import { deriveServerConnectionDefaults } from "./defaults.js";
 
 const CONFIG_FILE = "settings.json";
 const OWNER_DIRECTORY_MODE = 0o700;
@@ -118,7 +117,7 @@ export interface ConfigStore {
 }
 
 /** Synchronous load guarantees hooks have a durable fail-closed value at registration time. */
-export function createConfigStore(directory = appDirectory(), connectionDefaults: ConnectionDefaults = deriveServerConnectionDefaults()): ConfigStore {
+export function createConfigStore(directory = appDirectory(), connectionDefaults: ConnectionDefaults): ConfigStore {
   const settingsSchema = createTabGoblinSettingsSchema(connectionDefaults);
   const defaults = settingsSchema.parse({});
   const absoluteDirectory = resolve(directory);

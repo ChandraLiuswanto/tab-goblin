@@ -19,10 +19,22 @@ npm run build
 ./deploy/test-image.sh
 ```
 
-Configure Paseo to load `~/paseo-plugins/tab-goblin/plugin` from this checkout. If
-that checkout moves, rebuild it and update both the Paseo plugin location and the
-service `WorkingDirectory` together. The plugin fails with an actionable build error
-rather than launching an unusable MCP command when the bridge artifact is absent.
+Configure Paseo to load `~/paseo-plugins/tab-goblin/plugin` from this checkout.
+Paseo 0.8 compiles server plugins to a cached CJS bundle, so a bundled module filename
+cannot identify that checkout. Set this required, absolute path in the environment of
+the **Paseo server/daemon process** before loading or reloading the plugin:
+
+```bash
+export TABGOBLIN_INSTALL_ROOT="$HOME/paseo-plugins/tab-goblin"
+```
+
+Persist the same variable in the service manager, desktop launcher, or shell profile
+that starts your Paseo daemon, then restart that daemon and reload TabGoblin. The
+plugin validates that this path contains `plugin/paseo-plugin.json` and the built
+`packages/mcp-bridge/dist/index.js`; it fails with an actionable error rather than
+launching an unusable MCP command. If the checkout moves, rebuild it and update
+`TABGOBLIN_INSTALL_ROOT`, the Paseo plugin location, and the gateway service
+`WorkingDirectory` together.
 
 The smoke test uses a dedicated temporary Podman volume and publishes CDP and RFB only
 on `127.0.0.1`; it removes its test container and volume when it exits. It does not

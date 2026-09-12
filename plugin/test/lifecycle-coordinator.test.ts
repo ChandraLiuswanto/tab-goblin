@@ -5,10 +5,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { EnrollmentRegistry } from "../../packages/gateway/src/enrollment.js";
 import { createConfigStore } from "../server/config-store.js";
 import { createLifecycleCoordinator } from "../server/lifecycle-coordinator.js";
+import { testConnectionDefaults } from "./connection-defaults.js";
 
 const directories: string[] = [];
 afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
-function store() { const directory = mkdtempSync(join(tmpdir(), "tabgoblin-lifecycle-")); directories.push(directory); return createConfigStore(directory); }
+function store() { const directory = mkdtempSync(join(tmpdir(), "tabgoblin-lifecycle-")); directories.push(directory); return createConfigStore(directory, testConnectionDefaults); }
 const unavailable = { ok: false as const, error: { code: "runtime_unavailable", message: "down", retryable: true } };
 
 describe("durable lifecycle coordinator", () => {
@@ -91,7 +92,7 @@ describe("durable lifecycle coordinator", () => {
     expect(settings.read().workspaceGenerations).toEqual({ ws: 7 });
     expect(settings.read().pendingRevocations).toEqual([{ kind: "workspace", id: "ws" }]);
     const secondGateway = { request: vi.fn().mockResolvedValue({ ok: true, lifecycleGeneration: 8 }), notify: vi.fn(), close: vi.fn() } as any;
-    const reloaded = createLifecycleCoordinator(createConfigStore(dirname(settings.path)), secondGateway);
+    const reloaded = createLifecycleCoordinator(createConfigStore(dirname(settings.path), testConnectionDefaults), secondGateway);
     await reloaded.replayPending();
     expect(secondGateway.request).toHaveBeenCalledWith({ op: "revoke-workspace", workspaceId: "ws" }, expect.any(Number));
     expect(reloaded.settings().pendingRevocations).toEqual([]);
@@ -153,7 +154,7 @@ describe("durable lifecycle coordinator", () => {
       revokedWorkspaceIds: ["revoked-workspace"],
     }));
     // Reopen the same durable config against a new, empty gateway process.
-    const settings = createConfigStore(dirname(initial.path));
+    const settings = createConfigStore(dirname(initial.path), testConnectionDefaults);
     const calls: any[] = [];
     const gateway = { request: vi.fn(async (body) => {
       calls.push(body);
@@ -270,7 +271,7 @@ describe("durable lifecycle coordinator", () => {
     expect(initial.read()).toMatchObject({ rotatingAgentIds: ["agent"], rotatingWorkspaceIds: ["ws"], revokedWorkspaceIds: ["archived"] });
 
     // Reload preserves only the cleanup rotation, then admits a fresh nonce.
-    const settings = createConfigStore(dirname(initial.path));
+    const settings = createConfigStore(dirname(initial.path), testConnectionDefaults);
     const coordinator = createLifecycleCoordinator(settings, gateway);
     await expect(coordinator.openSession({ agentId: "agent", workspaceId: "ws", cwd: "/w", purpose: "interactive", enrollment: "22222222-2222-4222-8222-222222222222" })).resolves.toMatchObject({ agentGeneration: 8, workspaceGeneration: 9 });
     expect(calls).toContainEqual({ op: "record-enrollment", enrollment: "22222222-2222-4222-8222-222222222222", cwd: "/w", workspaceId: "ws", workspaceGeneration: 9 });

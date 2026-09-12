@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createConfigStore } from "../server/config-store.js";
 import { createGatewayManager } from "../server/gateway-client.js";
 import { createLifecycleCoordinator } from "../server/lifecycle-coordinator.js";
+import { testConnectionDefaults } from "./connection-defaults.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { await Promise.all(cleanups.splice(0).map((cleanup) => cleanup())); });
@@ -39,7 +40,7 @@ describe("transactional socket reconfiguration", () => {
     const missingPath = join(directory, "missing.sock");
     const oldEvents: string[] = [];
     const oldServer = await unixServer(oldPath, oldEvents);
-    const settings = createConfigStore(join(directory, "config"));
+    const settings = createConfigStore(join(directory, "config"), testConnectionDefaults);
     await settings.update((current) => ({ ...current, socketPath: oldPath, viewerUrl: "https://old-viewer.test/", workspaceGenerations: { ws: 3 } }));
     const manager = createGatewayManager(() => oldPath);
     const coordinator = createLifecycleCoordinator(settings, manager);
@@ -60,7 +61,7 @@ describe("transactional socket reconfiguration", () => {
     const newEvents: string[] = [];
     const oldServer = await unixServer(oldPath, oldEvents);
     const newServer = await unixServer(newPath, newEvents);
-    const settings = createConfigStore(join(directory, "config"));
+    const settings = createConfigStore(join(directory, "config"), testConnectionDefaults);
     await settings.update((current) => ({ ...current, socketPath: oldPath, viewerUrl: "https://old-viewer.test/", workspaceGenerations: { ws: 3 } }));
     const manager = createGatewayManager(() => oldPath);
     const coordinator = createLifecycleCoordinator(settings, manager);

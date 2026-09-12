@@ -10,6 +10,7 @@ import { createGatewayManager } from "../server/gateway-client.js";
 import { createHandlers } from "../server/handlers.js";
 import { createLifecycleCoordinator } from "../server/lifecycle-coordinator.js";
 import { configRpc, enableWorkspaceRpc, setGlobalEnabledRpc, tabsRpc, updateConnectionRpc } from "../shared/rpc.js";
+import { testConnectionDefaults } from "./connection-defaults.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
@@ -41,7 +42,7 @@ async function harness() {
   const admin = createAdminServer({ services: services as never, enrollment: new EnrollmentRegistry(), socketPath });
   await admin.listen();
   const gateway = createGatewayManager(() => socketPath);
-  const settings = createConfigStore(join(directory, "config"));
+  const settings = createConfigStore(join(directory, "config"), testConnectionDefaults);
   await settings.update((current) => ({ ...current, socketPath }));
   const lifecycle = createLifecycleCoordinator(settings, gateway);
   const handlers = createHandlers(gateway, lifecycle);

@@ -15,7 +15,7 @@ export function cleanupPlugin(cleanupHooks: () => void, lifecycle: Pick<Lifecycl
 }
 
 export default function contribute(server: PluginServerContext) {
-  const settings = createConfigStore(undefined, deriveServerConnectionDefaults({ entrypointUrl: import.meta.url }));
+  const settings = createConfigStore(undefined, deriveServerConnectionDefaults());
   const gateway = createGatewayManager(() => settings.read().socketPath);
   const lifecycle = createLifecycleCoordinator(settings, gateway);
   void lifecycle.replayPending();

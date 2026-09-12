@@ -1,7 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { createConfigStore } from "../server/config-store.js";
 import { deriveServerConnectionDefaults } from "../server/defaults.js";
@@ -12,36 +11,39 @@ function directory() { const value = mkdtempSync(join(tmpdir(), "tabgoblin-defau
 
 function installedCheckout() {
   const root = directory();
-  const entrypoint = join(root, "plugin", "bundle", "server", "index.server.js");
   const bridge = join(root, "packages", "mcp-bridge", "dist", "index.js");
-  mkdirSync(join(root, "plugin", "bundle", "server"), { recursive: true });
+  mkdirSync(join(root, "plugin"), { recursive: true });
   mkdirSync(join(root, "packages", "mcp-bridge", "dist"), { recursive: true });
   writeFileSync(join(root, "plugin", "paseo-plugin.json"), "{}\n");
   writeFileSync(bridge, "#!/usr/bin/env node\n");
-  return { root, entrypoint, bridge };
+  return { root, bridge };
 }
 
 describe("server-owned connection defaults", () => {
-  it("derives the Node bridge and runtime socket from an installed plugin entrypoint", () => {
-    const { entrypoint, bridge } = installedCheckout();
-    expect(deriveServerConnectionDefaults({ entrypointUrl: pathToFileURL(entrypoint).href, xdgRuntimeDir: "/run/user/123" })).toEqual({
+  it("derives the Node bridge and runtime socket from the explicit checkout root", () => {
+    const { root, bridge } = installedCheckout();
+    expect(deriveServerConnectionDefaults({ installRoot: root, xdgRuntimeDir: "/run/user/123" })).toEqual({
       bridgeCommand: process.execPath,
       bridgeArgs: [bridge],
       socketPath: "/run/user/123/tabgoblin/gateway.sock",
     });
   });
 
+  it("rejects a missing or relative configured installation root", () => {
+    expect(() => deriveServerConnectionDefaults({ xdgRuntimeDir: "/run/user/123" })).toThrow(/TABGOBLIN_INSTALL_ROOT/);
+    expect(() => deriveServerConnectionDefaults({ installRoot: "relative-checkout", xdgRuntimeDir: "/run/user/123" })).toThrow(/TABGOBLIN_INSTALL_ROOT/);
+  });
+
   it("fails clearly when the stable checkout layout has not been built", () => {
     const root = directory();
-    const entrypoint = join(root, "plugin", "bundle", "index.server.js");
-    mkdirSync(join(root, "plugin", "bundle"), { recursive: true });
+    mkdirSync(join(root, "plugin"), { recursive: true });
     writeFileSync(join(root, "plugin", "paseo-plugin.json"), "{}\n");
-    expect(() => deriveServerConnectionDefaults({ entrypointUrl: pathToFileURL(entrypoint).href, xdgRuntimeDir: "/run/user/123" })).toThrow(/npm run build/i);
+    expect(() => deriveServerConnectionDefaults({ installRoot: root, xdgRuntimeDir: "/run/user/123" })).toThrow(/npm run build/i);
   });
 
   it("uses derived defaults on a clean install and never replaces a saved connection choice", async () => {
-    const { entrypoint, bridge } = installedCheckout();
-    const initial = deriveServerConnectionDefaults({ entrypointUrl: pathToFileURL(entrypoint).href, xdgRuntimeDir: "/run/user/123" });
+    const { root, bridge } = installedCheckout();
+    const initial = deriveServerConnectionDefaults({ installRoot: root, xdgRuntimeDir: "/run/user/123" });
     const configDirectory = directory();
     const store = createConfigStore(configDirectory, initial);
     expect(store.read()).toMatchObject({ ...initial, enabled: false });

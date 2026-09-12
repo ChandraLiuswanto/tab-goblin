@@ -15,6 +15,7 @@ import { createGatewayManager } from "../server/gateway-client.js";
 import { createHandlers } from "../server/handlers.js";
 import { createLifecycleCoordinator } from "../server/lifecycle-coordinator.js";
 import { activityRpc } from "../shared/rpc.js";
+import { testConnectionDefaults } from "./connection-defaults.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { await Promise.allSettled(cleanups.splice(0).reverse().map((cleanup) => cleanup())); });
@@ -55,7 +56,7 @@ describe("manual transition activity integration", () => {
     const port = await viewer.listen();
     const base = `http://127.0.0.1:${port}`;
     const gateway = createGatewayManager(() => socketPath);
-    const config = createConfigStore(join(directory, "config"));
+    const config = createConfigStore(join(directory, "config"), testConnectionDefaults);
     await config.update((current) => ({ ...current, socketPath }));
     const handlers = createHandlers(gateway, createLifecycleCoordinator(config, gateway));
     const context = { paseo: { workspaces: { list: async () => ({ entries: [{ id: "ws-1", workspaceDirectory: "/w/one" }] }) } } } as any;

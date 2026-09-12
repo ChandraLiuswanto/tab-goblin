@@ -26,6 +26,7 @@ export const AdminRequestSchema = z.discriminatedUnion("op", [
   z
     .object({
       op: z.literal("tool"),
+      enrollment,
       workspaceId,
       name: z.enum(TOOL_NAMES),
       input: z.record(z.string(), z.unknown()),
@@ -51,6 +52,8 @@ export const AdminRequestSchema = z.discriminatedUnion("op", [
       purpose: z.enum(["interactive", "history"]),
     })
     .strict(),
+  z.object({ op: z.literal("revoke-agent"), agentId }).strict(),
+  z.object({ op: z.literal("revoke-workspace"), workspaceId }).strict(),
 ]);
 export type AdminRequest = z.infer<typeof AdminRequestSchema>;
 

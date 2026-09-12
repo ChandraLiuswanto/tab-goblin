@@ -381,6 +381,37 @@ describe("admin and viewer wire contracts", () => {
     ).toBe(true);
   });
 
+  it("requires a scoped enrollment credential for tools and exposes explicit revocation ops", () => {
+    const enrollment = "11111111-1111-4111-8111-111111111111";
+    expect(
+      AdminRequestSchema.safeParse({
+        op: "tool",
+        enrollment,
+        workspaceId: "w1",
+        name: "tabgoblin_status",
+        input: {},
+        source: "agent:spoofed",
+      }).success,
+    ).toBe(true);
+    expect(
+      AdminRequestSchema.safeParse({
+        op: "tool",
+        workspaceId: "w1",
+        name: "tabgoblin_status",
+        input: {},
+        source: "agent:a1",
+      }).success,
+    ).toBe(false);
+    expect(AdminRequestSchema.parse({ op: "revoke-agent", agentId: "a1" })).toEqual({
+      op: "revoke-agent",
+      agentId: "a1",
+    });
+    expect(AdminRequestSchema.parse({ op: "revoke-workspace", workspaceId: "w1" })).toEqual({
+      op: "revoke-workspace",
+      workspaceId: "w1",
+    });
+  });
+
   it("validates pairing and viewer sessions", () => {
     expect(PairRequestSchema.safeParse({ code: "short" }).success).toBe(false);
     expect(

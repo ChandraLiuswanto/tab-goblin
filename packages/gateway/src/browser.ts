@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { posix as path } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
@@ -22,6 +23,7 @@ import {
   errors,
   type Browser,
   type BrowserContext,
+  type CDPSession,
   type Locator,
   type Page,
 } from "playwright-core";
@@ -167,6 +169,7 @@ export function buildSnapshot(raw: RawSnapshot, tabId: string): Snapshot {
 export class BrowserSession {
   private readonly tabs = new Map<string, TabState>();
   private readonly pageIds = new WeakMap<Page, string>();
+  private readonly tabPrefix = randomUUID();
   private tabCounter = 0;
   private revision = 0;
   private activeTabId: string | null = null;
@@ -269,17 +272,11 @@ export class BrowserSession {
   }
 
   async back(tabId: string, timeoutMs: number, signal?: AbortSignal): Promise<Tab> {
-    const timeout = requireTimeout(timeoutMs);
-    return this.navigateOperation(tabId, timeout, signal, (page, deadline) =>
-      page.goBack({ waitUntil: "load", timeout: this.remaining(deadline) }),
-    );
+    return this.navigateHistory(tabId, -1, requireTimeout(timeoutMs), signal);
   }
 
   async forward(tabId: string, timeoutMs: number, signal?: AbortSignal): Promise<Tab> {
-    const timeout = requireTimeout(timeoutMs);
-    return this.navigateOperation(tabId, timeout, signal, (page, deadline) =>
-      page.goForward({ waitUntil: "load", timeout: this.remaining(deadline) }),
-    );
+    return this.navigateHistory(tabId, 1, requireTimeout(timeoutMs), signal);
   }
 
   async reload(tabId: string, timeoutMs: number, signal?: AbortSignal): Promise<Tab> {
@@ -396,7 +393,36 @@ export class BrowserSession {
     return this.withDeadline(DEFAULT_TIMEOUT_MS, signal, async () => {
       const state = this.getTab(tabId);
       this.activate(tabId);
-      await (await this.resolveRef(state, safeRef)).setInputFiles(safePath);
+      await this.resolveRef(state, safeRef);
+
+      const cdp = await this.context.newCDPSession(state.page);
+      try {
+        const { root } = await cdp.send("DOM.getDocument", { depth: 0, pierce: false });
+        const { nodeId } = await cdp.send("DOM.querySelector", {
+          nodeId: root.nodeId,
+          selector: `[data-tg-ref="${safeRef}"]`,
+        });
+        if (!nodeId) throw tabGoblinError("stale_ref", "The element reference is stale", false);
+
+        const { node } = await cdp.send("DOM.describeNode", { nodeId });
+        const attributes = node.attributes ?? [];
+        let inputType = "";
+        for (let index = 0; index < attributes.length; index += 2) {
+          if (attributes[index].toLowerCase() === "type") {
+            inputType = (attributes[index + 1] ?? "").toLowerCase();
+          }
+        }
+        if (node.nodeName.toUpperCase() !== "INPUT" || inputType !== "file") {
+          throw invalid("The upload reference must resolve to a file input");
+        }
+
+        // CDP makes Chromium resolve the path in its own container. Recheck the
+        // snapshot generation immediately before the one file-input mutation.
+        this.assertCurrentRef(state, safeRef);
+        await cdp.send("DOM.setFileInputFiles", { files: [safePath], nodeId });
+      } finally {
+        await cdp.detach().catch(() => undefined);
+      }
     });
   }
 
@@ -446,7 +472,7 @@ export class BrowserSession {
     if (existingId) return this.tabs.get(existingId)!;
 
     this.tabCounter += 1;
-    const id = `t${this.tabCounter}`;
+    const id = `t${this.tabPrefix}-${this.tabCounter}`;
     if (id.length > TAB_ID_LIMIT) throw tabGoblinError("runtime_unavailable", "Too many browser tabs");
     const state: TabState = { id, page, logs: [], network: [] };
     this.tabs.set(id, state);
@@ -529,7 +555,7 @@ export class BrowserSession {
     return this.revision;
   }
 
-  private async resolveRef(state: TabState, refValue: string): Promise<Locator> {
+  private assertCurrentRef(state: TabState, refValue: string): void {
     const ref = parseRef(refValue);
     if (
       !ref ||
@@ -539,7 +565,10 @@ export class BrowserSession {
     ) {
       throw tabGoblinError("stale_ref", "The element reference is stale", false);
     }
+  }
 
+  private async resolveRef(state: TabState, refValue: string): Promise<Locator> {
+    this.assertCurrentRef(state, refValue);
     const locator = state.page.locator(`[data-tg-ref="${refValue}"]`);
     const count = await locator.count();
     if (count !== 1) {
@@ -636,6 +665,112 @@ export class BrowserSession {
     return candidate;
   }
 
+  private async navigateHistory(
+    tabId: string,
+    delta: -1 | 1,
+    timeoutMs: number,
+    signal: AbortSignal | undefined,
+  ): Promise<Tab> {
+    let interruptNavigation: (() => void) | undefined;
+    return this.withDeadline(timeoutMs, signal, async (deadline) => {
+      const state = this.getTab(tabId);
+      this.activate(tabId);
+      this.invalidateRefs();
+      const cdp = await this.context.newCDPSession(state.page);
+      try {
+        await cdp.send("Page.enable");
+        const [{ frameTree }, history] = await Promise.all([
+          cdp.send("Page.getFrameTree"),
+          cdp.send("Page.getNavigationHistory"),
+        ]);
+        const target = history.entries[history.currentIndex + delta];
+        if (!target) return this.describeTab(state);
+        await this.navigateToHistoryEntry(
+          cdp,
+          frameTree.frame.id,
+          target.id,
+          target.url,
+          deadline,
+          signal,
+          (handler) => {
+            interruptNavigation = handler;
+          },
+        );
+        return this.describeTab(state);
+      } finally {
+        await cdp.detach().catch(() => undefined);
+      }
+    }, () => interruptNavigation?.());
+  }
+
+  private navigateToHistoryEntry(
+    cdp: CDPSession,
+    mainFrameId: string,
+    entryId: number,
+    targetUrl: string,
+    deadline: number,
+    signal: AbortSignal | undefined,
+    registerInterrupt: (handler: (() => void) | undefined) => void,
+  ): Promise<void> {
+    const timeout = this.remaining(deadline);
+    if (signal?.aborted) throw uncertain();
+
+    return new Promise<void>((resolve, reject) => {
+      let commandCompleted = false;
+      let navigationCompleted = false;
+      let settled = false;
+      const finish = (error?: unknown): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        cdp.off("Page.frameNavigated", onFrameNavigated);
+        cdp.off("Page.navigatedWithinDocument", onWithinDocument);
+        cdp.off("close", onClose);
+        signal?.removeEventListener("abort", onAbort);
+        registerInterrupt(undefined);
+        if (error) reject(error);
+        else resolve();
+      };
+      const maybeFinish = (): void => {
+        if (commandCompleted && navigationCompleted) finish();
+      };
+      const onFrameNavigated = (event: {
+        frame: { id: string; url: string };
+      }): void => {
+        if (event.frame.id === mainFrameId && event.frame.url === targetUrl) {
+          navigationCompleted = true;
+          maybeFinish();
+        }
+      };
+      const onWithinDocument = (event: { frameId: string; url: string }): void => {
+        if (event.frameId === mainFrameId && event.url === targetUrl) {
+          navigationCompleted = true;
+          maybeFinish();
+        }
+      };
+      const onClose = (): void =>
+        finish(tabGoblinError("runtime_unavailable", "The browser operation failed", false));
+      const onAbort = (): void => finish(uncertain());
+      const timer = setTimeout(() => finish(uncertain()), timeout);
+
+      registerInterrupt(() => finish(uncertain()));
+      cdp.on("Page.frameNavigated", onFrameNavigated);
+      cdp.on("Page.navigatedWithinDocument", onWithinDocument);
+      cdp.on("close", onClose);
+      signal?.addEventListener("abort", onAbort, { once: true });
+
+      // Listeners are installed before the sole mutating command so synchronous
+      // same-document and BFCache completion events cannot be missed.
+      void cdp.send("Page.navigateToHistoryEntry", { entryId }).then(
+        () => {
+          commandCompleted = true;
+          maybeFinish();
+        },
+        (error: unknown) => finish(error),
+      );
+    });
+  }
+
   private async navigateOperation(
     tabId: string,
     timeoutMs: number,
@@ -671,6 +806,7 @@ export class BrowserSession {
     timeoutMs: number,
     signal: AbortSignal | undefined,
     operation: (deadline: number) => Promise<T>,
+    onInterrupt?: () => void,
   ): Promise<T> {
     const deadline = performance.now() + timeoutMs;
     if (signal?.aborted) throw uncertain();
@@ -678,9 +814,13 @@ export class BrowserSession {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let abort: (() => void) | undefined;
     const interrupted = new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => reject(uncertain()), Math.max(1, deadline - performance.now()));
+      const interrupt = (): void => {
+        onInterrupt?.();
+        reject(uncertain());
+      };
+      timer = setTimeout(interrupt, Math.max(1, deadline - performance.now()));
       if (signal) {
-        abort = () => reject(uncertain());
+        abort = interrupt;
         signal.addEventListener("abort", abort, { once: true });
       }
     });

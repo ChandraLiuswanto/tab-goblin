@@ -90,8 +90,75 @@ class FakePage {
   }
 }
 
+class FakeCDPSession {
+  private readonly handlers = new Map<string, Array<(value: any) => void>>();
+  currentIndex = 2;
+  navigationEvent: "Page.frameNavigated" | "Page.navigatedWithinDocument" | null =
+    "Page.frameNavigated";
+  readonly entries = [
+    { id: 10, url: "https://example.test/first", title: "First" },
+    { id: 11, url: "https://example.test/second", title: "Second" },
+    { id: 12, url: "https://example.test/third", title: "Third" },
+  ];
+  readonly send = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+    if (method === "Page.enable") return {};
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "main" } } };
+    if (method === "Page.getNavigationHistory") {
+      return { currentIndex: this.currentIndex, entries: this.entries };
+    }
+    if (method === "Page.navigateToHistoryEntry") {
+      const index = this.entries.findIndex((entry) => entry.id === params?.entryId);
+      if (index >= 0) this.currentIndex = index;
+      if (this.navigationEvent === "Page.frameNavigated") {
+        this.emit(this.navigationEvent, {
+          frame: { id: "main", url: this.entries[this.currentIndex].url },
+          type: "BackForwardCacheRestore",
+        });
+      } else if (this.navigationEvent === "Page.navigatedWithinDocument") {
+        this.emit(this.navigationEvent, {
+          frameId: "main",
+          url: this.entries[this.currentIndex].url,
+          navigationType: "historyApi",
+        });
+      }
+      return {};
+    }
+    if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
+    if (method === "DOM.querySelector") return { nodeId: 2 };
+    if (method === "DOM.describeNode") {
+      return { node: { nodeName: "INPUT", attributes: ["id", "file", "type", "file"] } };
+    }
+    if (method === "DOM.setFileInputFiles") return {};
+    throw new Error(`Unexpected CDP method ${method}`);
+  });
+  readonly detach = vi.fn(async () => undefined);
+
+  on(event: string, handler: (value: any) => void): this {
+    const handlers = this.handlers.get(event) ?? [];
+    handlers.push(handler);
+    this.handlers.set(event, handlers);
+    return this;
+  }
+
+  off(event: string, handler: (value: any) => void): this {
+    const handlers = this.handlers.get(event) ?? [];
+    this.handlers.set(event, handlers.filter((candidate) => candidate !== handler));
+    return this;
+  }
+
+  emit(event: string, value: any): void {
+    for (const handler of this.handlers.get(event) ?? []) handler(value);
+  }
+
+  listenerCount(): number {
+    return [...this.handlers.values()].reduce((count, handlers) => count + handlers.length, 0);
+  }
+}
+
 class FakeContext {
   private readonly handlers = new Map<string, Array<(page: Page) => void>>();
+  readonly cdp = new FakeCDPSession();
+  readonly newCDPSession = vi.fn(async () => this.cdp);
 
   constructor(readonly pageList: FakePage[]) {}
 
@@ -282,11 +349,11 @@ describe("BrowserSession at the Playwright boundary", () => {
     expect(page.locator).not.toHaveBeenCalled();
   });
 
-  it("bounds text and evaluation results, screenshots, and accepts only controlled uploads", async () => {
+  it("bounds text and evaluation results, screenshots, and sends only controlled uploads to Chromium", async () => {
     const page = new FakePage();
     page.bodyText = "a".repeat(200);
     page.evaluateResults.push(raw(1), JSON.stringify({ value: "x".repeat(300) }));
-    const { session } = sessionWith(page);
+    const { context, session } = sessionWith(page);
     const [{ tabId: tab }] = await session.listTabs();
     const ref = (await session.snapshot(tab)).nodes[0].ref;
 
@@ -297,7 +364,123 @@ describe("BrowserSession at the Playwright boundary", () => {
       base64: Buffer.from("png").toString("base64"),
     });
     await session.upload(tab, ref, "/staging/report.txt");
-    expect(page.locatorObject.setInputFiles).toHaveBeenCalledWith("/staging/report.txt");
+    expect(context.cdp.send).toHaveBeenCalledWith("DOM.setFileInputFiles", {
+      files: ["/staging/report.txt"],
+      nodeId: 2,
+    });
+    expect(page.locatorObject.setInputFiles).not.toHaveBeenCalled();
+    expect(context.cdp.detach).toHaveBeenCalledOnce();
+  });
+
+  it("requires a fresh ref resolving to an actual file input before CDP upload", async () => {
+    const page = new FakePage();
+    page.evaluateResults.push(raw(1), raw(2));
+    const { context, session } = sessionWith(page);
+    const [{ tabId: tab }] = await session.listTabs();
+    const ref = (await session.snapshot(tab)).nodes[0].ref;
+    context.cdp.send.mockImplementation(async (method: string) => {
+      if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
+      if (method === "DOM.querySelector") return { nodeId: 2 };
+      if (method === "DOM.describeNode") return { node: { nodeName: "DIV", attributes: [] } };
+      if (method === "DOM.setFileInputFiles") return {};
+      throw new Error(`Unexpected CDP method ${method}`);
+    });
+
+    await expect(session.upload(tab, ref, "/staging/report.txt")).rejects.toMatchObject({
+      code: "invalid_input",
+    });
+    expect(context.cdp.send).not.toHaveBeenCalledWith("DOM.setFileInputFiles", expect.anything());
+
+    await session.snapshot(tab);
+    await expect(session.upload(tab, ref, "/staging/report.txt")).rejects.toMatchObject({
+      code: "stale_ref",
+    });
+  });
+
+  it.each(["Page.frameNavigated", "Page.navigatedWithinDocument"] as const)(
+    "handles synchronous %s history completion with exactly one CDP mutation",
+    async (navigationEvent) => {
+      const page = new FakePage();
+      const { context, session } = sessionWith(page);
+      context.cdp.navigationEvent = navigationEvent;
+      const [{ tabId: tab }] = await session.listTabs();
+
+      await expect(session.back(tab, 1000)).resolves.toMatchObject({ tabId: tab });
+      expect(context.cdp.send).toHaveBeenCalledWith("Page.navigateToHistoryEntry", {
+        entryId: 11,
+      });
+      expect(
+        context.cdp.send.mock.calls.filter(([method]) => method === "Page.navigateToHistoryEntry"),
+      ).toHaveLength(1);
+      expect(page.goBack).not.toHaveBeenCalled();
+      expect(context.cdp.listenerCount()).toBe(0);
+      expect(context.cdp.detach).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("returns a history-boundary no-op without issuing a CDP mutation", async () => {
+    const page = new FakePage();
+    const { context, session } = sessionWith(page);
+    context.cdp.currentIndex = 0;
+    const [{ tabId: tab }] = await session.listTabs();
+
+    await expect(session.back(tab, 1000)).resolves.toMatchObject({ tabId: tab });
+    expect(context.cdp.send).not.toHaveBeenCalledWith(
+      "Page.navigateToHistoryEntry",
+      expect.anything(),
+    );
+    expect(context.cdp.listenerCount()).toBe(0);
+  });
+
+  it("cleans CDP history listeners at the deadline without replaying the uncertain mutation", async () => {
+    const page = new FakePage();
+    const { context, session } = sessionWith(page);
+    context.cdp.navigationEvent = null;
+    const [{ tabId: tab }] = await session.listTabs();
+
+    await expect(session.back(tab, 1000)).rejects.toMatchObject({
+      code: "timeout_uncertain",
+      retryable: false,
+    });
+    expect(context.cdp.listenerCount()).toBe(0);
+    expect(context.cdp.detach).toHaveBeenCalledOnce();
+    expect(
+      context.cdp.send.mock.calls.filter(([method]) => method === "Page.navigateToHistoryEntry"),
+    ).toHaveLength(1);
+  });
+
+  it("cleans CDP history listeners on abort without replaying the uncertain mutation", async () => {
+    const page = new FakePage();
+    const { context, session } = sessionWith(page);
+    context.cdp.navigationEvent = null;
+    const [{ tabId: tab }] = await session.listTabs();
+    const controller = new AbortController();
+    const navigation = session.back(tab, 30_000, controller.signal);
+    await vi.waitFor(() => {
+      expect(context.cdp.send).toHaveBeenCalledWith("Page.navigateToHistoryEntry", {
+        entryId: 11,
+      });
+    });
+    controller.abort();
+
+    await expect(navigation).rejects.toMatchObject({ code: "timeout_uncertain", retryable: false });
+    await vi.waitFor(() => expect(context.cdp.listenerCount()).toBe(0));
+    expect(
+      context.cdp.send.mock.calls.filter(([method]) => method === "Page.navigateToHistoryEntry"),
+    ).toHaveLength(1);
+  });
+
+  it("uses bounded session-scoped tab IDs that cannot alias on fresh attachment", async () => {
+    const first = sessionWith(new FakePage()).session;
+    const second = sessionWith(new FakePage()).session;
+    const [firstId] = (await first.listTabs()).map(({ tabId }) => tabId);
+    const [secondId] = (await second.listTabs()).map(({ tabId }) => tabId);
+
+    expect(firstId).not.toBe(secondId);
+    expect(firstId).toMatch(/^t[0-9a-f-]+-1$/);
+    expect(secondId).toMatch(/^t[0-9a-f-]+-1$/);
+    expect(firstId.length).toBeLessThanOrEqual(64);
+    expect(secondId.length).toBeLessThanOrEqual(64);
   });
 
   it("maps Playwright timeouts once without retrying or exposing raw errors", async () => {
@@ -654,6 +837,56 @@ describeLive(
 
       const second = await session!.newTab(`${fixtureUrl}/account`);
       expect(await session!.text(second.tabId, 1000)).toContain("Signed in as grace");
+    });
+
+    it("completes meaningful static history back and forward in the real runtime", async () => {
+      const tab = await session!.newTab(`${fixtureUrl}/`);
+      await session!.navigate(tab.tabId, `${fixtureUrl}/login`, 5000);
+      await session!.navigate(tab.tabId, `${fixtureUrl}/upload`, 5000);
+
+      await expect(session!.back(tab.tabId, 5000)).resolves.toMatchObject({
+        title: "Sign in",
+        url: `${fixtureUrl}/login`,
+      });
+      await expect(session!.forward(tab.tabId, 5000)).resolves.toMatchObject({
+        title: "Upload",
+        url: `${fixtureUrl}/upload`,
+      });
+    });
+
+    it("uploads a file staged inside the real rootless container", async () => {
+      const hostPath = join(temporaryDirectory!, "meaningful-upload.txt");
+      await writeFile(hostPath, "rootless container upload\n");
+      await requirePodman([
+        "cp",
+        hostPath,
+        `${containerName}:/staging/meaningful-upload.txt`,
+      ]);
+      const tab = await session!.newTab(`${fixtureUrl}/upload`);
+      const snapshot = await session!.snapshot(tab.tabId);
+      const file = snapshot.nodes.find((node) => node.name === "file")!;
+      const send = snapshot.nodes.find((node) => node.name === "Send")!;
+
+      expect(file).toBeTruthy();
+      expect(send).toBeTruthy();
+      await session!.upload(tab.tabId, file.ref, "/staging/meaningful-upload.txt");
+      await session!.act(tab.tabId, {
+        kind: "click",
+        ref: send.ref,
+        timeoutMs: 5000,
+      });
+      expect(await session!.text(tab.tabId, 1000)).toContain("meaningful-upload.txt");
+    });
+
+    it("never aliases tab IDs after a fresh attachment to the real runtime", async () => {
+      const oldIds = new Set((await session!.listTabs()).map(({ tabId }) => tabId));
+      const fresh = await BrowserSession.attach((await supervisor!.start(workspaceId)).cdpUrl);
+      const freshIds = (await fresh.listTabs()).map(({ tabId }) => tabId);
+
+      expect(freshIds.length).toBeGreaterThan(0);
+      expect(freshIds.every((tabId) => !oldIds.has(tabId))).toBe(true);
+      await session!.close();
+      session = fresh;
     });
   },
 );

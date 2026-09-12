@@ -41,7 +41,6 @@ export class OwnershipController {
   private activeLease: ActiveLease | null = null;
   private drainWaiter: DrainWaiter | null = null;
   private readonly generationListeners = new Set<(generation: number) => void>();
-  private readonly now: () => number;
   private readonly drainTimeoutMs: number;
 
   constructor(options: { now?: () => number; drainTimeoutMs?: number } = {}) {
@@ -50,7 +49,6 @@ export class OwnershipController {
       throw new RangeError("drainTimeoutMs must be a non-negative safe integer");
     }
 
-    this.now = options.now ?? Date.now;
     this.drainTimeoutMs = drainTimeoutMs;
   }
 
@@ -204,9 +202,6 @@ export class OwnershipController {
   }
 
   private waitForDrain(lease: ActiveLease): Promise<DrainOutcome> {
-    const deadline = this.now() + this.drainTimeoutMs;
-    const delay = Math.max(0, deadline - this.now());
-
     return new Promise((resolve) => {
       let settled = false;
       const settle = (outcome: DrainOutcome): void => {
@@ -221,7 +216,7 @@ export class OwnershipController {
         }
         resolve(outcome);
       };
-      const timer = setTimeout(() => settle("timeout"), delay);
+      const timer = setTimeout(() => settle("timeout"), this.drainTimeoutMs);
       this.drainWaiter = { token: lease.token, settle };
     });
   }

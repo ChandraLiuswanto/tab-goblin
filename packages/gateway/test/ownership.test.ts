@@ -118,6 +118,22 @@ describe("taking control", () => {
     await expect(controller.returnToAgent()).rejects.toMatchObject({ code: "manual_control" });
   });
 
+  it("does not extend the configured drain timeout when the wall clock rolls backward", async () => {
+    vi.useFakeTimers();
+    const clockReadings = [1_000, -999_000];
+    const controller = new OwnershipController({
+      drainTimeoutMs: 15_000,
+      now: () => clockReadings.shift() ?? -999_000,
+    });
+    controller.acquireAgentLease("op-1");
+    const rejection = controller.requestTakeControl("viewer-1").catch((error: unknown) => error);
+
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    expect(controller.snapshot().state).toBe("needs-attention");
+    await expect(rejection).resolves.toMatchObject({ code: "timeout_uncertain" });
+  });
+
   it("fails the takeover immediately if the draining lease becomes uncertain", async () => {
     const controller = new OwnershipController({ drainTimeoutMs: 60_000 });
     const lease = controller.acquireAgentLease("op-1");

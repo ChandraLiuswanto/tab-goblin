@@ -2,6 +2,9 @@ import { z } from "zod";
 import { NETWORK_DIAGNOSTIC_LIMIT } from "./network.js";
 import { isNavigableUrl } from "./text.js";
 
+/** Maximum number of source bytes accepted by a single workspace upload. */
+export const MAX_UPLOAD_BYTES = 32 * 1024 * 1024;
+
 export const TOOL_NAMES = [
   "tabgoblin_status",
   "tabgoblin_start",

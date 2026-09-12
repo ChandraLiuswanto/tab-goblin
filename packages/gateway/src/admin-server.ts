@@ -8,6 +8,7 @@ import { performance } from "node:perf_hooks";
 import {
   AdminRequestSchema,
   AdminResponseSchema,
+  MAX_UPLOAD_BYTES,
   NetworkDiagnosticSchema,
   PROTOCOL_VERSION,
   SessionStatusSchema,
@@ -183,7 +184,8 @@ async function pinUpload(
       !opened.isFile() ||
       !sameInode(beforeOpen, opened) ||
       !Number.isSafeInteger(opened.size) ||
-      opened.size < 0
+      opened.size < 0 ||
+      opened.size > MAX_UPLOAD_BYTES
     ) {
       throw invalidInput();
     }
@@ -213,17 +215,19 @@ async function pinUpload(
     const buffer = Buffer.allocUnsafe(64 * 1024);
     let sourcePosition = 0;
     let destinationPosition = 0;
-    while (sourcePosition < opened.size) {
+    // Read to EOF instead of trusting the initial stat. The extra-byte probe
+    // catches a source that grows while its pinned descriptor is being copied.
+    while (sourcePosition <= MAX_UPLOAD_BYTES) {
       if (signal.aborted) throw signal.reason ?? timeoutFailure();
-      const bytesRemaining = opened.size - sourcePosition;
       const { bytesRead } = await source.read(
         buffer,
         0,
-        Math.min(buffer.length, bytesRemaining),
+        Math.min(buffer.length, MAX_UPLOAD_BYTES - sourcePosition + 1),
         sourcePosition,
       );
-      if (bytesRead === 0) throw invalidInput();
+      if (bytesRead === 0) break;
       sourcePosition += bytesRead;
+      if (sourcePosition > MAX_UPLOAD_BYTES) throw invalidInput();
       let written = 0;
       while (written < bytesRead) {
         if (signal.aborted) throw signal.reason ?? timeoutFailure();
@@ -242,6 +246,7 @@ async function pinUpload(
     const afterCopy = await source.stat();
     if (
       !sameInode(opened, afterCopy) ||
+      sourcePosition !== opened.size ||
       opened.size !== afterCopy.size ||
       opened.mtimeMs !== afterCopy.mtimeMs ||
       opened.ctimeMs !== afterCopy.ctimeMs

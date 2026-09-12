@@ -13,6 +13,7 @@ import {
   gatewayOperationTimeoutMs,
   gatewayTransportTimeoutMs,
   isNavigableUrl,
+  MAX_UPLOAD_BYTES,
   MCP_SERVER_NAME,
   NetworkDiagnosticSchema,
   NETWORK_DIAGNOSTIC_LIMIT,
@@ -42,6 +43,12 @@ const HIGH_SURROGATE = String.fromCharCode(0xd83d);
 const LOW_SURROGATE = String.fromCharCode(0xde00);
 const REPLACEMENT = String.fromCharCode(0xfffd);
 const ELLIPSIS = String.fromCharCode(8230);
+
+describe("upload limits", () => {
+  it("exports one conservative byte cap for upload implementations", () => {
+    expect(MAX_UPLOAD_BYTES).toBe(32 * 1024 * 1024);
+  });
+});
 
 describe("operation budgets", () => {
   it("keeps each outer transport budget above its bounded gateway operation", () => {

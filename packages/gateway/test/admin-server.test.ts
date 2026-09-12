@@ -1,9 +1,10 @@
 import { request as httpRequest } from "node:http";
-import { mkdtemp, mkdir, readFile, rename, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rename, stat, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createConnection } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MAX_UPLOAD_BYTES } from "@tab-goblin/protocol";
 import { ActivityFeed } from "../src/activity-feed.js";
 import { createAdminServer } from "../src/admin-server.js";
 import { EnrollmentRegistry } from "../src/enrollment.js";
@@ -475,6 +476,29 @@ describe("authenticated tool dispatch", () => {
     const escaped = await server.handle(tool("tabgoblin_upload", { tabId: "t1", ref: "r1-e0", path: "escape.txt" }));
     expect(escaped).toMatchObject({ ok: false, error: { code: "invalid_input" } });
     expect(runtime.stageFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an oversized sparse upload before runtime staging", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tg-upload-limit-"));
+    const workspace = join(root, "workspace");
+    const oversized = join(workspace, "oversized.bin");
+    await mkdir(workspace);
+    await writeFile(oversized, "");
+    await truncate(oversized, MAX_UPLOAD_BYTES + 1);
+
+    const { server, enrollment, runtime, session } = harness();
+    enroll(enrollment, { cwd: workspace });
+
+    await expect(server.handle(tool("tabgoblin_upload", {
+      tabId: "t1",
+      ref: "r1-e0",
+      path: "oversized.bin",
+    }))).resolves.toMatchObject({
+      ok: false,
+      error: { code: "invalid_input", retryable: false },
+    });
+    expect(runtime.stageFile).not.toHaveBeenCalled();
+    expect(session.upload).not.toHaveBeenCalled();
   });
 
   it("reauthorizes after the upload staging gap before browser upload", async () => {

@@ -240,11 +240,7 @@ export class BrowserSession {
       const page = await this.context.newPage();
       const state = this.registerPage(page);
       this.activate(state.id);
-      try {
-        await page.goto(safeUrl, { waitUntil: "load", timeout: this.remaining(deadline) });
-      } catch (error: unknown) {
-        throw this.mapBrowserError(error);
-      }
+      await page.goto(safeUrl, { waitUntil: "load", timeout: this.remaining(deadline) });
       return this.describeTab(state);
     });
   }
@@ -315,56 +311,52 @@ export class BrowserSession {
     return this.withDeadline(timeout, signal, async (deadline) => {
       const state = this.getTab(tabId);
       this.activate(tabId);
-      try {
-        switch (validated.kind) {
-          case "click":
-            await (await this.resolveRef(state, validated.ref)).click({
-              timeout: this.remaining(deadline),
-            });
-            return;
-          case "fill":
-            await (await this.resolveRef(state, validated.ref)).fill(validated.value, {
-              timeout: this.remaining(deadline),
-            });
-            return;
-          case "type":
-            await (await this.resolveRef(state, validated.ref)).pressSequentially(validated.text);
-            return;
-          case "keypress":
-            await state.page.keyboard.press(validated.key);
-            return;
-          case "select":
-            await (await this.resolveRef(state, validated.ref)).selectOption(validated.values, {
-              timeout: this.remaining(deadline),
-            });
-            return;
-          case "hover":
-            await (await this.resolveRef(state, validated.ref)).hover({
-              timeout: this.remaining(deadline),
-            });
-            return;
-          case "scroll":
-            await state.page.mouse.wheel(validated.dx, validated.dy);
-            return;
-          case "drag": {
-            const from = await this.resolveRef(state, validated.fromRef);
-            const to = await this.resolveRef(state, validated.toRef);
-            await from.dragTo(to, { timeout: this.remaining(deadline) });
-            return;
-          }
-          case "wait":
-            if (validated.condition === "load") {
-              await state.page.waitForLoadState("load", { timeout: this.remaining(deadline) });
-            } else {
-              await state.page
-                .getByText(validated.text!, { exact: false })
-                .first()
-                .waitFor({ state: "visible", timeout: this.remaining(deadline) });
-            }
-            return;
+      switch (validated.kind) {
+        case "click":
+          await (await this.resolveRef(state, validated.ref)).click({
+            timeout: this.remaining(deadline),
+          });
+          return;
+        case "fill":
+          await (await this.resolveRef(state, validated.ref)).fill(validated.value, {
+            timeout: this.remaining(deadline),
+          });
+          return;
+        case "type":
+          await (await this.resolveRef(state, validated.ref)).pressSequentially(validated.text);
+          return;
+        case "keypress":
+          await state.page.keyboard.press(validated.key);
+          return;
+        case "select":
+          await (await this.resolveRef(state, validated.ref)).selectOption(validated.values, {
+            timeout: this.remaining(deadline),
+          });
+          return;
+        case "hover":
+          await (await this.resolveRef(state, validated.ref)).hover({
+            timeout: this.remaining(deadline),
+          });
+          return;
+        case "scroll":
+          await state.page.mouse.wheel(validated.dx, validated.dy);
+          return;
+        case "drag": {
+          const from = await this.resolveRef(state, validated.fromRef);
+          const to = await this.resolveRef(state, validated.toRef);
+          await from.dragTo(to, { timeout: this.remaining(deadline) });
+          return;
         }
-      } catch (error: unknown) {
-        throw this.mapBrowserError(error);
+        case "wait":
+          if (validated.condition === "load") {
+            await state.page.waitForLoadState("load", { timeout: this.remaining(deadline) });
+          } else {
+            await state.page
+              .getByText(validated.text!, { exact: false })
+              .first()
+              .waitFor({ state: "visible", timeout: this.remaining(deadline) });
+          }
+          return;
       }
     });
   }
@@ -401,11 +393,7 @@ export class BrowserSession {
     return this.withDeadline(DEFAULT_TIMEOUT_MS, signal, async () => {
       const state = this.getTab(tabId);
       this.activate(tabId);
-      try {
-        await (await this.resolveRef(state, safeRef)).setInputFiles(safePath);
-      } catch (error: unknown) {
-        throw this.mapBrowserError(error);
-      }
+      await (await this.resolveRef(state, safeRef)).setInputFiles(safePath);
     });
   }
 
@@ -447,7 +435,7 @@ export class BrowserSession {
     this.invalidateRefs();
     this.tabs.clear();
     this.activeTabId = null;
-    await this.browser.close();
+    await this.withDeadline(DEFAULT_TIMEOUT_MS, undefined, () => this.browser.close());
   }
 
   private registerPage(page: Page): TabState {
@@ -655,19 +643,19 @@ export class BrowserSession {
       const state = this.getTab(tabId);
       this.activate(tabId);
       this.invalidateRefs();
-      try {
-        await operation(state.page, deadline);
-      } catch (error: unknown) {
-        throw this.mapBrowserError(error);
-      }
+      await operation(state.page, deadline);
       return this.describeTab(state);
     });
   }
 
-  private mapBrowserError(error: unknown): unknown {
+  private mapBrowserError(error: unknown): TabGoblinError {
     if (isStructuredError(error)) return error;
     if (error instanceof errors.TimeoutError) return uncertain();
-    return error;
+    return tabGoblinError(
+      "runtime_unavailable",
+      "The browser operation failed",
+      false,
+    );
   }
 
   private remaining(deadline: number): number {
@@ -696,6 +684,8 @@ export class BrowserSession {
 
     try {
       return await Promise.race([operation(deadline), interrupted]);
+    } catch (error: unknown) {
+      throw this.mapBrowserError(error);
     } finally {
       if (timer) clearTimeout(timer);
       if (signal && abort) signal.removeEventListener("abort", abort);

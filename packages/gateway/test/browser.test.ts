@@ -1,6 +1,19 @@
-import { describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { execFileSync, spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { ModuleKind, ScriptTarget, transpileModule } from "typescript";
 import { errors, type Browser, type BrowserContext, type Page } from "playwright-core";
 import { BrowserSession, type RawSnapshot } from "../src/browser.js";
+import {
+  RuntimeSupervisor,
+  volumeNameFor,
+  type PodmanExec,
+} from "../src/runtime.js";
 
 class FakeLocator {
   count = vi.fn(async () => 1);
@@ -268,6 +281,60 @@ describe("BrowserSession at the Playwright boundary", () => {
     expect(page.goto).toHaveBeenCalledTimes(1);
   });
 
+  it("sanitizes plain Playwright errors thrown by an action", async () => {
+    const page = new FakePage();
+    page.evaluateResults.push(raw(1));
+    page.locatorObject.click.mockRejectedValueOnce(
+      new Error("Execution context destroyed with secret=action-token"),
+    );
+    const { session } = sessionWith(page);
+    const [{ tabId: tab }] = await session.listTabs();
+    const ref = (await session.snapshot(tab)).nodes[0].ref;
+
+    const failure = await session
+      .act(tab, { kind: "click", ref, timeoutMs: 1000 })
+      .catch((error: unknown) => error);
+
+    expect(failure).toEqual({
+      code: "runtime_unavailable",
+      message: "The browser operation failed",
+      retryable: false,
+    });
+    expect(JSON.stringify(failure)).not.toContain("action-token");
+  });
+
+  it("sanitizes plain Playwright errors while reading tab metadata", async () => {
+    const page = new FakePage();
+    page.title = vi.fn(async () => {
+      throw new Error("Target closed at ws://secret-cdp-endpoint");
+    });
+    const { session } = sessionWith(page);
+
+    const failure = await session.listTabs().catch((error: unknown) => error);
+
+    expect(failure).toEqual({
+      code: "runtime_unavailable",
+      message: "The browser operation failed",
+      retryable: false,
+    });
+    expect(JSON.stringify(failure)).not.toContain("secret-cdp-endpoint");
+  });
+
+  it("sanitizes a plain Playwright error while closing the browser", async () => {
+    const page = new FakePage();
+    const { browser, session } = sessionWith(page);
+    browser.close.mockRejectedValueOnce(new Error("close failed for /profile/private"));
+
+    const failure = await session.close().catch((error: unknown) => error);
+
+    expect(failure).toEqual({
+      code: "runtime_unavailable",
+      message: "The browser operation failed",
+      retryable: false,
+    });
+    expect(JSON.stringify(failure)).not.toContain("/profile/private");
+  });
+
   it("honors AbortSignal before and during a mutating monotonic deadline", async () => {
     const page = new FakePage();
     const { session } = sessionWith(page);
@@ -302,3 +369,266 @@ describe("BrowserSession at the Playwright boundary", () => {
     expect(page.goto).toHaveBeenCalledTimes(1);
   });
 });
+
+interface PodmanResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+const LIVE_IMAGE = process.env.TABGOBLIN_IMAGE;
+const describeLive = LIVE_IMAGE ? describe : describe.skip;
+const LIVE_FIXTURE_PORT = 18_080;
+const MAX_PODMAN_OUTPUT = 1024 * 1024;
+
+const realPodman: PodmanExec = (args, signal) =>
+  new Promise<PodmanResult>((resolve, reject) => {
+    // Podman spells a random loopback host port as an omitted port. RuntimeSupervisor's
+    // injected executor boundary uses `0`; normalize only that spelling while preserving
+    // loopback-only publication and the requested container port.
+    const podmanArgs = args.map((argument) =>
+      argument.replace(/^127\.0\.0\.1:0:(\d+)$/, "127.0.0.1::$1"),
+    );
+    const child = spawn("podman", podmanArgs, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let spawnError: Error | null = null;
+    const append = (current: string, chunk: Buffer): string =>
+      (current + chunk.toString("utf8")).slice(-MAX_PODMAN_OUTPUT);
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout = append(stdout, chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr = append(stderr, chunk);
+    });
+    child.once("error", (error) => {
+      spawnError = error;
+    });
+    const abort = () => child.kill("SIGTERM");
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+    child.once("close", (code) => {
+      signal?.removeEventListener("abort", abort);
+      if (signal?.aborted) {
+        reject(signal.reason ?? new Error("Podman command aborted"));
+      } else if (spawnError) {
+        reject(spawnError);
+      } else {
+        resolve({ code: code ?? 1, stdout, stderr });
+      }
+    });
+  });
+
+async function requirePodman(args: string[]): Promise<PodmanResult> {
+  const result = await realPodman(args);
+  if (result.code !== 0) {
+    throw new Error(`podman ${args[0]} failed: ${result.stderr.slice(-1000)}`);
+  }
+  return result;
+}
+
+async function installFixtureInRuntime(containerName: string, temporaryDirectory: string): Promise<void> {
+  const fixtureSourcePath = fileURLToPath(
+    new URL("../../fixture-site/src/server.ts", import.meta.url),
+  );
+  const fixtureSource = await readFile(fixtureSourcePath, "utf8");
+  const fixtureJavaScript = transpileModule(fixtureSource, {
+    compilerOptions: { module: ModuleKind.ESNext, target: ScriptTarget.ES2023 },
+    fileName: fixtureSourcePath,
+  }).outputText;
+  const fixturePath = join(temporaryDirectory, "fixture-server.mjs");
+  const runnerPath = join(temporaryDirectory, "fixture-runner.mjs");
+  await Promise.all([
+    writeFile(fixturePath, fixtureJavaScript),
+    writeFile(
+      runnerPath,
+      `import { startFixtureSite } from "/tmp/tabgoblin-fixture-server.mjs";\n` +
+        `await startFixtureSite(${LIVE_FIXTURE_PORT});\n`,
+    ),
+  ]);
+
+  await requirePodman(["cp", process.execPath, `${containerName}:/tmp/tabgoblin-live-node`]);
+  const libatomic = /^\s*libatomic\.so\.1\s+=>\s+(\S+)/m.exec(
+    execFileSync("ldd", [process.execPath], { encoding: "utf8" }),
+  )?.[1];
+  if (libatomic) {
+    await requirePodman([
+      "cp",
+      realpathSync(libatomic),
+      `${containerName}:/tmp/libatomic.so.1`,
+    ]);
+  }
+  await requirePodman(["cp", fixturePath, `${containerName}:/tmp/tabgoblin-fixture-server.mjs`]);
+  await requirePodman(["cp", runnerPath, `${containerName}:/tmp/tabgoblin-fixture-runner.mjs`]);
+  await requirePodman([
+    "exec",
+    "-d",
+    containerName,
+    "sh",
+    "-c",
+    "LD_LIBRARY_PATH=/tmp /tmp/tabgoblin-live-node /tmp/tabgoblin-fixture-runner.mjs >/tmp/tabgoblin-fixture.log 2>&1",
+  ]);
+
+  const fixtureUrl = `http://127.0.0.1:${LIVE_FIXTURE_PORT}/`;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const probe = await realPodman([
+      "exec",
+      "--env",
+      "LD_LIBRARY_PATH=/tmp",
+      containerName,
+      "/tmp/tabgoblin-live-node",
+      "-e",
+      `fetch(${JSON.stringify(fixtureUrl)}).then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))`,
+    ]);
+    if (probe.code === 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  const diagnostics = await realPodman([
+    "exec",
+    containerName,
+    "sh",
+    "-c",
+    "tail -c 2000 /tmp/tabgoblin-fixture.log 2>/dev/null || true",
+  ]);
+  throw new Error(
+    `The isolated fixture server did not become ready: ${diagnostics.stdout.trim() || "no diagnostics"}`,
+  );
+}
+
+describeLive(
+  `BrowserSession live runtime${LIVE_IMAGE ? "" : " (skipped: set TABGOBLIN_IMAGE)"}`,
+  () => {
+    let supervisor: RuntimeSupervisor | undefined;
+    let session: BrowserSession | undefined;
+    let containerName: string | undefined;
+    let temporaryDirectory: string | undefined;
+    const workspaceId = `t6-live-${randomUUID()}`;
+    const profileVolume = volumeNameFor(workspaceId);
+    const fixtureUrl = `http://127.0.0.1:${LIVE_FIXTURE_PORT}`;
+
+    beforeAll(async () => {
+      temporaryDirectory = await mkdtemp(join(tmpdir(), "tabgoblin-t6-live-"));
+      supervisor = new RuntimeSupervisor({
+        image: LIVE_IMAGE!,
+        podman: realPodman,
+        probe: async (cdpUrl, signal) => {
+          try {
+            return (await fetch(`${cdpUrl}/json/version`, { signal })).ok;
+          } catch {
+            return false;
+          }
+        },
+      });
+      const endpoints = await supervisor.start(workspaceId);
+      containerName = endpoints.containerName;
+      expect(endpoints.volumeName).toBe(profileVolume);
+      await installFixtureInRuntime(containerName, temporaryDirectory);
+      session = await BrowserSession.attach(endpoints.cdpUrl);
+    }, 120_000);
+
+    afterAll(async () => {
+      const cleanupErrors: unknown[] = [];
+      await session?.close().catch((error: unknown) => cleanupErrors.push(error));
+      await supervisor?.stop(workspaceId).catch((error: unknown) => cleanupErrors.push(error));
+      const volumes = await realPodman([
+        "volume",
+        "rm",
+        "--force",
+        profileVolume,
+        `${profileVolume}-staging`,
+      ]).catch((error: unknown) => {
+        cleanupErrors.push(error);
+        return null;
+      });
+      if (volumes && volumes.code !== 0) cleanupErrors.push(new Error("volume cleanup failed"));
+      if (temporaryDirectory) {
+        await rm(temporaryDirectory, { recursive: true, force: true }).catch((error: unknown) =>
+          cleanupErrors.push(error),
+        );
+      }
+      if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, "Live cleanup failed");
+    }, 120_000);
+
+    it("opens the isolated fixture, uses real DOM refs, and submits login", async () => {
+      const tab = await session!.newTab(`${fixtureUrl}/login`);
+      const snapshot = await session!.snapshot(tab.tabId);
+      const username = snapshot.nodes.find((node) => node.name.toLowerCase() === "username")!;
+      const submit = snapshot.nodes.find(
+        (node) => node.name === "Sign in" && node.role === "button",
+      )!;
+
+      expect(username).toBeTruthy();
+      expect(submit).toBeTruthy();
+      await session!.act(tab.tabId, {
+        kind: "fill",
+        ref: username.ref,
+        value: "ada",
+        timeoutMs: 5000,
+      });
+      await session!.act(tab.tabId, {
+        kind: "click",
+        ref: submit.ref,
+        timeoutMs: 5000,
+      });
+      expect(await session!.text(tab.tabId, 1000)).toContain("Signed in as ada");
+    });
+
+    it("rejects a real ref from an earlier snapshot revision", async () => {
+      const tab = await session!.newTab(`${fixtureUrl}/login`);
+      const first = await session!.snapshot(tab.tabId);
+      await session!.snapshot(tab.tabId);
+
+      await expect(
+        session!.act(tab.tabId, {
+          kind: "click",
+          ref: first.nodes[0].ref,
+          timeoutMs: 2000,
+        }),
+      ).rejects.toMatchObject({ code: "stale_ref" });
+    });
+
+    it("returns validated redacted network metadata from the real fixture", async () => {
+      const tab = await session!.newTab(`${fixtureUrl}/login?token=secret#fragment`);
+      const login = session!
+        .network(tab.tabId, 100)
+        .find((entry) => entry.method === "GET" && entry.url === `${fixtureUrl}/login`);
+
+      expect(login).toEqual({ method: "GET", url: `${fixtureUrl}/login`, status: 200 });
+      expect(JSON.stringify(session!.network(tab.tabId, 100))).not.toContain("secret");
+    });
+
+    it("rejects non-http navigation before reaching Chromium", async () => {
+      const tab = await session!.newTab(`${fixtureUrl}/`);
+      await expect(
+        session!.navigate(tab.tabId, "file:///etc/passwd", 5000),
+      ).rejects.toMatchObject({ code: "invalid_input" });
+    });
+
+    it("reports a real slow navigation as timeout_uncertain without retrying", async () => {
+      const tab = await session!.newTab(`${fixtureUrl}/`);
+      await expect(
+        session!.navigate(tab.tabId, `${fixtureUrl}/slow?ms=5000`, 1000),
+      ).rejects.toMatchObject({ code: "timeout_uncertain", retryable: false });
+    });
+
+    it("retains fixture login cookies after closing and reopening tabs", async () => {
+      const first = await session!.newTab(`${fixtureUrl}/login`);
+      const snapshot = await session!.snapshot(first.tabId);
+      await session!.act(first.tabId, {
+        kind: "fill",
+        ref: snapshot.nodes.find((node) => node.name.toLowerCase() === "username")!.ref,
+        value: "grace",
+        timeoutMs: 5000,
+      });
+      await session!.act(first.tabId, {
+        kind: "click",
+        ref: snapshot.nodes.find((node) => node.role === "button")!.ref,
+        timeoutMs: 5000,
+      });
+      await session!.closeTab(first.tabId);
+
+      const second = await session!.newTab(`${fixtureUrl}/account`);
+      expect(await session!.text(second.tabId, 1000)).toContain("Signed in as grace");
+    });
+  },
+);

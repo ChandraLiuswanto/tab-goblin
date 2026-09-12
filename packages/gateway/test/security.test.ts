@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { mkdir, readFile, mkdtemp, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
-import { createConnection, createServer as createTcpServer, type Socket } from "node:net";
+import { createConnection, createServer as createTcpServer, Server as NetServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -253,8 +253,13 @@ describe("viewer authentication and transport input gating", () => {
     const fresh = codes.issue("ws-a");
     expect(codes.redeem(fresh.code)).toEqual({ workspaceId: "ws-a" });
     expect(() => codes.redeem(fresh.code)).toThrowError(expect.objectContaining({ code: "auth_failed" }));
-    expect(() => codes.redeem("wrong-a")).toThrow();
-    expect(() => codes.redeem("wrong-b")).toThrowError(expect.objectContaining({ code: "auth_failed" }));
+    const limited = new PairingCodes({ now: () => now, maxFailuresPerMinute: 2 });
+    expect(() => limited.redeem("wrong-a")).toThrowError(expect.objectContaining({ code: "auth_failed" }));
+    expect(() => limited.redeem("wrong-b")).toThrowError(expect.objectContaining({ code: "auth_failed" }));
+    const rateLimitedFresh = limited.issue("ws-a");
+    expect(() => limited.redeem(rateLimitedFresh.code)).toThrowError(expect.objectContaining({ code: "auth_failed" }));
+    now += 60_000;
+    expect(limited.redeem(rateLimitedFresh.code)).toEqual({ workspaceId: "ws-a" });
 
     const vnc = await fakeVnc();
     const h = await viewerHarness(vnc.port);
@@ -289,27 +294,55 @@ describe("agent scope and bounded local control plane", () => {
     await expect(registry.authorize(NONCE_B)).rejects.toMatchObject({ code: "not_enrolled" });
   });
 
-  it("forces the bridge to its enrollment workspace and redacts sensitive runtime details from tool results", async () => {
+  it("forces the bridge to its enrollment workspace and redacts actual AdminServer runtime details from successful tool results", async () => {
+    const registry = new EnrollmentRegistry();
+    bindInteractive(registry, NONCE_A, "/workspace/a", "agent-a", "ws-a");
+    const runtime = {
+      state: () => "ready" as const,
+      start: async () => ({
+        cdpUrl: `http://127.0.0.1:9222/${SECRET}`,
+        vncHost: "127.0.0.1",
+        vncPort: 5900,
+        containerName: "runtime-secret-profile",
+        volumeName: "runtime-secret-profile",
+      }),
+    };
+    const admin = createAdminServer({
+      enrollment: registry,
+      socketPath: join(tmpdir(), "tabgoblin-security-bridge.sock"),
+      services: {
+        runtime,
+        ownership: () => new OwnershipController(),
+        activity: () => new ActivityFeed(),
+        viewerUrlFor: () => "https://viewer.example/ws-a",
+      },
+    } as never);
     const calls: Array<Record<string, unknown>> = [];
     const bridge = createBridge({
       enrollment: NONCE_A,
-      resolveBinding: async () => ({ workspaceId: "ws-a", agentId: "agent-a" }) as never,
+      resolveBinding: () => registry.authorize(NONCE_A).then(({ agentId, workspaceId }) => ({ agentId: agentId!, workspaceId: workspaceId! })),
       call: async (body) => {
         calls.push(body as Record<string, unknown>);
-        return { ok: true };
+        return admin.handle(body);
       },
     });
-    const result = await bridge.callTool("tabgoblin_start", {});
+    const result = await bridge.callTool("tabgoblin_start", { workspaceId: "ws-b" });
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({ workspaceId: "ws-a", enrollment: NONCE_A });
-    expect(JSON.stringify(result)).not.toMatch(/9222|cdp|profile|socket|11111111/i);
+    expect(result.isError).toBeUndefined();
+    expect(result.content).toEqual([{ type: "text", text: expect.stringContaining('"workspaceId":"ws-a"') }]);
+    expect(JSON.stringify(result)).not.toMatch(/9222|cdp|profile|socket|11111111|test-only-sensitive/i);
   });
 
-  it("bounds Unix-socket request bytes and deadlines without reflecting sensitive malformed input", async () => {
+  it("uses a Unix-domain admin listener (not TCP) and bounds request bytes/deadlines without reflecting sensitive malformed input", async () => {
     const directory = await mkdtemp(join(tmpdir(), "tabgoblin-security-admin-"));
     const socketPath = join(directory, "admin.sock");
+    const before = new Set((process as typeof process & { _getActiveHandles(): unknown[] })._getActiveHandles().filter((handle): handle is NetServer => handle instanceof NetServer));
     const server = createAdminServer({ services: {} as never, enrollment: new EnrollmentRegistry(), socketPath, handlerTimeoutMs: 25 });
     await server.listen();
+    const newListeners = (process as typeof process & { _getActiveHandles(): unknown[] })._getActiveHandles()
+      .filter((handle): handle is NetServer => handle instanceof NetServer && !before.has(handle));
+    expect(newListeners.map((listener) => listener.address())).toEqual([socketPath]);
     cleanups.push(async () => { await server.close(); await rm(directory, { recursive: true, force: true }); });
     expect((await stat(socketPath)).mode & 0o777).toBe(0o600);
     const tooLarge = await postUnix(socketPath, JSON.stringify({ padding: "x".repeat(65_536), secret: SECRET }));

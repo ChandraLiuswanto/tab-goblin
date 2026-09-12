@@ -93,27 +93,113 @@ describe("callTool", () => {
     expect(text).not.toContain("secret backend detail");
   });
 
-  it("converts screenshots to MCP image content and validates bounded redacted network records", async () => {
+  it("renders actual status, tab, and snapshot response fields rather than an arbitrary result", async () => {
+    const status = {
+      workspaceId: "ws-1",
+      sessionState: "ready" as const,
+      ownership: { state: "agent-ready" as const, generation: 1, owner: "agent" as const },
+      startedAt: "2026-09-12T00:00:00.000Z",
+      viewerUrl: "http://viewer.test",
+      lastError: null,
+    };
+    const tab = { tabId: "t1", title: "Example", url: "https://example.test", active: true };
+    const snapshot = { tabId: "t1", revision: 1, url: "https://example.test", title: "Example", nodes: [{ ref: "r1-e0", role: "button", name: "Go", depth: 0 }] };
+    const call = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, status })
+      .mockResolvedValueOnce({ ok: true, tabs: [tab] })
+      .mockResolvedValueOnce({ ok: true, snapshot })
+      .mockResolvedValueOnce({ ok: true, result: tab });
+    const bridge = createBridge({ call, enrollment: "enrollment", resolveBinding: binding });
+
+    await expect(bridge.callTool("tabgoblin_status", {})).resolves.toEqual({ content: [{ type: "text", text: JSON.stringify(status) }] });
+    await expect(bridge.callTool("tabgoblin_list_tabs", {})).resolves.toEqual({ content: [{ type: "text", text: JSON.stringify([tab]) }] });
+    await expect(bridge.callTool("tabgoblin_snapshot", { tabId: "t1" })).resolves.toEqual({ content: [{ type: "text", text: JSON.stringify(snapshot) }] });
+    await expect(bridge.callTool("tabgoblin_navigate", { tabId: "t1", url: "https://example.test" })).resolves.toEqual({ content: [{ type: "text", text: JSON.stringify(tab) }] });
+  });
+
+  it("rejects malformed success fields instead of rendering upstream result data", async () => {
+    const bridge = createBridge({
+      call: vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, result: { backendSecret: "do-not-disclose" } })
+        .mockResolvedValueOnce({ ok: true, result: "do-not-disclose" }),
+      enrollment: "enrollment",
+      resolveBinding: binding,
+    });
+
+    for (const [name, input] of [
+      ["tabgoblin_status", {}],
+      ["tabgoblin_close_tab", { tabId: "t1" }],
+    ] as const) {
+      const result = await bridge.callTool(name, input);
+      expect(result).toMatchObject({ isError: true });
+      expect(JSON.stringify(result)).toContain("runtime_unavailable");
+      expect(JSON.stringify(result)).not.toContain("do-not-disclose");
+    }
+  });
+
+  it("accepts actual bounded text, log, evaluation, and no-result success fields", async () => {
+    const call = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, result: "visible page text" })
+      .mockResolvedValueOnce({ ok: true, result: ["log: one"] })
+      .mockResolvedValueOnce({ ok: true, result: "{\"allowed\":true}" })
+      .mockResolvedValueOnce({ ok: true });
+    const bridge = createBridge({ call, enrollment: "enrollment", resolveBinding: binding });
+
+    await expect(bridge.callTool("tabgoblin_text", { tabId: "t1", maxChars: 100 })).resolves.toEqual({ content: [{ type: "text", text: JSON.stringify("visible page text") }] });
+    await expect(bridge.callTool("tabgoblin_logs", { tabId: "t1", maxEntries: 1 })).resolves.toEqual({ content: [{ type: "text", text: JSON.stringify(["log: one"]) }] });
+    await expect(bridge.callTool("tabgoblin_evaluate", { tabId: "t1", expression: "({ allowed: true })", maxChars: 100 })).resolves.toEqual({ content: [{ type: "text", text: JSON.stringify("{\"allowed\":true}") }] });
+    await expect(bridge.callTool("tabgoblin_close_tab", { tabId: "t1" })).resolves.toEqual({ content: [{ type: "text", text: "null" }] });
+  });
+
+  it("rejects text, log, and evaluation results that exceed their requested bounds", async () => {
+    const bridge = createBridge({
+      call: vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, result: "x".repeat(101) })
+        .mockResolvedValueOnce({ ok: true, result: ["one", "two"] })
+        .mockResolvedValueOnce({ ok: true, result: "x".repeat(101) }),
+      enrollment: "enrollment",
+      resolveBinding: binding,
+    });
+
+    for (const [name, input] of [
+      ["tabgoblin_text", { tabId: "t1", maxChars: 100 }],
+      ["tabgoblin_logs", { tabId: "t1", maxEntries: 1 }],
+      ["tabgoblin_evaluate", { tabId: "t1", expression: "null", maxChars: 100 }],
+    ] as const) {
+      const result = await bridge.callTool(name, input);
+      expect(result).toMatchObject({ isError: true });
+      expect(JSON.stringify(result)).toContain("runtime_unavailable");
+    }
+  });
+
+  it("converts only canonical bounded screenshots and network entries within the requested limit", async () => {
     const call = vi
       .fn()
       .mockResolvedValueOnce({ ok: true, result: { mimeType: "image/png", base64: "cGl4ZWxz" } })
       .mockResolvedValueOnce({
         ok: true,
-        result: [{ method: "GET", url: "https://example.test/path?secret=discarded", status: 200 }],
-      });
+        result: [
+          { method: "GET", url: "https://example.test/path?secret=discarded", status: 200 },
+          { method: "POST", url: "https://example.test/second", status: 201 },
+        ],
+      })
+      .mockResolvedValueOnce({ ok: true, result: { mimeType: "image/png", base64: "A" } });
     const bridge = createBridge({ call, enrollment: "enrollment", resolveBinding: binding });
 
     await expect(bridge.callTool("tabgoblin_screenshot", { tabId: "t1" })).resolves.toEqual({
       content: [{ type: "image", data: "cGl4ZWxz", mimeType: "image/png" }],
     });
     const network = await bridge.callTool("tabgoblin_network", { tabId: "t1", maxEntries: 1 });
+    expect(network).toMatchObject({ isError: true });
+    expect(JSON.stringify(network)).toContain("runtime_unavailable");
 
-    expect(network).toEqual({
-      content: [{
-        type: "text",
-        text: JSON.stringify([{ method: "GET", url: "https://example.test/path", status: 200 }]),
-      }],
-    });
+    const invalidImage = await bridge.callTool("tabgoblin_screenshot", { tabId: "t1" });
+    expect(invalidImage).toMatchObject({ isError: true });
+    expect(JSON.stringify(invalidImage)).toContain("runtime_unavailable");
   });
 });
 

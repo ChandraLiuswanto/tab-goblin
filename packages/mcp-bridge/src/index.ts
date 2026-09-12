@@ -12,6 +12,9 @@ import {
   ENROLLMENT_ENV,
   MCP_SERVER_NAME,
   NetworkDiagnosticSchema,
+  SessionStatusSchema,
+  SnapshotSchema,
+  TabSchema,
   tabGoblinError,
   ToolInputSchemas,
   type AdminResponse,
@@ -82,26 +85,86 @@ function textResult(value: unknown): BridgeResult {
   return { content: [{ type: "text", text }] };
 }
 
-function renderResult(name: ToolName, response: AdminResponse): BridgeResult {
+const tabResultTools = new Set<ToolName>([
+  "tabgoblin_new_tab",
+  "tabgoblin_navigate",
+  "tabgoblin_back",
+  "tabgoblin_forward",
+  "tabgoblin_reload",
+]);
+
+const noResultTools = new Set<ToolName>([
+  "tabgoblin_close_tab",
+  "tabgoblin_click",
+  "tabgoblin_fill",
+  "tabgoblin_type",
+  "tabgoblin_keypress",
+  "tabgoblin_select",
+  "tabgoblin_hover",
+  "tabgoblin_scroll",
+  "tabgoblin_drag",
+  "tabgoblin_wait",
+  "tabgoblin_upload",
+]);
+
+function canonicalImage(result: unknown): { mimeType: "image/png" | "image/jpeg" | "image/webp"; base64: string } | null {
+  const parsed = z.object({
+    mimeType: z.enum(["image/png", "image/jpeg", "image/webp"]),
+    base64: z.string().min(4).max(Math.floor(SOCKET_RESPONSE_MAX_BYTES * 0.75)),
+  }).strict().safeParse(result);
+  if (!parsed.success || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(parsed.data.base64)) {
+    return null;
+  }
+  const decoded = Buffer.from(parsed.data.base64, "base64");
+  if (decoded.byteLength === 0 || decoded.byteLength > Math.floor(SOCKET_RESPONSE_MAX_BYTES * 0.75)) return null;
+  return decoded.toString("base64") === parsed.data.base64 ? parsed.data : null;
+}
+
+function inputLimit(input: unknown, key: "maxChars" | "maxEntries"): number | null {
+  const value = typeof input === "object" && input !== null ? (input as Record<string, unknown>)[key] : undefined;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function renderResult(name: ToolName, response: AdminResponse, input: unknown): BridgeResult {
   if (!response.ok) return errorResult(response.error.code);
 
+  if (name === "tabgoblin_status" || name === "tabgoblin_start") {
+    const status = SessionStatusSchema.safeParse(response.status);
+    return status.success ? textResult(status.data) : errorResult("runtime_unavailable");
+  }
+  if (name === "tabgoblin_list_tabs") {
+    const tabs = TabSchema.array().max(100).safeParse(response.tabs);
+    return tabs.success ? textResult(tabs.data) : errorResult("runtime_unavailable");
+  }
+  if (name === "tabgoblin_snapshot") {
+    const snapshot = SnapshotSchema.safeParse(response.snapshot);
+    return snapshot.success ? textResult(snapshot.data) : errorResult("runtime_unavailable");
+  }
+  if (tabResultTools.has(name)) {
+    const tab = TabSchema.safeParse(response.result);
+    return tab.success ? textResult(tab.data) : errorResult("runtime_unavailable");
+  }
   if (name === "tabgoblin_screenshot") {
-    const image = z.object({
-      mimeType: z.enum(["image/png", "image/jpeg", "image/webp"]),
-      base64: z.string().min(1).max(Math.floor(SOCKET_RESPONSE_MAX_BYTES * 0.75)).regex(/^[A-Za-z0-9+/]+={0,2}$/),
-    }).strict().safeParse(response.result);
-    if (!image.success) return errorResult("runtime_unavailable");
-    return { content: [{ type: "image", data: image.data.base64, mimeType: image.data.mimeType }] };
+    const image = canonicalImage(response.result);
+    return image ? { content: [{ type: "image", data: image.base64, mimeType: image.mimeType }] } : errorResult("runtime_unavailable");
   }
-
   if (name === "tabgoblin_network") {
-    const parsed = NetworkDiagnosticSchema.array().max(100).safeParse(response.result);
-    if (!parsed.success) return errorResult("runtime_unavailable");
-    return textResult(parsed.data);
+    const maxEntries = inputLimit(input, "maxEntries");
+    const parsed = maxEntries === null ? null : NetworkDiagnosticSchema.array().max(maxEntries).safeParse(response.result);
+    return parsed?.success ? textResult(parsed.data) : errorResult("runtime_unavailable");
   }
-
-  const result = response.result ?? response.status ?? response.tabs ?? response.activity ?? null;
-  return textResult(result);
+  if (name === "tabgoblin_text" || name === "tabgoblin_evaluate") {
+    const maxChars = inputLimit(input, "maxChars");
+    const text = maxChars === null ? null : z.string().max(maxChars).safeParse(response.result);
+    return text?.success ? textResult(text.data) : errorResult("runtime_unavailable");
+  }
+  if (name === "tabgoblin_logs") {
+    const maxEntries = inputLimit(input, "maxEntries");
+    const logs = maxEntries === null ? null : z.array(z.string().max(242)).max(maxEntries).safeParse(response.result);
+    return logs?.success ? textResult(logs.data) : errorResult("runtime_unavailable");
+  }
+  if (noResultTools.has(name) && response.result === undefined) return textResult(null);
+  return errorResult("runtime_unavailable");
 }
 
 export function createBridge(deps: BridgeDependencies): {
@@ -130,7 +193,7 @@ export function createBridge(deps: BridgeDependencies): {
           source: "mcp-bridge",
         };
         const response = await (signal ? deps.call(request, signal) : deps.call(request));
-        return renderResult(name, AdminResponseSchema.parse(response));
+        return renderResult(name, AdminResponseSchema.parse(response), parsedInput.data);
       } catch (error: unknown) {
         return errorResult(codeFrom(error, signal?.aborted ? "timeout_uncertain" : "runtime_unavailable"));
       }

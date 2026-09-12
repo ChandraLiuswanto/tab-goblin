@@ -31,7 +31,9 @@ uses private `127.0.0.1:9223`; a supervised in-container Nginx relay listens on
 container port 9222, forwards HTTP/WebSocket CDP traffic, and rewrites discovery URLs
 to Podman's loopback-published host port. This does not create a host listener beyond
 Podman's explicit `127.0.0.1` publish rule. PID 1 stops the container if Chromium, the
-relay, Xvfb, or VNC exits, rather than reporting a partially functioning runtime.
+relay, Xvfb, or VNC exits, rather than reporting a partially functioning runtime. On a
+normal container stop, PID 1 asks Chromium's private CDP endpoint to close, waits a
+bounded interval for its profile flush, and only then tears down the display.
 
 ## Gateway user service
 
@@ -71,4 +73,7 @@ do not guess or overwrite a deployment's existing Serve routes.
 A profile volume contains cookies and other login material. Filesystem permissions
 are not encryption at rest, and backups of the volume contain authenticated session
 data. Use encrypted host storage where required, keep volumes owner-restricted, and
-never mount, import, delete, or use a personal browser profile.
+never mount, import, delete, or use a personal browser profile. The runtime holds an
+exclusive file lock for its full lifetime, so a second container using the same volume
+fails instead of corrupting an active Chromium profile. After a hard kill, the next
+lock holder removes stale Chromium singleton links only after acquiring that lock.

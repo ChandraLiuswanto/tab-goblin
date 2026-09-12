@@ -2,7 +2,7 @@
 FROM registry.fedoraproject.org/fedora:41
 
 RUN dnf -y install --setopt=install_weak_deps=False \
-      chromium xorg-x11-server-Xvfb xdpyinfo x11vnc nginx openbox procps-ng dbus-x11 \
+      chromium xorg-x11-server-Xvfb xdpyinfo x11vnc nginx openbox procps-ng util-linux python3 dbus-x11 \
       nss alsa-lib liberation-fonts google-noto-sans-fonts \
  && dnf clean all
 
@@ -14,11 +14,14 @@ RUN useradd --create-home --uid 1000 goblin \
  && chmod 1777 /tmp/.X11-unix
 
 COPY runtime-entrypoint.sh /usr/local/bin/runtime-entrypoint.sh
+COPY close-browser.py /usr/local/bin/close-browser.py
 COPY cdp-relay.conf /etc/tabgoblin/cdp-relay.conf
-RUN chmod 0755 /usr/local/bin/runtime-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/runtime-entrypoint.sh /usr/local/bin/close-browser.py
 
 USER goblin
-ENV HOME=/home/goblin DISPLAY=:99 TG_SCREEN=1280x800x24
+# Keep Chromium's profile-adjacent state (including its cookie encryption material)
+# with the persistent profile volume rather than in ephemeral container home storage.
+ENV HOME=/profile DISPLAY=:99 TG_SCREEN=1280x800x24
 VOLUME ["/profile", "/staging"]
 EXPOSE 9222 5900
 ENTRYPOINT ["/usr/local/bin/runtime-entrypoint.sh"]

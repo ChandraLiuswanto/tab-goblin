@@ -34008,7 +34008,9 @@ var enrollment = external_exports.string().uuid();
 var lifecycleGeneration = external_exports.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 var scopedOperation = (op) => external_exports.object({ op: external_exports.literal(op), workspaceId }).strict();
 var AdminRequestSchema = external_exports.discriminatedUnion("op", [
+  external_exports.object({ op: external_exports.literal("health") }).strict(),
   scopedOperation("status"),
+  scopedOperation("tabs"),
   scopedOperation("start"),
   scopedOperation("stop"),
   scopedOperation("activity"),
@@ -34063,6 +34065,7 @@ var AdminResponseSchema = external_exports.discriminatedUnion("ok", [
     pairingCode: external_exports.string().min(8).max(64).optional(),
     pairingExpiresAt: external_exports.string().max(64).optional(),
     lifecycleGeneration: lifecycleGeneration.optional(),
+    protocolVersion: external_exports.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
     binding: external_exports.object({ agentId, workspaceId }).strict().optional(),
     // Tool responses are operation-specific and validated/bounded by their producers.
     result: external_exports.unknown().optional()

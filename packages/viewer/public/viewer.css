@@ -1,0 +1,17 @@
+:root { color-scheme: dark; font-family: system-ui, sans-serif; background: #101216; color: #f5f7fa; }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; display: grid; grid-template-rows: auto 1fr auto; }
+button, input { font: inherit; }
+button { min-height: 2.75rem; padding: .5rem .9rem; border: 0; border-radius: .35rem; background: #4779d7; color: #fff; }
+button:disabled { opacity: .55; }
+#banner { padding: .65rem 1rem; background: #202938; font-weight: 600; text-align: center; }
+#pairing { width: min(28rem, calc(100% - 2rem)); margin: auto; padding: 1.25rem; display: grid; gap: .75rem; }
+#pairing input { min-height: 2.75rem; padding: .5rem; color: inherit; background: #181d26; border: 1px solid #64748b; border-radius: .35rem; }
+#pairing-error { min-height: 1.25rem; color: #ffb4ab; }
+#viewer { position: relative; overflow: hidden; min-height: 0; background: #050607; touch-action: none; }
+#screen { position: absolute; transform-origin: top left; touch-action: none; }
+#screen canvas { touch-action: none; }
+#controls { display: flex; flex-wrap: wrap; gap: .5rem; padding: .75rem; background: #181d26; }
+#keyboard-input { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.hidden { display: none !important; }
+@media (max-width: 420px) { #controls button { flex: 1 1 45%; } }

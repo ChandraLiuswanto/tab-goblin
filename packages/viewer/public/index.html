@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <meta name="referrer" content="no-referrer" />
+    <title>TabGoblin Viewer</title>
+    <link rel="stylesheet" href="/viewer.css" />
+  </head>
+  <body>
+    <header id="banner" role="status" aria-live="polite">needs attention</header>
+    <main id="viewer">
+      <section id="pairing" aria-labelledby="pairing-title">
+        <h1 id="pairing-title">Pair this device</h1>
+        <label for="pairing-code">Pairing code</label>
+        <input id="pairing-code" inputmode="text" autocomplete="one-time-code" autocapitalize="off" spellcheck="false" />
+        <button id="pair-button" type="button">Pair</button>
+        <p id="pairing-error" role="alert"></p>
+      </section>
+      <div id="screen" class="hidden" aria-label="Remote browser"></div>
+    </main>
+    <footer id="controls" class="hidden" aria-label="Viewer controls">
+      <button id="take-control" type="button">Take control</button>
+      <button id="return-to-agent" type="button">Return to agent</button>
+      <button id="reclaim-control" type="button">Reclaim control</button>
+      <button id="keyboard-toggle" type="button">Show keyboard</button>
+      <button id="sign-out" type="button">Sign out</button>
+      <input id="keyboard-input" aria-label="Remote keyboard" autocomplete="off" />
+    </footer>
+    <script type="module" src="/viewer.js"></script>
+  </body>
+</html>

@@ -75,9 +75,36 @@ export function viewerAddress(raw: string | null | undefined): string | null {
   }
 }
 
-export function pollInterval(failureCount: number): number {
-  const failures = Number.isSafeInteger(failureCount) && failureCount > 0 ? failureCount : 0;
-  return Math.min(30_000, 3_000 * 2 ** Math.min(failures, 4));
+export const manualQueryPolicy = {
+  retry: false,
+  refetchOnWindowFocus: false,
+  refetchOnReconnect: false,
+  refetchInterval: false,
+} as const;
+
+type RefetchResult = { data?: { ok: boolean; status?: { sessionState: string } } };
+export type PanelRefetchers = {
+  config(): Promise<unknown>;
+  status(): Promise<RefetchResult>;
+  tabs(): Promise<unknown>;
+  activity(): Promise<unknown>;
+};
+
+export async function refreshPanelQueries(refetchers: PanelRefetchers, includeConfig = true): Promise<void> {
+  const [statusResult] = await Promise.all([
+    refetchers.status(),
+    refetchers.activity(),
+    includeConfig ? refetchers.config() : Promise.resolve(),
+  ]);
+  if (statusResult.data?.ok && statusResult.data.status?.sessionState === "ready") {
+    await refetchers.tabs();
+  }
+}
+
+export async function refreshAfterSuccessfulAction(response: { ok: boolean }, refetchers: PanelRefetchers): Promise<boolean> {
+  if (!response.ok) return false;
+  await refreshPanelQueries(refetchers);
+  return true;
 }
 
 export function actionAvailability(status: SessionStatus | null, rpcFailed: boolean, hasSafeViewerAddress: boolean) {

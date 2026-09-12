@@ -11,8 +11,10 @@ import {
   actionAvailability,
   describeState,
   initialEphemeralState,
+  manualQueryPolicy,
   panelEphemeralReducer,
-  pollInterval,
+  refreshAfterSuccessfulAction,
+  refreshPanelQueries,
   sanitizeTabs,
   statusResponseIssue,
   viewerAddress,
@@ -143,8 +145,7 @@ export function TabGoblinPanel({ theme, host, layout, workspaceId }: PluginWorks
   const configQuery = useQuery({
     queryKey: configKey,
     enabled: input !== null,
-    retry: false,
-    refetchOnWindowFocus: false,
+    ...manualQueryPolicy,
     queryFn: async () => {
       if (!input) throw new Error("Workspace unavailable");
       const response = await getConfig(input);
@@ -157,9 +158,7 @@ export function TabGoblinPanel({ theme, host, layout, workspaceId }: PluginWorks
   const statusQuery = useQuery({
     queryKey: statusKey,
     enabled: input !== null,
-    retry: false,
-    refetchOnWindowFocus: false,
-    refetchInterval: (query) => pollInterval(query.state.fetchFailureCount),
+    ...manualQueryPolicy,
     queryFn: async () => {
       if (!input) throw new Error("Workspace unavailable");
       const response = await getStatus(input);
@@ -177,9 +176,7 @@ export function TabGoblinPanel({ theme, host, layout, workspaceId }: PluginWorks
   const tabsQuery = useQuery({
     queryKey: tabsKey,
     enabled: input !== null && statusForTabs?.sessionState === "ready" && !statusQuery.isError,
-    retry: false,
-    refetchOnWindowFocus: false,
-    refetchInterval: (query) => pollInterval(query.state.fetchFailureCount),
+    ...manualQueryPolicy,
     queryFn: async () => {
       if (!input) throw new Error("Workspace unavailable");
       const response = await getTabs(input);
@@ -192,9 +189,7 @@ export function TabGoblinPanel({ theme, host, layout, workspaceId }: PluginWorks
   const activityQuery = useQuery({
     queryKey: activityKey,
     enabled: input !== null,
-    retry: false,
-    refetchOnWindowFocus: false,
-    refetchInterval: (query) => pollInterval(query.state.fetchFailureCount),
+    ...manualQueryPolicy,
     queryFn: async () => {
       if (!input) throw new Error("Workspace unavailable");
       const response = await getActivity(input);
@@ -218,6 +213,12 @@ export function TabGoblinPanel({ theme, host, layout, workspaceId }: PluginWorks
   const viewer = viewerAddress(viewerSource);
   const busy = pending?.scope === scope;
   const available = actionAvailability(status, statusQuery.isError, viewer !== null);
+  const refetchers = {
+    config: () => configQuery.refetch(),
+    status: () => statusQuery.refetch(),
+    tabs: () => tabsQuery.refetch(),
+    activity: () => activityQuery.refetch(),
+  };
   const connectionChanged = config !== null && (socketDraft !== config.socketPath || viewerDraft !== config.viewerUrl);
 
   async function perform(action: ActionName, call: () => Promise<AdminResponse>) {
@@ -233,7 +234,7 @@ export function TabGoblinPanel({ theme, host, layout, workspaceId }: PluginWorks
         return;
       }
       dispatch({ type: "clear-error", scope: requestScope });
-      await statusQuery.refetch();
+      await refreshAfterSuccessfulAction(response, refetchers);
     } catch {
       dispatch({ type: "action-failed", scope: requestScope, request, message: "Request failed. Refresh status before trying again." });
     } finally {
@@ -255,6 +256,7 @@ export function TabGoblinPanel({ theme, host, layout, workspaceId }: PluginWorks
         return;
       }
       dispatch({ type: "pair-succeeded", scope: requestScope, request, code: response.pairingCode, expiresAt: response.pairingExpiresAt });
+      await refreshAfterSuccessfulAction(response, refetchers);
     } catch {
       dispatch({ type: "action-failed", scope: requestScope, request, message: "Pairing request failed. No control handoff was assumed." });
     } finally {
@@ -283,6 +285,8 @@ export function TabGoblinPanel({ theme, host, layout, workspaceId }: PluginWorks
         return;
       }
       dispatch({ type: "clear-error", scope: requestScope });
+      await refreshPanelQueries(refetchers, false);
+      if (scopeRef.current !== requestScope || requestRef.current !== request) return;
       toast.show(`Workspace ${enabled ? "enabled" : "disabled"} on the TabGoblin server.`, { variant: "success" });
     } catch {
       dispatch({ type: "action-failed", scope: requestScope, request, message: "The server-owned workspace setting was not changed." });
@@ -308,6 +312,8 @@ export function TabGoblinPanel({ theme, host, layout, workspaceId }: PluginWorks
         dispatch({ type: "action-failed", scope: requestScope, request, message: "TabGoblin is disabled, but authority cleanup is still pending. It was not re-enabled." });
       } else {
         dispatch({ type: "clear-error", scope: requestScope });
+        await refreshPanelQueries(refetchers, false);
+        if (scopeRef.current !== requestScope || requestRef.current !== request) return;
         toast.show(`TabGoblin ${enabled ? "enabled" : "disabled"} for opted-in workspaces on this host.`, { variant: "success" });
       }
     } catch {
@@ -335,6 +341,8 @@ export function TabGoblinPanel({ theme, host, layout, workspaceId }: PluginWorks
         return;
       }
       dispatch({ type: "clear-error", scope: requestScope });
+      await refreshPanelQueries(refetchers, false);
+      if (scopeRef.current !== requestScope || requestRef.current !== request) return;
       toast.show("Connection settings saved by the TabGoblin server.", { variant: "success" });
     } catch {
       dispatch({ type: "action-failed", scope: requestScope, request, message: "Use an absolute socket path and a credential-free HTTPS or loopback viewer URL." });
@@ -390,7 +398,7 @@ export function TabGoblinPanel({ theme, host, layout, workspaceId }: PluginWorks
       <View style={styles.header}>
         <Text style={styles.eyebrow}>Persistent workspace browser</Text>
         <Text style={styles.title}>TabGoblin · {workspace?.name ?? "Workspace unavailable"}</Text>
-        <Text style={styles.subtext}>Server-owned browser state and explicit manual handoff. Nothing resumes automatically.</Text>
+        <Text style={styles.subtext}>Server-owned browser state and explicit manual handoff. Snapshots load initially and after successful actions; use Refresh all for an on-demand reread.</Text>
       </View>
 
       <View style={styles.columns}>
@@ -398,7 +406,7 @@ export function TabGoblinPanel({ theme, host, layout, workspaceId }: PluginWorks
           <View style={styles.banner} accessibilityLiveRegion="polite">
             <Text style={styles.headline}>{state.headline}</Text>
             <Text style={styles.detail}>{state.detail}</Text>
-            <Text style={styles.meta}>{lastUpdated(statusQuery.dataUpdatedAt)}</Text>
+            <Text style={styles.meta}>{lastUpdated(statusQuery.dataUpdatedAt)} · Manual refresh mode; this retained panel does not detect every reopen.</Text>
             {status ? <Text style={styles.meta}>Ownership generation {status.ownership.generation}</Text> : null}
           </View>
 
@@ -407,7 +415,7 @@ export function TabGoblinPanel({ theme, host, layout, workspaceId }: PluginWorks
             <View style={styles.buttonRow}>
               <ActionButton label={pending?.action === "start" ? "Starting…" : "Start browser"} onPress={() => input && void perform("start", () => startBrowser(input))} disabled={busy || !input || !available.start || config?.effectiveEnabled !== true} emphasis="primary" colors={theme.colors} />
               <ActionButton label="Stop browser" onPress={() => setStopConfirmation(true)} disabled={busy || !input || !available.stop} emphasis="danger" colors={theme.colors} />
-              <ActionButton label="Refresh" onPress={() => void statusQuery.refetch()} disabled={!input || statusQuery.isFetching} colors={theme.colors} />
+              <ActionButton label="Refresh all" onPress={() => void refreshPanelQueries(refetchers)} disabled={!input || configQuery.isFetching || statusQuery.isFetching || tabsQuery.isFetching || activityQuery.isFetching} colors={theme.colors} />
             </View>
             <View style={styles.buttonRow}>
               <ActionButton label="Open live viewer" onPress={() => void openViewer()} disabled={!available.viewer} emphasis="primary" colors={theme.colors} />
@@ -493,7 +501,7 @@ export function TabGoblinPanel({ theme, host, layout, workspaceId }: PluginWorks
             {status?.sessionState === "ready" && tabsQuery.isLoading ? <Text style={styles.detail}>Loading tabs…</Text> : null}
             {status?.sessionState === "ready" && tabsQuery.isError ? <Text style={styles.warning}>Tabs unavailable. Refresh browser status before trying again.</Text> : null}
             {status?.sessionState === "ready" && tabsQuery.isSuccess && tabs.length === 0 ? <Text style={styles.detail}>No open tabs reported.</Text> : null}
-            {tabsQuery.isSuccess ? tabs.map((tab) => (
+            {status?.sessionState === "ready" && tabsQuery.isSuccess ? tabs.map((tab) => (
               <View key={tab.tabId} style={styles.tabRow}>
                 <Text style={styles.tabTitle} numberOfLines={1}>{tab.active ? "Active · " : ""}{tab.title}</Text>
                 <Text style={styles.tabUrl} numberOfLines={1}>{tab.url}</Text>

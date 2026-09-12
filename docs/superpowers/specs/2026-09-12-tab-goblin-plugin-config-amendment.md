@@ -23,3 +23,9 @@ The probe establishes the deployed Claude stdio-child inheritance behavior neede
 ## Gateway transport requirements
 
 The Unix-socket client bounds response **bytes** (not JavaScript string length) and uses an absolute wall-clock deadline independent of response activity. Transport failures return the existing structured `runtime_unavailable` response.
+
+## Approved panel refresh fallback
+
+Paseo 0.8 retains up to three inactive workspace tabs and hides them with `RetainedPanel` rather than unmounting their children. The public `PluginWorkspacePanelProps` contract exposes no active or visible signal, and the host's retained-panel activity context is not part of the plugin SDK. TabGoblin must not import that private context or infer panel visibility through DOM APIs.
+
+The approved fallback is manual refresh: configuration, status, tabs and activity fetch on initial mount or workspace/host query-key change, after successful mutations, and when the user selects **Refresh all**. They do not poll on an interval or automatically refetch on window focus or network reconnect. The panel shows the last successful status timestamp and states that retained-panel reopen is not automatically detected. The local pairing-expiry timer may continue because it performs no network request and prevents an expired code from remaining visible. Live viewer streaming and the persistent browser runtime are independent of this panel query policy and remain unaffected.

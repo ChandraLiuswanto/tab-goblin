@@ -5,7 +5,6 @@ import {
   describeState,
   initialEphemeralState,
   panelEphemeralReducer,
-  pollInterval,
   sanitizeTabs,
   statusResponseIssue,
   viewerAddress,
@@ -121,12 +120,6 @@ describe("panel request safety", () => {
       expiresAt: "earlier",
     });
     expect(stale.pairing?.code).toBe("LATEST");
-  });
-
-  it("backs status polling off after errors and caps it at thirty seconds", () => {
-    expect(pollInterval(0)).toBe(3_000);
-    expect(pollInterval(1)).toBe(6_000);
-    expect(pollInterval(9)).toBe(30_000);
   });
 
   it("fails closed on cross-workspace and regressed ownership generations", () => {

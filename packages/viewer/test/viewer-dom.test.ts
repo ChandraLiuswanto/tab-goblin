@@ -380,6 +380,71 @@ describe("viewer DOM and transport behavior", () => {
     expect(elements.get("banner")!.textContent).toBe("connection lost");
   });
 
+  it("releases tracked modifiers on ownership revoke, but rejects new keys after revoke", async () => {
+    let controlsRequested = false;
+    let returnedControl = false;
+    const fetchMock = vi.fn(async (path: string) => {
+      if (path === "/api/pair") return response({ workspaceId: "workspace-a", csrfToken: "csrf-token", viewOnly: true });
+      if (path === "/api/take-control") {
+        controlsRequested = true;
+        return response({});
+      }
+      if (path === "/api/return-to-agent") {
+        returnedControl = true;
+        return response({});
+      }
+      if (!controlsRequested) return response(status(1));
+      return response(returnedControl ? status(3, "agent-ready", "agent", false) : status(2, "manual", "viewer", true));
+    });
+    const { elements } = await boot(fetchMock);
+    const rfb = await pairAndConnect(elements);
+    const input = elements.get("keyboard-input")!;
+    elements.get("take-control")!.dispatchEvent(new Event("click"));
+    await flush();
+    input.dispatchEvent(eventWithData("keydown", { key: "Shift", code: "ShiftLeft", isComposing: false }));
+    input.dispatchEvent(eventWithData("keydown", { key: "Control", code: "ControlLeft", isComposing: false }));
+
+    elements.get("return-to-agent")!.dispatchEvent(new Event("click"));
+    input.dispatchEvent(eventWithData("keyup", { key: "Shift", code: "ShiftLeft", isComposing: false }));
+    input.dispatchEvent(eventWithData("keyup", { key: "Control", code: "ControlLeft", isComposing: false }));
+    input.dispatchEvent(eventWithData("keydown", { key: "Alt", code: "AltLeft", isComposing: false }));
+    await flush();
+
+    expect(rfb.sentKeys).toEqual([
+      [0xffe1, "ShiftLeft", true],
+      [0xffe3, "ControlLeft", true],
+      [0xffe1, "ShiftLeft", false],
+      [0xffe3, "ControlLeft", false],
+    ]);
+  });
+
+  it("releases tracked modifiers before successful sign-out disconnects the transport", async () => {
+    let controlsRequested = false;
+    const fetchMock = vi.fn(async (path: string) => {
+      if (path === "/api/pair") return response({ workspaceId: "workspace-a", csrfToken: "csrf-token", viewOnly: true });
+      if (path === "/api/take-control") {
+        controlsRequested = true;
+        return response({});
+      }
+      if (path === "/api/sign-out") return response({});
+      return response(controlsRequested ? status(2, "manual", "viewer", true) : status(1));
+    });
+    const { elements } = await boot(fetchMock);
+    const rfb = await pairAndConnect(elements);
+    const input = elements.get("keyboard-input")!;
+    elements.get("take-control")!.dispatchEvent(new Event("click"));
+    await flush();
+    input.dispatchEvent(eventWithData("keydown", { key: "Shift", code: "ShiftLeft", isComposing: false }));
+    elements.get("sign-out")!.dispatchEvent(new Event("click"));
+    await flush();
+
+    expect(rfb.sentKeys).toEqual([
+      [0xffe1, "ShiftLeft", true],
+      [0xffe1, "ShiftLeft", false],
+    ]);
+    expect(rfb.disconnected).toBe(true);
+  });
+
   it("requires the session-specific isOwner status flag, not generic viewer ownership, before enabling input", async () => {
     let controlsRequested = false;
     const fetchMock = vi.fn(async (path: string) => {

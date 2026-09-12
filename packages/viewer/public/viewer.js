@@ -34178,9 +34178,18 @@ function statusText(current) {
 function canSendInput() {
   return transportConnected && !signOutPending && !signOutFailure && ui.kind === "controlling";
 }
+function releaseTrackedKeys() {
+  const activeRfb = rfb;
+  if (activeRfb && transportConnected) {
+    for (const [code, keysym] of pressedKeys) activeRfb.sendKey(keysym, code, false);
+  }
+  pressedKeys.clear();
+}
 function setUi(next) {
+  const previouslyAllowed = canSendInput();
   ui = next;
   const inputAllowed = canSendInput();
+  if (previouslyAllowed && !inputAllowed) releaseTrackedKeys();
   banner.textContent = statusText(next);
   pairing.classList.toggle("hidden", next.kind !== "pairing");
   screen.classList.toggle("hidden", next.kind === "pairing");
@@ -34274,9 +34283,9 @@ function connectVnc() {
     void refreshStatus();
   });
   rfb.addEventListener("disconnect", () => {
+    pressedKeys.clear();
     if (connectionEpoch !== transportEpoch || !csrfToken2) return;
     transportConnected = false;
-    pressedKeys.clear();
     invalidateStatusRequests();
     setUi(nextUi(ui, { type: "socket-closed" }));
     scheduleReconnect();
@@ -34400,22 +34409,23 @@ function physicalKeysym(key) {
   return match ? 65469 + Number(match[1]) : null;
 }
 function forwardPhysicalKey(event) {
-  if (!canSendInput() || composing || !rfb) return;
-  const printable = event.key.length === 1 || event.key === "Dead";
   if (event.type === "keydown") {
+    if (!canSendInput() || composing || !rfb) return;
+    const printable = event.key.length === 1 || event.key === "Dead";
     if (printable || event.repeat) return;
-    const keysym = physicalKeysym(event.key);
-    if (keysym === null) return;
-    pressedKeys.set(event.code, keysym);
-    rfb.sendKey(keysym, event.code, true);
+    const keysym2 = physicalKeysym(event.key);
+    if (keysym2 === null) return;
+    pressedKeys.set(event.code, keysym2);
+    rfb.sendKey(keysym2, event.code, true);
     event.preventDefault();
-  } else {
-    const keysym = pressedKeys.get(event.code);
-    if (keysym === void 0) return;
-    pressedKeys.delete(event.code);
-    rfb.sendKey(keysym, event.code, false);
-    event.preventDefault();
+    return;
   }
+  const keysym = pressedKeys.get(event.code);
+  if (keysym === void 0) return;
+  pressedKeys.delete(event.code);
+  if (!rfb || !transportConnected) return;
+  rfb.sendKey(keysym, event.code, false);
+  event.preventDefault();
 }
 function finishComposition(text) {
   compositionCommitPending = false;
@@ -34459,6 +34469,7 @@ function handleInput(event) {
 }
 async function signOutViewer() {
   if (!csrfToken2 || signOutPending || signOutAttempts >= MAX_SIGN_OUT_ATTEMPTS) return;
+  releaseTrackedKeys();
   signOutPending = true;
   if (rfb) rfb.viewOnly = true;
   setUi(ui);

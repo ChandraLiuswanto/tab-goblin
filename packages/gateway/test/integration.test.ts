@@ -450,12 +450,18 @@ describeLive(`TabGoblin integrated runtime${LIVE_IMAGE ? "" : " (skipped: set TA
     expect(initialReloadSettings.workspaceGenerations[workspaceId]).toBe(initialReload.scope!.workspaceGeneration);
     const bridge = initialReload.bridge!;
 
-    // Recreate the runtime once before login; this proves an enrolled bridge can
-    // start the same persistent profile after an ordinary stop.
+    // Recreate the runtime once before login. The durable profile must survive,
+    // while the upload staged by the preceding test must not cross the stop boundary.
+    const profileMarker = "/profile/t16-profile-marker";
+    const stagedUpload = "/staging/meaningful-upload.bin";
+    requirePodman(["exec", containerName, "sh", "-c", `printf profile-retained > ${profileMarker}`]);
+    expect(podman(["exec", containerName, "test", "-f", stagedUpload]).code).toBe(0);
     expect(await gateway!.request({ op: "stop", workspaceId })).toEqual({ ok: true });
     const restarted = await bridge.callTool({ name: "tabgoblin_start", arguments: {} });
     expect(restarted.isError, textContent(restarted)).not.toBe(true);
     expect(jsonContent<{ sessionState: string }>(restarted).sessionState).toBe("ready");
+    expect(requirePodman(["exec", containerName, "cat", profileMarker]).trim()).toBe("profile-retained");
+    expect(podman(["exec", containerName, "test", "!", "-e", stagedUpload]).code).toBe(0);
     await installFixture(containerName, directory);
     const tab = jsonContent<{ tabId: string }>(await bridge.callTool({ name: "tabgoblin_new_tab", arguments: { url: `${fixtureUrl}/login` } }));
     let snapshot = jsonContent<{ nodes: Array<{ name: string; role: string; ref: string }> }>(await bridge.callTool({ name: "tabgoblin_snapshot", arguments: { tabId: tab.tabId } }));

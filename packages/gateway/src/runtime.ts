@@ -50,6 +50,7 @@ interface Entry {
   starting: Promise<RuntimeEndpoints> | null;
   stopping: Promise<void> | null;
   blocked: Promise<void> | null;
+  stagingCleanupPending: boolean;
 }
 
 interface PodmanResult {
@@ -178,15 +179,19 @@ export class RuntimeSupervisor {
       starting: null,
       stopping: null,
       blocked: null,
+      stagingCleanupPending: true,
     };
     this.entries.set(workspaceId, entry);
 
     const name = containerNameFor(workspaceId);
     const deadline = this.deadline(this.timeout);
-    entry.starting = this.withLifecycleLock(name, deadline, () => this.launch(workspaceId, deadline))
+    entry.starting = this.withLifecycleLock(name, deadline, () =>
+      this.launch(workspaceId, entry, deadline),
+    )
       .then((runtimeEndpoints) => {
         entry.state = "ready";
         entry.endpoints = runtimeEndpoints;
+        entry.stagingCleanupPending = true;
         return runtimeEndpoints;
       })
       .catch((error: unknown) => {
@@ -216,8 +221,14 @@ export class RuntimeSupervisor {
     const deadline = this.deadline(this.stopOperationTimeout);
     entry.stopping = this.withLifecycleLock(containerName, deadline, async () => {
       const state = await this.existingContainerState(containerName, workspaceId, deadline);
-      if (state === null) return;
-      await this.removeOwnedContainer(containerName, state, deadline);
+      if (state !== null) {
+        entry.stagingCleanupPending = true;
+        await this.removeOwnedContainer(containerName, state, deadline);
+      }
+      if (entry.stagingCleanupPending) {
+        await this.resetStagingVolume(workspaceId, deadline);
+        entry.stagingCleanupPending = false;
+      }
     })
       .then(() => {
         entry.state = "stopped";
@@ -275,6 +286,7 @@ export class RuntimeSupervisor {
       starting: null,
       stopping: null,
       blocked: null,
+      stagingCleanupPending: true,
     };
   }
 
@@ -285,7 +297,11 @@ export class RuntimeSupervisor {
     });
   }
 
-  private async launch(workspaceId: string, deadline: number): Promise<RuntimeEndpoints> {
+  private async launch(
+    workspaceId: string,
+    entry: Entry,
+    deadline: number,
+  ): Promise<RuntimeEndpoints> {
     const containerName = containerNameFor(workspaceId);
     const volumeName = volumeNameFor(workspaceId);
     const stagingName = `${volumeName}-staging`;
@@ -305,17 +321,17 @@ export class RuntimeSupervisor {
       );
     }
 
+    await this.resetStagingVolume(workspaceId, deadline);
+    entry.stagingCleanupPending = false;
     await this.requireSuccess(
       ["volume", "create", "--ignore", volumeName],
       "prepare the browser profile volume",
       deadline,
     );
-    await this.requireSuccess(
-      ["volume", "create", "--ignore", stagingName],
-      "prepare the browser staging volume",
-      deadline,
-    );
 
+    // From the first container mutation onward, a later stop must reset staging
+    // even if startup fails before readiness is established.
+    entry.stagingCleanupPending = true;
     const run = await this.invoke([
       "run",
       "-d",
@@ -447,6 +463,7 @@ export class RuntimeSupervisor {
     const deadline = this.deadline(this.stopOperationTimeout);
     const state = await this.existingContainerState(containerName, workspaceId, deadline);
     if (state !== null) await this.removeOwnedContainer(containerName, state, deadline);
+    await this.resetStagingVolume(workspaceId, deadline);
   }
 
   private async publishedPort(
@@ -483,6 +500,31 @@ export class RuntimeSupervisor {
     await this.requireSuccess(
       ["rm", "--ignore", containerName],
       "remove the stopped browser runtime",
+      deadline,
+    );
+  }
+
+  private async resetStagingVolume(workspaceId: string, deadline: number): Promise<void> {
+    const stagingName = `${volumeNameFor(workspaceId)}-staging`;
+    const exists = await this.invoke(
+      ["volume", "exists", stagingName],
+      "check the browser staging volume",
+      deadline,
+    );
+    if (exists.code === 0) {
+      // Deliberately omit --force: a volume attached to any live or uncertain
+      // container must make cleanup fail closed instead of deleting live data.
+      await this.requireSuccess(
+        ["volume", "rm", stagingName],
+        "clear the browser staging volume",
+        deadline,
+      );
+    } else if (exists.code !== 1) {
+      throw unavailable("Could not check the browser staging volume");
+    }
+    await this.requireSuccess(
+      ["volume", "create", stagingName],
+      "prepare the browser staging volume",
       deadline,
     );
   }

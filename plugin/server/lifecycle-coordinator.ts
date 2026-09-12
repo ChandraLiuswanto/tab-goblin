@@ -14,7 +14,9 @@ function revocationPending(body: Parameters<GatewayClient["request"]>[0]): Pendi
 }
 
 function isGeneration(response: AdminResponse | undefined): response is AdminResponse & { ok: true; lifecycleGeneration: number } {
-  return !!response && response.ok && typeof response.lifecycleGeneration === "number";
+  if (!response?.ok) return false;
+  const generation = response.lifecycleGeneration;
+  return generation !== undefined && Number.isSafeInteger(generation) && generation >= 0;
 }
 
 /**
@@ -41,7 +43,7 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
     const responses = await manager.switchSocketPath(settings.read().socketPath, revocations, timeoutMs);
     // The manager retains its old socket when any revoke fails. Keep every intent
     // durable too: none may be replayed against the replacement socket.
-    if (responses.length !== pending.length || responses.some((response) => !response.ok)) return new Map();
+    if (responses.length !== pending.length || responses.some((response) => !isGeneration(response))) return new Map();
     await settings.update((value) => ({
       ...value,
       pendingRevocations: value.pendingRevocations.filter((item) => !pending.some((candidate) => candidate.kind === item.kind && candidate.id === item.id)),
@@ -71,7 +73,7 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
     // Persist intent before I/O: a reload can replay an interrupted cleanup safely.
     await remember(pending);
     const response = await request(pending.kind === "agent" ? { op: "revoke-agent", agentId: pending.id } : { op: "revoke-workspace", workspaceId: pending.id }, timeoutMs);
-    if (!response?.ok) return false;
+    if (!isGeneration(response)) return false;
     await settings.update((current) => ({
       ...current,
       pendingRevocations: current.pendingRevocations.filter((item) => item.kind !== pending.kind || item.id !== pending.id),

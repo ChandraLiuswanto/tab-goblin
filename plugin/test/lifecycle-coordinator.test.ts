@@ -19,11 +19,21 @@ describe("durable lifecycle coordinator", () => {
     expect(settings.read().enabledWorkspaceCwds).toEqual(["/w"]);
     expect(settings.read().workspaceGenerations).toEqual({ ws: 7 });
     expect(settings.read().pendingRevocations).toEqual([{ kind: "workspace", id: "ws" }]);
-    const secondGateway = { request: vi.fn().mockResolvedValue({ ok: true }), notify: vi.fn(), close: vi.fn() } as any;
+    const secondGateway = { request: vi.fn().mockResolvedValue({ ok: true, lifecycleGeneration: 8 }), notify: vi.fn(), close: vi.fn() } as any;
     const reloaded = createLifecycleCoordinator(createConfigStore(dirname(settings.path)), secondGateway);
     await reloaded.replayPending();
     expect(secondGateway.request).toHaveBeenCalledWith({ op: "revoke-workspace", workspaceId: "ws" }, expect.any(Number));
     expect(reloaded.settings().pendingRevocations).toEqual([]);
+  });
+
+  it("keeps a revoke pending when a protocol-valid success omits its lifecycle generation", async () => {
+    const settings = store(); await settings.update((current) => ({ ...current, workspaceGenerations: { ws: 3 } }));
+    const gateway = { request: vi.fn().mockResolvedValue({ ok: true }), notify: vi.fn(), close: vi.fn() } as any;
+    const coordinator = createLifecycleCoordinator(settings, gateway);
+    await expect(coordinator.revokeWorkspace("ws")).resolves.toBe(false);
+    expect(settings.read().pendingRevocations).toEqual([{ kind: "workspace", id: "ws" }]);
+    expect(settings.read().workspaceGenerations.ws).toBe(3);
+    expect(settings.read().revokedWorkspaceIds).toEqual([]);
   });
 
   it("does not retry an old-socket revoke on the replacement socket after a successful switch", async () => {
@@ -34,6 +44,15 @@ describe("durable lifecycle coordinator", () => {
     expect(gateway.switchSocketPath).toHaveBeenCalledWith("/new.sock", [{ op: "revoke-workspace", workspaceId: "ws" }], undefined);
     expect(gateway.request).not.toHaveBeenCalled();
     expect(settings.read().workspaceGenerations.ws).toBe(8);
+  });
+
+  it("keeps the old socket and all intents when a switch acknowledgement omits its lifecycle generation", async () => {
+    const settings = store(); await settings.update((current) => ({ ...current, socketPath: "/new.sock", workspaceGenerations: { ws: 3 } }));
+    const gateway = { socketPath: vi.fn(() => "/old.sock"), switchSocketPath: vi.fn().mockResolvedValue([{ ok: true }]), request: vi.fn().mockResolvedValue({ ok: true }), notify: vi.fn(), close: vi.fn() } as any;
+    const coordinator = createLifecycleCoordinator(settings, gateway);
+    await coordinator.revokeWorkspace("ws");
+    expect(settings.read().pendingRevocations).toEqual([{ kind: "workspace", id: "ws" }]);
+    expect(settings.read().revokedWorkspaceIds).toEqual([]);
   });
 
   it("persists the exact acknowledged revocation generation with its revoked marker", async () => {
@@ -63,7 +82,7 @@ describe("durable lifecycle coordinator", () => {
 
   it("persists cleanup intent before a failed revoke and resets only the still-enabled workspace", async () => {
     const settings = store(); await settings.update((current) => ({ ...current, enabled: true, enabledWorkspaceCwds: ["/w"], workspaceGenerations: { ws: 5 } }));
-    const gateway = { request: vi.fn().mockResolvedValueOnce(unavailable).mockResolvedValueOnce({ ok: true }).mockResolvedValueOnce({ ok: true, lifecycleGeneration: 8 }).mockResolvedValue({ ok: true }), notify: vi.fn(), close: vi.fn() } as any;
+    const gateway = { request: vi.fn().mockResolvedValueOnce(unavailable).mockResolvedValueOnce({ ok: true, lifecycleGeneration: 7 }).mockResolvedValueOnce({ ok: true, lifecycleGeneration: 8 }).mockResolvedValue({ ok: true }), notify: vi.fn(), close: vi.fn() } as any;
     const coordinator = createLifecycleCoordinator(settings, gateway);
     await coordinator.cleanup();
     expect(settings.read().pendingRevocations).toEqual([{ kind: "workspace", id: "ws" }]);

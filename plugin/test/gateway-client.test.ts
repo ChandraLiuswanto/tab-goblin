@@ -46,7 +46,7 @@ describe("gateway client", () => {
 
   it("revokes through the old socket before selecting a replacement socket", async () => {
     const directory = await mkdtemp(join(tmpdir(), "tabgoblin-plugin-")); const oldPath = join(directory, "old.sock"); const newPath = join(directory, "new.sock"); const events: string[] = [];
-    const oldServer = createServer((request, response) => { events.push(`old:${request.url}`); response.end(JSON.stringify({ ok: true })); });
+    const oldServer = createServer((request, response) => { events.push(`old:${request.url}`); response.end(JSON.stringify({ ok: true, lifecycleGeneration: 1 })); });
     const newServer = createServer((request, response) => { events.push(`new:${request.url}`); response.end(JSON.stringify({ ok: true })); });
     await Promise.all([new Promise<void>((resolve) => oldServer.listen(oldPath, resolve)), new Promise<void>((resolve) => newServer.listen(newPath, resolve))]);
     cleanup.push(() => Promise.all([oldServer, newServer].map((server) => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())))).then(() => rm(directory, { recursive: true })));
@@ -54,6 +54,16 @@ describe("gateway client", () => {
     await manager.switchSocketPath(newPath, [{ op: "revoke-workspace", workspaceId: "ws-1" }]);
     await manager.request({ op: "status", workspaceId: "ws-1" });
     expect(events).toEqual(["old:/", "new:/"]);
+  });
+
+  it("keeps the old socket when a protocol-valid revoke success omits its lifecycle generation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "tabgoblin-plugin-")); const oldPath = join(directory, "old.sock"); const newPath = join(directory, "new.sock");
+    const oldServer = createServer((_request, response) => response.end(JSON.stringify({ ok: true })));
+    await new Promise<void>((resolve) => oldServer.listen(oldPath, resolve));
+    cleanup.push(() => new Promise<void>((resolve, reject) => oldServer.close((error) => error ? reject(error) : resolve())).then(() => rm(directory, { recursive: true })));
+    const manager = createGatewayManager(() => oldPath);
+    await manager.switchSocketPath(newPath, [{ op: "revoke-workspace", workspaceId: "ws-1" }]);
+    expect(manager.socketPath()).toBe(oldPath);
   });
 
   it("keeps the old socket and its pending work when an old-socket revoke is not acknowledged", async () => {

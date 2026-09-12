@@ -10,6 +10,12 @@ function unavailable(): AdminResponse {
   return { ok: false, error: tabGoblinError("runtime_unavailable", "TabGoblin runtime is unavailable") };
 }
 
+function isRevokeAcknowledged(response: AdminResponse): response is AdminResponse & { ok: true; lifecycleGeneration: number } {
+  if (!response.ok) return false;
+  const generation = response.lifecycleGeneration;
+  return generation !== undefined && Number.isSafeInteger(generation) && generation >= 0;
+}
+
 export interface GatewayClient {
   request(body: AdminRequest, timeoutMs?: number): Promise<AdminResponse>;
   notify(body: AdminRequest): void;
@@ -80,7 +86,7 @@ export function createGatewayManager(readSocketPath: () => string): GatewayManag
       // Preserve both the old client and its durable intents unless every old-socket
       // revoke was acknowledged. Retrying an old intent through the replacement
       // socket could grant it authority over a different gateway instance.
-      if (responses.some((response) => !response.ok)) return responses;
+      if (responses.some((response) => !isRevokeAcknowledged(response))) return responses;
       const replacement = createGatewayClient(socketPath);
       current.close();
       current = replacement;

@@ -1,4 +1,4 @@
-import { chmodSync, lstatSync, mkdirSync, symlinkSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, renameSync, symlinkSync } from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,8 +21,17 @@ describe("app-owned durable config", () => {
     createConfigStore(dir);
     expect(lstatSync(first.path).mode & 0o777).toBe(0o600);
   });
-  it("rejects a symlinked app directory", () => {
-    const root = directory(); const target = join(root, "target"); mkdirSync(target); const linked = join(root, "linked"); symlinkSync(target, linked);
-    expect(() => createConfigStore(linked)).toThrow(/unsafe/);
+  it("rejects a symlink anywhere in the XDG state-home ancestor chain", () => {
+    const root = directory(); const target = join(root, "target"); mkdirSync(target); const linked = join(root, "state-link"); symlinkSync(target, linked);
+    const previous = process.env.XDG_STATE_HOME; process.env.XDG_STATE_HOME = linked;
+    try { expect(() => createConfigStore()).toThrow(/unsafe/); }
+    finally { if (previous === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = previous; }
+  });
+  it("keeps writes anchored to the verified directory descriptor after its path is swapped", async () => {
+    const root = directory(); const app = join(root, "app"); const store = createConfigStore(app); const verified = join(root, "verified");
+    renameSync(app, verified); mkdirSync(app, { mode: 0o700 });
+    await store.update((current) => ({ ...current, enabled: true }));
+    expect(createConfigStore(verified).read().enabled).toBe(true);
+    expect(createConfigStore(app).read().enabled).toBe(false);
   });
 });

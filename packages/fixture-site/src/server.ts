@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { type AddressInfo } from "node:net";
 
-const sessions = new Map<string, string>();
+const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
+
+class PayloadTooLargeError extends Error {}
 
 function page(title: string, body: string): string {
   return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body>${body}</body></html>`;
@@ -31,9 +33,24 @@ function cookieOf(request: IncomingMessage, name: string): string | null {
 }
 
 async function readBody(request: IncomingMessage): Promise<Buffer> {
+  const declaredLength = Number(request.headers["content-length"] ?? "0");
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BODY_BYTES) {
+    request.resume();
+    throw new PayloadTooLargeError();
+  }
+
   const chunks: Buffer[] = [];
-  for await (const chunk of request) chunks.push(Buffer.from(chunk));
-  return Buffer.concat(chunks);
+  let byteLength = 0;
+  for await (const chunk of request) {
+    const buffer = Buffer.from(chunk);
+    byteLength += buffer.length;
+    if (byteLength > MAX_REQUEST_BODY_BYTES) {
+      request.resume();
+      throw new PayloadTooLargeError();
+    }
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks, byteLength);
 }
 
 function slowDelay(value: string | null): number {
@@ -45,8 +62,14 @@ function slowDelay(value: string | null): number {
 export async function startFixtureSite(
   port = 0,
 ): Promise<{ url: string; close(): Promise<void> }> {
+  const sessions = new Map<string, string>();
   const server = createServer((request, response) => {
-    void handle(request, response).catch(() => {
+    void handle(request, response, sessions).catch((error: unknown) => {
+      if (response.writableEnded) return;
+      if (error instanceof PayloadTooLargeError) {
+        response.writeHead(413, { "content-type": "text/html; charset=utf-8" }).end(page("Too large", "<h1>413</h1>"));
+        return;
+      }
       response.writeHead(500).end("error");
     });
   });
@@ -54,11 +77,22 @@ export async function startFixtureSite(
   const { port: bound } = server.address() as AddressInfo;
   return {
     url: `http://127.0.0.1:${bound}`,
-    close: () => new Promise((resolve) => server.close(() => resolve())),
+    close: () =>
+      new Promise((resolve, reject) =>
+        server.close((error) => {
+          sessions.clear();
+          if (error) reject(error);
+          else resolve();
+        }),
+      ),
   };
 }
 
-async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+async function handle(
+  request: IncomingMessage,
+  response: ServerResponse,
+  sessions: Map<string, string>,
+): Promise<void> {
   const url = new URL(request.url ?? "/", "http://127.0.0.1");
   const send = (status: number, html: string, headers: Record<string, string> = {}): void => {
     response.writeHead(status, { "content-type": "text/html; charset=utf-8", ...headers }).end(html);

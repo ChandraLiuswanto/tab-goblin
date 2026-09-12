@@ -1,7 +1,37 @@
+import { request as httpRequest } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { startFixtureSite } from "../src/server.js";
 
 let site: Awaited<ReturnType<typeof startFixtureSite>>;
+const MAX_FIXTURE_BODY_BYTES = 1024 * 1024;
+
+function postChunked(url: string, body: Buffer): Promise<{ status: number; body: string }> {
+  const target = new URL(url);
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(
+      {
+        hostname: target.hostname,
+        port: target.port,
+        path: target.pathname + target.search,
+        method: "POST",
+        headers: {
+          "content-type": "multipart/form-data; boundary=fixture",
+          "transfer-encoding": "chunked",
+        },
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("end", () => {
+          resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") });
+        });
+      },
+    );
+    request.on("error", reject);
+    request.write(body.subarray(0, 32 * 1024));
+    request.end(body.subarray(32 * 1024));
+  });
+}
 
 beforeAll(async () => {
   site = await startFixtureSite();
@@ -42,5 +72,65 @@ describe("fixture site", () => {
     const started = Date.now();
     await fetch(site.url + "/slow?ms=300");
     expect(Date.now() - started).toBeGreaterThanOrEqual(250);
+  });
+
+  it("rejects oversized declared and chunked POST bodies while accepting valid requests", async () => {
+    const upload = await fetch(site.url + "/upload", {
+      method: "POST",
+      headers: { "content-type": "multipart/form-data; boundary=fixture" },
+      body: '--fixture\r\nContent-Disposition: form-data; name="file"; filename="sample.txt"\r\n\r\nabc\r\n--fixture--\r\n',
+    });
+    expect(upload.status).toBe(200);
+    expect(await upload.text()).toContain("sample.txt");
+
+    const oversized = Buffer.alloc(MAX_FIXTURE_BODY_BYTES + 1, "x");
+    const declared = await fetch(site.url + "/login", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        "content-length": oversized.byteLength.toString(),
+      },
+      body: oversized,
+      redirect: "manual",
+    });
+    expect(declared.status).toBe(413);
+
+    const chunked = await postChunked(site.url + "/upload", oversized);
+    expect(chunked.status).toBe(413);
+
+    const login = await fetch(site.url + "/login", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: "username=after-limit&password=fixture-only",
+      redirect: "manual",
+    });
+    expect(login.status).toBe(302);
+  });
+
+  it("isolates sessions per fixture instance and clears them on close", async () => {
+    const first = await startFixtureSite();
+    const second = await startFixtureSite();
+    let cookie = "";
+    try {
+      const login = await fetch(first.url + "/login", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: "username=isolated&password=fixture-only",
+        redirect: "manual",
+      });
+      cookie = (login.headers.get("set-cookie") ?? "").split(";", 1)[0];
+      expect((await fetch(first.url + "/account", { headers: { cookie } })).status).toBe(200);
+      expect((await fetch(second.url + "/account", { headers: { cookie } })).status).toBe(401);
+    } finally {
+      await second.close();
+      await first.close();
+    }
+
+    const replacement = await startFixtureSite();
+    try {
+      expect((await fetch(replacement.url + "/account", { headers: { cookie } })).status).toBe(401);
+    } finally {
+      await replacement.close();
+    }
   });
 });

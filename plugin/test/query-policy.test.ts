@@ -56,7 +56,7 @@ describe("manual panel refresh policy", () => {
     const order: string[] = [];
     const refetchers = {
       config: vi.fn(async () => { order.push("config"); return {}; }),
-      status: vi.fn(async () => { order.push("status"); return { data: { ok: true as const, status: { sessionState: "ready" } } }; }),
+      status: vi.fn(async () => { order.push("status"); return { isSuccess: true as const, data: { ok: true as const, status: { sessionState: "ready" } } }; }),
       tabs: vi.fn(async () => { order.push("tabs"); return {}; }),
       activity: vi.fn(async () => { order.push("activity"); return {}; }),
     };
@@ -68,10 +68,22 @@ describe("manual panel refresh policy", () => {
     expect(order.at(-1)).toBe("tabs");
   });
 
+  it("does not fetch tabs when a failed status refetch retains stale ready data", async () => {
+    const refetchers = {
+      config: vi.fn(async () => ({})),
+      status: vi.fn(async () => ({ isSuccess: false as const, data: { ok: true as const, status: { sessionState: "ready" } } })),
+      tabs: vi.fn(async () => ({})),
+      activity: vi.fn(async () => ({})),
+    };
+    await refreshPanelQueries(refetchers);
+    expect(refetchers.status).toHaveBeenCalledOnce();
+    expect(refetchers.tabs).not.toHaveBeenCalled();
+  });
+
   it("rereads after successful mutations but never after a failed action", async () => {
     const refetchers = {
       config: vi.fn(async () => ({})),
-      status: vi.fn(async () => ({ data: { ok: true as const, status: { sessionState: "stopped" } } })),
+      status: vi.fn(async () => ({ isSuccess: true as const, data: { ok: true as const, status: { sessionState: "stopped" } } })),
       tabs: vi.fn(async () => ({})),
       activity: vi.fn(async () => ({})),
     };

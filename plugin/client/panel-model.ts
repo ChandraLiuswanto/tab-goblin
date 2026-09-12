@@ -82,7 +82,7 @@ export const manualQueryPolicy = {
   refetchInterval: false,
 } as const;
 
-type RefetchResult = { data?: { ok: boolean; status?: { sessionState: string } } };
+type RefetchResult = { isSuccess: boolean; data?: { ok: boolean; status?: { sessionState: string } } };
 export type PanelRefetchers = {
   config(): Promise<unknown>;
   status(): Promise<RefetchResult>;
@@ -96,7 +96,7 @@ export async function refreshPanelQueries(refetchers: PanelRefetchers, includeCo
     refetchers.activity(),
     includeConfig ? refetchers.config() : Promise.resolve(),
   ]);
-  if (statusResult.data?.ok && statusResult.data.status?.sessionState === "ready") {
+  if (statusResult.isSuccess && statusResult.data?.ok && statusResult.data.status?.sessionState === "ready") {
     await refetchers.tabs();
   }
 }

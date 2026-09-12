@@ -73,16 +73,53 @@ describe("isNavigableUrl", () => {
 });
 
 describe("boundedText", () => {
-  it("truncates and marks truncation", () => {
-    expect(boundedText("abcdefghij", 5)).toBe("abcde" + ELLIPSIS);
+  it("reserves space for the truncation marker", () => {
+    expect(boundedText("abcdefghij", 5)).toBe("abcd" + ELLIPSIS);
+    expect(boundedText("abcdefghij", 5)).toHaveLength(5);
   });
 
-  it("leaves short text alone", () => {
+  it("handles zero and one-character caps without exceeding them", () => {
+    expect(boundedText("abc", 0)).toBe("");
+    expect(boundedText("abc", 1)).toBe(ELLIPSIS);
+  });
+
+  it("leaves text at or below the cap alone", () => {
+    expect(boundedText("abcde", 5)).toBe("abcde");
     expect(boundedText("abc", 5)).toBe("abc");
   });
 
-  it("strips unsafe control characters from untrusted page text", () => {
-    expect(boundedText("a" + NUL + "b" + ESC + "c", 10)).toBe("abc");
+  it("strips unsafe control characters before applying the cap", () => {
+    expect(boundedText("a" + NUL + "b" + ESC + "c", 3)).toBe("abc");
+  });
+
+  it.each([
+    -1,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+  ])(
+    "rejects invalid max %s",
+    (max) => {
+      expect(() => boundedText("abc", max)).toThrow(RangeError);
+    },
+  );
+
+  it("produces values accepted by downstream 40 and 200 character schema caps", () => {
+    const result = ActivityRecordSchema.safeParse({
+      operationId: "op1",
+      source: "agent:a1",
+      tabId: "t1",
+      action: boundedText("a".repeat(41), 40),
+      status: "ok",
+      startedAt: "2026-09-12T00:00:00.000Z",
+      endedAt: null,
+      code: null,
+      url: "https://x/",
+      title: boundedText("t".repeat(201), 200),
+    });
+
+    expect(result.success).toBe(true);
   });
 });
 
@@ -97,6 +134,14 @@ describe("structured errors", () => {
     expect(tabGoblinError("timeout_uncertain", "Inspect state before retrying").retryable).toBe(
       false,
     );
+  });
+
+  it("uses the full schema allowance when bounding long messages", () => {
+    const error = tabGoblinError("invalid_input", "x".repeat(401));
+
+    expect(error.message).toHaveLength(400);
+    expect(error.message.endsWith(ELLIPSIS)).toBe(true);
+    expect(TabGoblinErrorSchema.safeParse(error).success).toBe(true);
   });
 
   it("bounds messages and rejects unknown codes", () => {

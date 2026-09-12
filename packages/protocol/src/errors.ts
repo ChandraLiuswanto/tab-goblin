@@ -34,6 +34,5 @@ export function tabGoblinError(
   message: string,
   retryable = RETRYABLE.has(code),
 ): TabGoblinError {
-  // boundedText appends an ellipsis when truncating, so 399 keeps the wire maximum at 400.
-  return { code, message: boundedText(message, 399), retryable };
+  return { code, message: boundedText(message, 400), retryable };
 }

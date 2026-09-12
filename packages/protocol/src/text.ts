@@ -18,7 +18,9 @@ export function boundedText(value: string, max: number): string {
   }
 
   const clean = value.replace(CONTROL, "");
-  return clean.length > max ? clean.slice(0, max) + ELLIPSIS : clean;
+  if (clean.length <= max) return clean;
+  if (max === 0) return "";
+  return clean.slice(0, max - 1) + ELLIPSIS;
 }
 
 export function redactUrl(raw: string): string {

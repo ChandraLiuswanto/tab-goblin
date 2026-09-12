@@ -213,6 +213,26 @@ describe("durable lifecycle coordinator", () => {
     await expect(coordinator.openSession({ agentId: "new", workspaceId: "archived", cwd: "/w", purpose: "interactive", enrollment: "33333333-3333-4333-8333-333333333333" })).resolves.toBeUndefined();
   });
 
+  it("lets an explicit archive override a cleanup rotation and remain closed on reopen", async () => {
+    const settings = store();
+    await settings.update((current) => ({ ...current, gatewayInstanceId: "11111111-1111-4111-8111-111111111111", enabled: true, enabledWorkspaceCwds: ["/w"], activeAgentIds: ["agent"], agentGenerations: { agent: 2 }, workspaceGenerations: { ws: 3 } }));
+    const calls: any[] = [];
+    const gateway = { request: vi.fn(async (body) => {
+      calls.push(body);
+      if (body.op === "health") return { ok: true, protocolVersion: 1, gatewayInstanceId: "11111111-1111-4111-8111-111111111111" };
+      return body.op.startsWith("revoke-") ? { ok: true, lifecycleGeneration: 4 } : { ok: true };
+    }), notify: vi.fn(), close: vi.fn() } as any;
+    const coordinator = createLifecycleCoordinator(settings, gateway);
+
+    await coordinator.cleanup();
+    expect(settings.read()).toMatchObject({ rotatingWorkspaceIds: ["ws"], revokedWorkspaceIds: [] });
+    await expect(coordinator.revokeWorkspace("ws")).resolves.toBe(true);
+    expect(settings.read()).toMatchObject({ rotatingWorkspaceIds: [], revokedWorkspaceIds: ["ws"] });
+
+    await expect(coordinator.openSession({ agentId: "agent", workspaceId: "ws", cwd: "/w", purpose: "interactive", enrollment: "44444444-4444-4444-8444-444444444444" })).resolves.toBeUndefined();
+    expect(calls.filter((body) => body.op === "reset-workspace" || body.op === "record-enrollment")).toEqual([]);
+  });
+
   it("serializes deferred enables so an older response cannot roll back a newer generation", async () => {
     const settings = store(); await settings.update((current) => ({ ...current, enabled: true }));
     let releaseFirst!: (value: unknown) => void; const firstResponse = new Promise((resolve) => { releaseFirst = resolve; });

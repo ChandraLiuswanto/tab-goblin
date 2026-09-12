@@ -182,8 +182,9 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
       const deadline = Date.now() + 2_000;
       for (const pending of settings.read().pendingRevocations) { const remaining = deadline - Date.now(); if (remaining <= 0) break; await revoke(pending, remaining); }
     }),
-    revokeAgent: (agentId: string) => serialize(() => revoke({ kind: "agent", id: agentId })),
-    revokeWorkspace: (workspaceId: string) => serialize(() => revoke({ kind: "workspace", id: workspaceId })),
+    // These are explicit archive/opt-out actions, never cleanup replay.
+    revokeAgent: (agentId: string) => serialize(() => revoke({ kind: "agent", id: agentId }, undefined, false)),
+    revokeWorkspace: (workspaceId: string) => serialize(() => revoke({ kind: "workspace", id: workspaceId }, undefined, false)),
     setGlobalEnabled: (enabled: boolean) => serialize(async () => {
       const current = settings.read();
       if (enabled) {
@@ -218,7 +219,7 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
       for (const target of targets) {
         const remaining = deadline - Date.now();
         if (remaining <= 0) { acknowledged = false; break; }
-        try { if (!await revoke(target, remaining)) acknowledged = false; }
+        try { if (!await revoke(target, remaining, false)) acknowledged = false; }
         catch { acknowledged = false; }
       }
       return { ok: acknowledged };
@@ -263,7 +264,7 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
       return { ok: true as const };
     }),
     disableWorkspace: (workspaceId: string, cwd: string) => serialize(async () => {
-      if (!await revoke({ kind: "workspace", id: workspaceId })) return { ok: false as const };
+      if (!await revoke({ kind: "workspace", id: workspaceId }, undefined, false)) return { ok: false as const };
       await settings.update((current) => ({
         ...current,
         enabledWorkspaceCwds: current.enabledWorkspaceCwds.filter((item) => item !== cwd),

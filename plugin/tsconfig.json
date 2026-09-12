@@ -7,7 +7,7 @@
       "@tab-goblin/protocol": ["../packages/protocol/src/index.ts"]
     },
     "lib": ["ES2023"],
-    "types": ["react"],
+    "types": ["react", "node"],
     "jsx": "react-jsx",
     "strict": true,
     "skipLibCheck": true,

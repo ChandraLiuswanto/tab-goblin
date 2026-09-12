@@ -1,8 +1,13 @@
 import { createHash } from "node:crypto";
-import { tabGoblinError, type SessionState } from "@tab-goblin/protocol";
+import { tabGoblinError, type SessionState, type TabGoblinError } from "@tab-goblin/protocol";
 
+/**
+ * T9 production executors MUST terminate the child process when this signal aborts.
+ * Promise.race bounds the caller only; honoring the signal prevents late external mutation.
+ */
 export type PodmanExec = (
   args: string[],
+  signal?: AbortSignal,
 ) => Promise<{ code: number; stdout: string; stderr: string }>;
 
 export interface RuntimeEndpoints {
@@ -16,10 +21,12 @@ export interface RuntimeEndpoints {
 export interface RuntimeSupervisorOptions {
   podman: PodmanExec;
   image: string;
-  probe: (cdpUrl: string) => Promise<boolean>;
+  /** T9 production probes MUST cancel their request when this signal aborts. */
+  probe: (cdpUrl: string, signal?: AbortSignal) => Promise<boolean>;
   startTimeoutMs?: number;
+  operationTimeoutMs?: number;
   now?: () => number;
-  sleep?: (ms: number) => Promise<void>;
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
 interface Entry {
@@ -27,6 +34,7 @@ interface Entry {
   endpoints: RuntimeEndpoints | null;
   starting: Promise<RuntimeEndpoints> | null;
   stopping: Promise<void> | null;
+  blocked: Promise<void> | null;
 }
 
 interface PodmanResult {
@@ -35,9 +43,19 @@ interface PodmanResult {
   stderr: string;
 }
 
+const DEFAULT_START_TIMEOUT_MS = 60_000;
+const DEFAULT_OPERATION_TIMEOUT_MS = 30_000;
+const MAX_TIMER_MS = 2_147_483_647;
 const GRACEFUL_STOP_SECONDS = 20;
 const POLL_INTERVAL_MS = 500;
 const lifecycleLocks = new Map<string, Promise<void>>();
+
+class DeadlineExceeded {
+  constructor(
+    readonly failure: TabGoblinError,
+    readonly quiesced: Promise<void>,
+  ) {}
+}
 
 function slug(workspaceId: string): string {
   const readable = workspaceId
@@ -56,34 +74,45 @@ export function volumeNameFor(workspaceId: string): string {
   return `tabgoblin-profile-${slug(workspaceId)}`;
 }
 
-function unavailable(message: string) {
+function unavailable(message: string): TabGoblinError {
   return tabGoblinError("runtime_unavailable", message);
 }
 
-function withLifecycleLock<T>(name: string, operation: () => Promise<T>): Promise<T> {
-  const previous = lifecycleLocks.get(name) ?? Promise.resolve();
-  const result = previous.catch(() => undefined).then(operation);
-  const settled = result.then(
-    () => undefined,
-    () => undefined,
-  );
-  lifecycleLocks.set(name, settled);
-  void settled.finally(() => {
-    if (lifecycleLocks.get(name) === settled) lifecycleLocks.delete(name);
-  });
-  return result;
+function duration(value: number | undefined, fallback: number, option: string): number {
+  const selected = value ?? fallback;
+  if (!Number.isFinite(selected) || selected <= 0 || selected > MAX_TIMER_MS) {
+    throw tabGoblinError("invalid_input", `${option} must be a finite positive duration`);
+  }
+  return selected;
 }
 
 export class RuntimeSupervisor {
   private readonly entries = new Map<string, Entry>();
   private readonly timeout: number;
+  private readonly operationTimeout: number;
   private readonly now: () => number;
-  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
 
   constructor(private readonly options: RuntimeSupervisorOptions) {
-    this.timeout = options.startTimeoutMs ?? 60_000;
+    this.timeout = duration(options.startTimeoutMs, DEFAULT_START_TIMEOUT_MS, "startTimeoutMs");
+    this.operationTimeout = duration(
+      options.operationTimeoutMs,
+      DEFAULT_OPERATION_TIMEOUT_MS,
+      "operationTimeoutMs",
+    );
     this.now = options.now ?? Date.now;
-    this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.sleep = options.sleep ?? ((ms, signal) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(signal?.reason ?? new Error("Sleep aborted"));
+      };
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener("abort", onAbort, { once: true });
+    }));
   }
 
   state(workspaceId: string): SessionState {
@@ -96,6 +125,9 @@ export class RuntimeSupervisor {
 
   start(workspaceId: string): Promise<RuntimeEndpoints> {
     const existing = this.entries.get(workspaceId);
+    if (existing?.blocked) {
+      return Promise.reject(unavailable("A prior browser runtime operation has not terminated"));
+    }
     if (existing?.stopping) {
       return existing.stopping.then(() => this.start(workspaceId));
     }
@@ -109,11 +141,13 @@ export class RuntimeSupervisor {
       endpoints: null,
       starting: null,
       stopping: null,
+      blocked: null,
     };
     this.entries.set(workspaceId, entry);
 
     const name = containerNameFor(workspaceId);
-    entry.starting = withLifecycleLock(name, () => this.launch(workspaceId))
+    const deadline = this.deadline(this.timeout);
+    entry.starting = this.withLifecycleLock(name, deadline, () => this.launch(workspaceId, deadline))
       .then((runtimeEndpoints) => {
         entry.state = "ready";
         entry.endpoints = runtimeEndpoints;
@@ -122,6 +156,10 @@ export class RuntimeSupervisor {
       .catch((error: unknown) => {
         entry.state = "failed";
         entry.endpoints = null;
+        if (error instanceof DeadlineExceeded) {
+          this.blockEntry(entry, error.quiesced);
+          throw error.failure;
+        }
         throw error;
       })
       .finally(() => {
@@ -131,18 +169,20 @@ export class RuntimeSupervisor {
   }
 
   async stop(workspaceId: string): Promise<void> {
-    const entry = this.entries.get(workspaceId) ?? {
-      state: "stopped" as const,
-      endpoints: null,
-      starting: null,
-      stopping: null,
-    };
+    const entry = this.entries.get(workspaceId) ?? this.newStoppedEntry();
     this.entries.set(workspaceId, entry);
+    if (entry.blocked) {
+      throw unavailable("A prior browser runtime operation has not terminated");
+    }
     if (entry.stopping) return entry.stopping;
 
-    entry.stopping = withLifecycleLock(containerNameFor(workspaceId), () =>
-      this.gracefullyRemove(containerNameFor(workspaceId)),
-    )
+    const containerName = containerNameFor(workspaceId);
+    const deadline = this.deadline(this.operationTimeout);
+    entry.stopping = this.withLifecycleLock(containerName, deadline, async () => {
+      const state = await this.existingContainerState(containerName, workspaceId, deadline);
+      if (state === null) return;
+      await this.removeOwnedContainer(containerName, state, deadline);
+    })
       .then(() => {
         entry.state = "stopped";
         entry.endpoints = null;
@@ -150,6 +190,10 @@ export class RuntimeSupervisor {
       .catch((error: unknown) => {
         entry.state = "failed";
         entry.endpoints = null;
+        if (error instanceof DeadlineExceeded) {
+          this.blockEntry(entry, error.quiesced);
+          throw error.failure;
+        }
         throw error;
       })
       .finally(() => {
@@ -163,22 +207,53 @@ export class RuntimeSupervisor {
       throw tabGoblinError("invalid_input", "The staging file name must be a plain file name");
     }
 
+    const containerName = containerNameFor(workspaceId);
     const target = `/staging/${name}`;
-    await this.requireSuccess(
-      ["cp", hostPath, `${containerNameFor(workspaceId)}:${target}`],
-      "stage the file into the browser runtime",
-    );
-    return target;
+    const deadline = this.deadline(this.operationTimeout);
+    try {
+      return await this.withLifecycleLock(containerName, deadline, async () => {
+        const state = await this.existingContainerState(containerName, workspaceId, deadline);
+        if (state !== "running") {
+          throw unavailable("File staging requires an owned running browser runtime");
+        }
+        await this.requireSuccess(
+          ["cp", hostPath, `${containerName}:${target}`],
+          "stage the file into the browser runtime",
+          deadline,
+        );
+        return target;
+      });
+    } catch (error: unknown) {
+      if (error instanceof DeadlineExceeded) throw error.failure;
+      throw error;
+    }
   }
 
-  private async launch(workspaceId: string): Promise<RuntimeEndpoints> {
+  private newStoppedEntry(): Entry {
+    return {
+      state: "stopped",
+      endpoints: null,
+      starting: null,
+      stopping: null,
+      blocked: null,
+    };
+  }
+
+  private blockEntry(entry: Entry, quiesced: Promise<void>): void {
+    entry.blocked = quiesced;
+    void quiesced.then(() => {
+      if (entry.blocked === quiesced) entry.blocked = null;
+    });
+  }
+
+  private async launch(workspaceId: string, deadline: number): Promise<RuntimeEndpoints> {
     const containerName = containerNameFor(workspaceId);
     const volumeName = volumeNameFor(workspaceId);
     const stagingName = `${volumeName}-staging`;
-    const existingState = await this.existingContainerState(containerName, workspaceId);
+    const existingState = await this.existingContainerState(containerName, workspaceId, deadline);
 
     if (existingState === "running") {
-      return this.resolveAndAwaitReady(containerName, volumeName, true);
+      return this.resolveAndAwaitReady(workspaceId, containerName, volumeName, deadline);
     }
     if (existingState && !this.isStaleState(existingState)) {
       throw unavailable(`The existing browser runtime is ${existingState}; refusing to replace it`);
@@ -187,16 +262,19 @@ export class RuntimeSupervisor {
       await this.requireSuccess(
         ["rm", "--ignore", containerName],
         "remove the stale browser runtime",
+        deadline,
       );
     }
 
     await this.requireSuccess(
       ["volume", "create", "--ignore", volumeName],
       "prepare the browser profile volume",
+      deadline,
     );
     await this.requireSuccess(
       ["volume", "create", "--ignore", stagingName],
       "prepare the browser staging volume",
+      deadline,
     );
 
     const run = await this.invoke([
@@ -216,34 +294,34 @@ export class RuntimeSupervisor {
       "--label",
       `tabgoblin.workspace=${workspaceId}`,
       this.options.image,
-    ], "start the browser runtime");
-    if (run.code !== 0) {
-      throw unavailable("Could not start the browser runtime");
-    }
+    ], "start the browser runtime", deadline);
+    if (run.code !== 0) throw unavailable("Could not start the browser runtime");
 
-    return this.resolveAndAwaitReady(containerName, volumeName, true);
+    return this.resolveAndAwaitReady(workspaceId, containerName, volumeName, deadline);
   }
 
   private async existingContainerState(
     containerName: string,
     workspaceId: string,
+    deadline: number,
   ): Promise<string | null> {
     const exists = await this.invoke(
       ["container", "exists", containerName],
       "check for an existing browser runtime",
+      deadline,
     );
     if (exists.code === 1) return null;
-    if (exists.code !== 0) {
-      throw unavailable("Could not check for an existing browser runtime");
-    }
+    if (exists.code !== 0) throw unavailable("Could not check for an existing browser runtime");
 
     const status = await this.requireSuccess(
       ["inspect", "--format", "{{.State.Status}}", containerName],
       "inspect the existing browser runtime",
+      deadline,
     );
     const label = await this.requireSuccess(
       ["inspect", "--format", '{{ index .Config.Labels "tabgoblin.workspace" }}', containerName],
       "inspect the existing browser runtime owner",
+      deadline,
     );
     if (label.stdout.trim() !== workspaceId) {
       throw unavailable("The existing browser runtime belongs to a different workspace");
@@ -259,13 +337,14 @@ export class RuntimeSupervisor {
   }
 
   private async resolveAndAwaitReady(
+    workspaceId: string,
     containerName: string,
     volumeName: string,
-    cleanUpOnFailure: boolean,
+    deadline: number,
   ): Promise<RuntimeEndpoints> {
     try {
-      const cdpPort = await this.publishedPort(containerName, 9222);
-      const vncPort = await this.publishedPort(containerName, 5900);
+      const cdpPort = await this.publishedPort(containerName, 9222, deadline);
+      const vncPort = await this.publishedPort(containerName, 5900, deadline);
       const runtimeEndpoints: RuntimeEndpoints = {
         containerName,
         volumeName,
@@ -274,32 +353,72 @@ export class RuntimeSupervisor {
         vncPort,
       };
 
-      const deadline = this.now() + this.timeout;
-      while (this.now() < deadline) {
+      while (true) {
+        let ready = false;
         try {
-          if (await this.options.probe(runtimeEndpoints.cdpUrl)) return runtimeEndpoints;
-        } catch {
-          // A transient probe transport failure means "not ready" until the deadline.
+          ready = await this.withDeadline(
+            deadline,
+            "wait for the browser runtime readiness probe",
+            (signal) => this.options.probe(runtimeEndpoints.cdpUrl, signal),
+          );
+        } catch (error: unknown) {
+          if (error instanceof DeadlineExceeded) throw error;
         }
-        await this.sleep(POLL_INTERVAL_MS);
+        if (ready) return runtimeEndpoints;
+
+        const pause = Math.min(POLL_INTERVAL_MS, Math.max(1, deadline - this.now()));
+        await this.withDeadline(deadline, "wait to retry the browser runtime probe", (signal) =>
+          this.sleep(pause, signal),
+        );
       }
-      throw unavailable("The browser runtime did not become ready in time");
     } catch (error: unknown) {
-      if (cleanUpOnFailure) {
-        try {
-          await this.gracefullyRemove(containerName);
-        } catch {
-          // Preserve the original bounded startup failure. Cleanup remains non-destructive.
+      if (error instanceof DeadlineExceeded) {
+        throw new DeadlineExceeded(
+          error.failure,
+          this.cleanupAfterQuiescence(error.quiesced, workspaceId, containerName),
+        );
+      }
+
+      try {
+        await this.cleanupOwned(workspaceId, containerName);
+      } catch (cleanupError: unknown) {
+        if (cleanupError instanceof DeadlineExceeded) {
+          throw new DeadlineExceeded(unavailable("Browser runtime startup cleanup timed out"), cleanupError.quiesced);
         }
       }
       throw error;
     }
   }
 
-  private async publishedPort(containerName: string, internalPort: number): Promise<number> {
+  private cleanupAfterQuiescence(
+    quiesced: Promise<void>,
+    workspaceId: string,
+    containerName: string,
+  ): Promise<void> {
+    return quiesced.then(async () => {
+      try {
+        await this.cleanupOwned(workspaceId, containerName);
+      } catch (error: unknown) {
+        if (error instanceof DeadlineExceeded) await error.quiesced;
+      }
+    });
+  }
+
+  private async cleanupOwned(workspaceId: string, containerName: string): Promise<void> {
+    const deadline = this.deadline(this.operationTimeout);
+    const state = await this.existingContainerState(containerName, workspaceId, deadline);
+    if (state !== null) await this.removeOwnedContainer(containerName, state, deadline);
+  }
+
+  private async publishedPort(
+    containerName: string,
+    internalPort: number,
+    deadline: number,
+  ): Promise<number> {
     const result = await this.requireSuccess(
       ["port", containerName, `${internalPort}/tcp`],
       "resolve a browser runtime port",
+      deadline,
     );
     const lines = result.stdout.trim().split("\n").filter(Boolean);
     const match = lines.length === 1 ? /^127\.0\.0\.1:(\d+)$/.exec(lines[0]!) : null;
@@ -310,28 +429,95 @@ export class RuntimeSupervisor {
     return port;
   }
 
-  private async gracefullyRemove(containerName: string): Promise<void> {
-    await this.requireSuccess(
-      ["stop", "--ignore", "--time", String(GRACEFUL_STOP_SECONDS), containerName],
-      "stop the browser runtime gracefully",
-    );
+  private async removeOwnedContainer(
+    containerName: string,
+    state: string,
+    deadline: number,
+  ): Promise<void> {
+    if (!this.isStaleState(state)) {
+      await this.requireSuccess(
+        ["stop", "--ignore", "--time", String(GRACEFUL_STOP_SECONDS), containerName],
+        "stop the browser runtime gracefully",
+        deadline,
+      );
+    }
     await this.requireSuccess(
       ["rm", "--ignore", containerName],
       "remove the stopped browser runtime",
+      deadline,
     );
   }
 
-  private async requireSuccess(args: string[], action: string): Promise<PodmanResult> {
-    const result = await this.invoke(args, action);
+  private async requireSuccess(
+    args: string[],
+    action: string,
+    deadline: number,
+  ): Promise<PodmanResult> {
+    const result = await this.invoke(args, action, deadline);
     if (result.code !== 0) throw unavailable(`Could not ${action}`);
     return result;
   }
 
-  private async invoke(args: string[], action: string): Promise<PodmanResult> {
+  private async invoke(args: string[], action: string, deadline: number): Promise<PodmanResult> {
     try {
-      return await this.options.podman(args);
-    } catch {
+      return await this.withDeadline(deadline, action, (signal) => this.options.podman(args, signal));
+    } catch (error: unknown) {
+      if (error instanceof DeadlineExceeded) throw error;
       throw unavailable(`Could not ${action}`);
     }
+  }
+
+  private deadline(timeout: number): number {
+    return this.now() + timeout;
+  }
+
+  private async withDeadline<T>(
+    deadline: number,
+    action: string,
+    operation: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const remaining = deadline - this.now();
+    if (remaining <= 0) {
+      throw new DeadlineExceeded(unavailable(`Timed out while trying to ${action}`), Promise.resolve());
+    }
+
+    const controller = new AbortController();
+    const operationPromise = Promise.resolve().then(() => operation(controller.signal));
+    const quiesced = operationPromise.then(
+      () => undefined,
+      () => undefined,
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new DeadlineExceeded(unavailable(`Timed out while trying to ${action}`), quiesced));
+      }, Math.max(1, Math.ceil(remaining)));
+    });
+
+    try {
+      return await Promise.race([operationPromise, timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  private withLifecycleLock<T>(
+    name: string,
+    deadline: number,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = lifecycleLocks.get(name) ?? Promise.resolve();
+    const result = this.withDeadline(deadline, "wait for the prior browser runtime operation", () => previous)
+      .then(operation);
+    const hold = result.then(
+      () => undefined,
+      (error: unknown) => error instanceof DeadlineExceeded ? error.quiesced : undefined,
+    );
+    lifecycleLocks.set(name, hold);
+    void hold.then(() => {
+      if (lifecycleLocks.get(name) === hold) lifecycleLocks.delete(name);
+    });
+    return result;
   }
 }

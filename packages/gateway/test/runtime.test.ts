@@ -16,7 +16,7 @@ function fakePodman(options: FakePodmanOptions = {}) {
   let containerState = options.state ?? "missing";
   const workspaceId = options.workspaceId ?? "w1";
   const calls: string[][] = [];
-  const exec: PodmanExec = vi.fn(async (args: string[]) => {
+  const exec: PodmanExec = vi.fn(async (args: string[], _signal?: AbortSignal) => {
     calls.push(args);
 
     if (args[0] === "container" && args[1] === "exists") {
@@ -188,14 +188,14 @@ describe("start", () => {
 
   it("gracefully stops then removes a newly launched container when readiness times out", async () => {
     const podman = fakePodman();
-    let clock = 0;
     const runtime = supervisor(podman.exec, {
       probe: async () => false,
-      startTimeoutMs: 3,
-      now: () => clock++,
+      startTimeoutMs: 15,
+      sleep: async () => new Promise<void>((resolve) => setTimeout(resolve, 1)),
     });
 
     await expect(runtime.start("w1")).rejects.toMatchObject({ code: "runtime_unavailable" });
+    await vi.waitFor(() => expect(podman.calls.some((args) => args[0] === "rm")).toBe(true));
 
     const stopIndex = podman.calls.findIndex((args) => args[0] === "stop");
     const removeIndex = podman.calls.findIndex((args) => args[0] === "rm");
@@ -204,6 +204,66 @@ describe("start", () => {
     expect(podman.calls[removeIndex]).not.toContain("-f");
     expect(runtime.state("w1")).toBe("failed");
   });
+
+  it("bounds a never-settling published-port command, aborts it, and fails closed", async () => {
+    const workspaceId = "port-timeout";
+    const podman = fakePodman({ workspaceId });
+    let rejectPort!: (error: Error) => void;
+    const pendingPort = new Promise<{ code: number; stdout: string; stderr: string }>((_resolve, reject) => {
+      rejectPort = reject;
+    });
+    let portSignal: AbortSignal | undefined;
+    const exec = vi.fn<PodmanExec>((args, signal) => {
+      if (args[0] === "port" && args.at(-1) === "9222/tcp") {
+        portSignal = signal;
+        return pendingPort;
+      }
+      return podman.exec(args, signal);
+    });
+    const runtime = supervisor(exec, { startTimeoutMs: 15, operationTimeoutMs: 15 });
+    const unhandled: unknown[] = [];
+    const captureUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", captureUnhandled);
+
+    try {
+      await expect(runtime.start(workspaceId)).rejects.toMatchObject({ code: "runtime_unavailable" });
+      expect(runtime.state(workspaceId)).toBe("failed");
+      expect(portSignal?.aborted).toBe(true);
+
+      const callsAtTimeout = exec.mock.calls.length;
+      await expect(runtime.start(workspaceId)).rejects.toMatchObject({ code: "runtime_unavailable" });
+      const restartedSupervisor = supervisor(exec, { startTimeoutMs: 15, operationTimeoutMs: 15 });
+      await expect(restartedSupervisor.start(workspaceId)).rejects.toMatchObject({
+        code: "runtime_unavailable",
+      });
+      expect(exec.mock.calls).toHaveLength(callsAtTimeout);
+
+      rejectPort(new Error("late child rejection"));
+      await vi.waitFor(() => expect(podman.calls.some((args) => args[0] === "stop")).toBe(true));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", captureUnhandled);
+    }
+  }, 1_000);
+
+  it("bounds and aborts a never-settling readiness probe", async () => {
+    const workspaceId = "probe-timeout";
+    const podman = fakePodman({ workspaceId });
+    let probeSignal: AbortSignal | undefined;
+    const runtime = supervisor(podman.exec, {
+      startTimeoutMs: 15,
+      operationTimeoutMs: 15,
+      probe: async (_url, signal) => {
+        probeSignal = signal;
+        return new Promise<boolean>(() => {});
+      },
+    });
+
+    await expect(runtime.start(workspaceId)).rejects.toMatchObject({ code: "runtime_unavailable" });
+    expect(probeSignal?.aborted).toBe(true);
+    expect(runtime.state(workspaceId)).toBe("failed");
+  }, 1_000);
 });
 
 describe("stop", () => {
@@ -217,8 +277,8 @@ describe("stop", () => {
 
     const stopCalls = podman.calls.filter((args) => args[0] === "stop");
     const removeCalls = podman.calls.filter((args) => args[0] === "rm");
-    expect(stopCalls).toHaveLength(2);
-    expect(removeCalls).toHaveLength(2);
+    expect(stopCalls).toHaveLength(1);
+    expect(removeCalls).toHaveLength(1);
     for (let index = 0; index < stopCalls.length; index += 1) {
       const seconds = Number(stopCalls[index][stopCalls[index].indexOf("--time") + 1]);
       expect(seconds).toBeGreaterThanOrEqual(15);
@@ -230,10 +290,50 @@ describe("stop", () => {
     expect(runtime.state("w1")).toBe("stopped");
     expect(runtime.endpoints("w1")).toBeNull();
   });
+
+  it("treats a missing container as an idempotent no-op", async () => {
+    const podman = fakePodman({ state: "missing", workspaceId: "missing-stop" });
+    const runtime = supervisor(podman.exec);
+
+    await runtime.stop("missing-stop");
+
+    expect(podman.calls.some((args) => args[0] === "stop" || args[0] === "rm")).toBe(false);
+    expect(runtime.state("missing-stop")).toBe("stopped");
+  });
+
+  it("rejects a foreign same-name container without stopping or removing it", async () => {
+    const podman = fakePodman({ state: "running", workspaceId: "someone-else" });
+    const runtime = supervisor(podman.exec);
+
+    await expect(runtime.stop("owned-workspace")).rejects.toMatchObject({ code: "runtime_unavailable" });
+
+    expect(podman.calls.some((args) => args[0] === "stop" || args[0] === "rm")).toBe(false);
+    expect(runtime.state("owned-workspace")).toBe("failed");
+  });
+
+  it("bounds a never-settling stop command and passes it an abort signal", async () => {
+    const workspaceId = "stop-timeout";
+    const podman = fakePodman({ state: "running", workspaceId });
+    let stopSignal: AbortSignal | undefined;
+    const exec: PodmanExec = vi.fn((args, signal) => {
+      if (args[0] === "stop") {
+        stopSignal = signal;
+        return new Promise(() => {});
+      }
+      return podman.exec(args, signal);
+    });
+    const runtime = supervisor(exec, { operationTimeoutMs: 15 });
+
+    await expect(runtime.stop(workspaceId)).rejects.toMatchObject({ code: "runtime_unavailable" });
+
+    expect(stopSignal?.aborted).toBe(true);
+    expect(runtime.state(workspaceId)).toBe("failed");
+    expect(podman.calls.some((args) => args[0] === "rm")).toBe(false);
+  }, 1_000);
 });
 
 describe("staging", () => {
-  it("copies into the controlled staging path and maps failures", async () => {
+  it("copies into the controlled staging path of an owned running container and maps failures", async () => {
     const podman = fakePodman({ state: "running" });
     const runtime = supervisor(podman.exec);
 
@@ -246,9 +346,48 @@ describe("staging", () => {
       `${containerNameFor("w1")}:/staging/report.txt`,
     ]);
 
-    const failing = supervisor(async () => result(125, "", "copy failed"));
-    await expect(failing.stageFile("w1", "/workspace/report.txt", "report.txt")).rejects.toMatchObject({
-      code: "runtime_unavailable",
+    const failingPodman = fakePodman({ state: "running", workspaceId: "copy-failure" });
+    const failing = supervisor(async (args, signal) => {
+      if (args[0] === "cp") return result(125, "", "copy failed");
+      return failingPodman.exec(args, signal);
     });
+    await expect(
+      failing.stageFile("copy-failure", "/workspace/report.txt", "report.txt"),
+    ).rejects.toMatchObject({ code: "runtime_unavailable" });
   });
+
+  it("rejects missing, stopped, and foreign containers without copying", async () => {
+    const cases = [
+      fakePodman({ state: "missing", workspaceId: "missing-stage" }),
+      fakePodman({ state: "exited", workspaceId: "stopped-stage" }),
+      fakePodman({ state: "running", workspaceId: "someone-else" }),
+    ];
+
+    for (const [index, podman] of cases.entries()) {
+      const workspaceId = ["missing-stage", "stopped-stage", "foreign-stage"][index]!;
+      await expect(
+        supervisor(podman.exec).stageFile(workspaceId, "/workspace/report.txt", "report.txt"),
+      ).rejects.toMatchObject({ code: "runtime_unavailable" });
+      expect(podman.calls.some((args) => args[0] === "cp")).toBe(false);
+    }
+  });
+
+  it("bounds a never-settling copy and passes it an abort signal", async () => {
+    const workspaceId = "stage-timeout";
+    const podman = fakePodman({ state: "running", workspaceId });
+    let copySignal: AbortSignal | undefined;
+    const exec: PodmanExec = vi.fn((args, signal) => {
+      if (args[0] === "cp") {
+        copySignal = signal;
+        return new Promise(() => {});
+      }
+      return podman.exec(args, signal);
+    });
+    const runtime = supervisor(exec, { operationTimeoutMs: 15 });
+
+    await expect(
+      runtime.stageFile(workspaceId, "/workspace/report.txt", "report.txt"),
+    ).rejects.toMatchObject({ code: "runtime_unavailable" });
+    expect(copySignal?.aborted).toBe(true);
+  }, 1_000);
 });

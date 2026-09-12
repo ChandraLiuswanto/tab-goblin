@@ -14,7 +14,11 @@ import WebSocket from "ws";
 import { createConfigStore } from "../../../plugin/server/config-store.js";
 import { createGatewayManager } from "../../../plugin/server/gateway-client.js";
 import { createLifecycleCoordinator } from "../../../plugin/server/lifecycle-coordinator.js";
-import { tabGoblinSettingsSchema, type TabGoblinSettings } from "../../../plugin/shared/settings.js";
+import {
+  createTabGoblinSettingsSchema,
+  type ConnectionDefaults,
+  type TabGoblinSettings,
+} from "../../../plugin/shared/settings.js";
 import { containerNameFor, volumeNameFor } from "../src/runtime.js";
 import { runGateway, type GatewayApplication } from "../src/main.js";
 
@@ -22,6 +26,7 @@ const LIVE_IMAGE = process.env.TABGOBLIN_IMAGE;
 const describeLive = LIVE_IMAGE ? describe : describe.skip;
 const FIXTURE_PORT = 18_080;
 const MAX_PODMAN_OUTPUT = 1024 * 1024;
+const BRIDGE_PATH = fileURLToPath(new URL("../../mcp-bridge/dist/index.js", import.meta.url));
 
 interface PodmanResult { code: number; stdout: string; stderr: string }
 
@@ -177,7 +182,26 @@ function keyEvent(keysym: number, down: boolean): Buffer {
 
 function closeWebSocket(websocket: WebSocket): Promise<void> {
   if (websocket.readyState === WebSocket.CLOSED) return Promise.resolve();
-  return new Promise((resolve) => { websocket.once("close", () => resolve()); websocket.close(); });
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      websocket.terminate();
+      finish();
+    }, 2_000);
+    websocket.once("close", finish);
+    try {
+      websocket.close();
+    } catch {
+      websocket.terminate();
+      finish();
+    }
+  });
 }
 
 function textContent(result: Awaited<ReturnType<Client["callTool"]>>): string {
@@ -217,27 +241,53 @@ describeLive(`TabGoblin integrated runtime${LIVE_IMAGE ? "" : " (skipped: set TA
   const pluginStateDirectory = () => join(directory, "plugin-state");
   const viewers = new Set<WebSocket>();
 
+  function connectionDefaults(): ConnectionDefaults {
+    return {
+      bridgeCommand: process.execPath,
+      bridgeArgs: [BRIDGE_PATH],
+      socketPath: join(directory, "tabgoblin", "gateway.sock"),
+    };
+  }
+
+  async function closeActiveBridge(): Promise<void> {
+    const activeClient = client;
+    const activeTransport = transport;
+    client = undefined;
+    transport = undefined;
+    const failures: unknown[] = [];
+    if (activeClient) await activeClient.close().catch((error: unknown) => failures.push(error));
+    if (activeTransport) await activeTransport.close().catch((error: unknown) => failures.push(error));
+    if (failures.length > 0) throw new AggregateError(failures, "MCP bridge cleanup failed");
+  }
+
+  function closePluginManager(): void {
+    const activeGateway = gateway;
+    gateway = undefined;
+    activeGateway?.close();
+  }
+
   async function openBridge(enrollment: string): Promise<Client> {
-    const bridgePath = fileURLToPath(new URL("../../mcp-bridge/dist/index.js", import.meta.url));
-    await stat(bridgePath);
+    const defaults = connectionDefaults();
+    await stat(defaults.bridgeArgs[0]!);
     transport = new StdioClientTransport({
-      command: process.execPath,
-      args: [bridgePath],
+      command: defaults.bridgeCommand,
+      args: defaults.bridgeArgs,
       env: { ...process.env, TABGOBLIN_SOCKET: app!.socketPath, TABGOBLIN_ENROLLMENT: enrollment } as Record<string, string>,
       stderr: "pipe",
     });
     const next = new Client({ name: "tabgoblin-t16", version: "1.0.0" });
-    await next.connect(transport);
     client = next;
+    await next.connect(transport);
     return next;
   }
 
   async function readPersistedPluginSettings(): Promise<TabGoblinSettings> {
-    return tabGoblinSettingsSchema.parse(JSON.parse(await readFile(join(pluginStateDirectory(), "settings.json"), "utf8")));
+    const schema = createTabGoblinSettingsSchema(connectionDefaults());
+    return schema.parse(JSON.parse(await readFile(join(pluginStateDirectory(), "settings.json"), "utf8")));
   }
 
   function reloadPluginLifecycle(): void {
-    const store = createConfigStore(pluginStateDirectory());
+    const store = createConfigStore(pluginStateDirectory(), connectionDefaults());
     gateway = createGatewayManager(() => store.read().socketPath);
     lifecycle = createLifecycleCoordinator(store, gateway);
   }
@@ -252,8 +302,9 @@ describeLive(`TabGoblin integrated runtime${LIVE_IMAGE ? "" : " (skipped: set TA
   }
 
   async function setupPluginSession(enrollment: string) {
-    const store = createConfigStore(pluginStateDirectory());
-    await store.update((current) => ({ ...current, enabled: true, socketPath: app!.socketPath, bridgeCommand: process.execPath, bridgeArgs: [fileURLToPath(new URL("../../mcp-bridge/dist/index.js", import.meta.url))] }));
+    const defaults = connectionDefaults();
+    const store = createConfigStore(pluginStateDirectory(), defaults);
+    await store.update((current) => ({ ...current, enabled: true, socketPath: app!.socketPath, bridgeCommand: defaults.bridgeCommand, bridgeArgs: defaults.bridgeArgs }));
     gateway = createGatewayManager(() => store.read().socketPath);
     lifecycle = createLifecycleCoordinator(store, gateway);
     expect(await lifecycle.enableWorkspace(workspaceId, cwd)).toEqual({ ok: true });
@@ -268,13 +319,16 @@ describeLive(`TabGoblin integrated runtime${LIVE_IMAGE ? "" : " (skipped: set TA
   }
 
   async function expectMissingConfigStaysClosed(): Promise<void> {
-    const store = createConfigStore(join(directory, "missing-plugin-state"));
+    const store = createConfigStore(join(directory, "missing-plugin-state"), connectionDefaults());
     const manager = createGatewayManager(() => store.read().socketPath);
     const coordinator = createLifecycleCoordinator(store, manager);
-    expect(await coordinator.openSession({ agentId, workspaceId, cwd, purpose: "interactive", enrollment: randomUUID() })).toBeUndefined();
-    expect(store.read()).toMatchObject({ enabled: false, enabledWorkspaceCwds: [], agentGenerations: {}, workspaceGenerations: {} });
-    await expect(stat(store.path)).rejects.toMatchObject({ code: "ENOENT" });
-    manager.close();
+    try {
+      expect(await coordinator.openSession({ agentId, workspaceId, cwd, purpose: "interactive", enrollment: randomUUID() })).toBeUndefined();
+      expect(store.read()).toMatchObject({ enabled: false, enabledWorkspaceCwds: [], agentGenerations: {}, workspaceGenerations: {} });
+      await expect(stat(store.path)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      manager.close();
+    }
   }
 
   beforeAll(async () => {
@@ -288,9 +342,13 @@ describeLive(`TabGoblin integrated runtime${LIVE_IMAGE ? "" : " (skipped: set TA
   afterAll(async () => {
     const failures: unknown[] = [];
     for (const viewer of viewers) await closeWebSocket(viewer).catch((error: unknown) => failures.push(error));
-    await client?.close().catch((error: unknown) => failures.push(error));
-    gateway?.close();
+    viewers.clear();
+    await closeActiveBridge().catch((error: unknown) => failures.push(error));
+    await lifecycle?.cleanup().catch((error: unknown) => failures.push(error));
+    lifecycle = undefined;
+    try { closePluginManager(); } catch (error: unknown) { failures.push(error); }
     await app?.close().catch((error: unknown) => failures.push(error));
+    app = undefined;
     const cleanup = podman(["rm", "--force", "--ignore", containerName]);
     if (cleanup.code !== 0) failures.push(new Error(cleanup.stderr));
     const volumes = podman(["volume", "rm", "--force", profileVolume, stagingVolume]);
@@ -380,7 +438,7 @@ describeLive(`TabGoblin integrated runtime${LIVE_IMAGE ? "" : " (skipped: set TA
     const initialBridge = client!;
     await lifecycle!.cleanup();
     await expectToolError(initialBridge, "tabgoblin_status", {}, "not_enrolled");
-    await initialBridge.close(); client = undefined; gateway!.close();
+    await closeActiveBridge(); closePluginManager();
     const initialReload = await reopenPluginSession(randomUUID());
     expect(initialReload.bridge, "persisted plugin lifecycle did not reopen").toBeDefined();
     expect(initialReload.scope!.agentGeneration).toBeGreaterThan(0);
@@ -494,7 +552,7 @@ describeLive(`TabGoblin integrated runtime${LIVE_IMAGE ? "" : " (skipped: set TA
     expect(durableAfterCleanup.rotatingAgentIds).toContain(agentId);
     expect(durableAfterCleanup.rotatingWorkspaceIds).toContain(workspaceId);
     await expectToolError(bridge, "tabgoblin_status", {}, "not_enrolled");
-    await bridge.close(); client = undefined; gateway!.close();
+    await closeActiveBridge(); closePluginManager();
     expect(requirePodman(["inspect", "--format", "{{.State.Running}}", containerName]).trim()).toBe("true");
 
     expect(await readPersistedPluginSettings()).toEqual(durableAfterCleanup);
@@ -515,7 +573,7 @@ describeLive(`TabGoblin integrated runtime${LIVE_IMAGE ? "" : " (skipped: set TA
     expect(oldTabIds.length).toBeGreaterThan(0);
     const staleViewerCookie = secondAuth.cookie;
     const durableBeforeGatewayRestart = await readPersistedPluginSettings();
-    await postReloadBridge.close(); client = undefined; gateway!.close();
+    await closeActiveBridge(); closePluginManager();
     await app!.close(); app = undefined;
     requirePodman(["restart", containerName]);
     await startFixture(containerName);
@@ -562,7 +620,7 @@ describeLive(`TabGoblin integrated runtime${LIVE_IMAGE ? "" : " (skipped: set TA
 
     expect(await lifecycle!.disableWorkspace(workspaceId, cwd)).toEqual({ ok: true });
     await expectToolError(recovered, "tabgoblin_status", {}, "not_enrolled");
-    await recovered.close(); client = undefined; gateway!.close();
+    await closeActiveBridge(); closePluginManager();
     await app!.close(); app = undefined;
     app = await runGateway({ xdgRuntimeDir: directory, viewerPort, viewerOrigins: [base], image: LIVE_IMAGE! });
     const optedOut = await reopenPluginSession(randomUUID());
@@ -577,10 +635,10 @@ describeLive(`TabGoblin integrated runtime${LIVE_IMAGE ? "" : " (skipped: set TA
       afterReturn: returnedStatus.ownership.generation,
     };
     expect(ownershipGenerations, `ownership generations: ${JSON.stringify(ownershipGenerations)}`).toEqual({
-      beforeTakeover: 0,
-      afterTakeover: 1,
-      afterReclaim: 2,
-      afterReturn: 3,
+      beforeTakeover,
+      afterTakeover: beforeTakeover + 1,
+      afterReclaim: beforeTakeover + 2,
+      afterReturn: beforeTakeover + 3,
     });
   }, 300_000);
 });

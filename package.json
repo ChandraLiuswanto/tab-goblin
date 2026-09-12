@@ -1,0 +1,16 @@
+{
+  "name": "tab-goblin",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/*", "plugin"],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "npm run typecheck -w @tab-goblin/protocol && npm run typecheck -w plugin",
+    "build": "npm run build -w @tab-goblin/protocol"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.6"
+  }
+}

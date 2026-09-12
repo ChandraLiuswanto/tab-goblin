@@ -1,7 +1,8 @@
 import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { defaultTabGoblinSettings, tabGoblinSettingsSchema, type TabGoblinSettings } from "../shared/settings.js";
+import { createTabGoblinSettingsSchema, type ConnectionDefaults, type TabGoblinSettings } from "../shared/settings.js";
+import { deriveServerConnectionDefaults } from "./defaults.js";
 
 const CONFIG_FILE = "settings.json";
 const OWNER_DIRECTORY_MODE = 0o700;
@@ -80,13 +81,13 @@ function openPrivateFile(directoryFd: number, name: string): number {
   return fd;
 }
 
-function readConfig(directoryFd: number): TabGoblinSettings {
+function readConfig(directoryFd: number, parse: (value: unknown) => TabGoblinSettings, defaults: TabGoblinSettings): TabGoblinSettings {
   try {
     const fd = openPrivateFile(directoryFd, CONFIG_FILE);
-    try { return tabGoblinSettingsSchema.parse(JSON.parse(readFileSync(fd, "utf8"))); }
+    try { return parse(JSON.parse(readFileSync(fd, "utf8"))); }
     finally { closeSync(fd); }
   } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaultTabGoblinSettings;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaults;
     throw error;
   }
 }
@@ -117,11 +118,13 @@ export interface ConfigStore {
 }
 
 /** Synchronous load guarantees hooks have a durable fail-closed value at registration time. */
-export function createConfigStore(directory = appDirectory()): ConfigStore {
+export function createConfigStore(directory = appDirectory(), connectionDefaults: ConnectionDefaults = deriveServerConnectionDefaults()): ConfigStore {
+  const settingsSchema = createTabGoblinSettingsSchema(connectionDefaults);
+  const defaults = settingsSchema.parse({});
   const absoluteDirectory = resolve(directory);
   const directoryFd = openPrivateDirectory(absoluteDirectory);
   let value: TabGoblinSettings;
-  try { value = readConfig(directoryFd); }
+  try { value = readConfig(directoryFd, settingsSchema.parse, defaults); }
   catch (error) { closeSync(directoryFd); throw error; }
   let writes = Promise.resolve();
   return {
@@ -129,7 +132,7 @@ export function createConfigStore(directory = appDirectory()): ConfigStore {
     read: () => value,
     update(change) {
       const run = writes.then(() => {
-        const next = tabGoblinSettingsSchema.parse(change(value));
+        const next = settingsSchema.parse(change(value));
         writeConfig(directoryFd, next);
         value = next;
         return next;

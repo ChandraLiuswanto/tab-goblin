@@ -26,32 +26,42 @@ const pendingRevocations = z.array(z.object({
   id: z.string().min(1).max(128),
 }).strict()).max(512);
 
-/** App-owned server configuration. It is intentionally not a Paseo host setting. */
-export const tabGoblinSettingsSchema = z.object({
-  enabled: z.boolean().default(false),
-  enabledWorkspaceCwds: z.array(boundedString).max(256).default([]),
-  bridgeCommand: boundedString.default("node"),
-  bridgeArgs: z.array(boundedString).max(32).default([]),
-  socketPath: socketPathSchema.default("/tmp/tabgoblin.sock"),
-  viewerUrl: viewerUrlSchema.default(""),
-  // The ephemeral gateway process identity fences durable lifecycle generations.
-  // It is not a credential and changes on every gateway restart.
-  gatewayInstanceId: z.string().uuid().nullable().default(null),
-  workspaceGenerations: generationMap.default({}),
-  agentGenerations: generationMap.default({}),
-  // Active IDs are cleanup targets, not credentials or lifecycle generations.
-  activeAgentIds: boundedIds.default([]),
-  // Agent tombstones are never implicitly revived by opening a session.
-  revokedAgentIds: boundedIds.default([]),
-  // A workspace tombstone is cleared only by explicit workspace opt-in/reset.
-  revokedWorkspaceIds: boundedIds.default([]),
-  // Cleanup rotates credentials without turning an active identity into an
-  // archive/opt-out tombstone. The next session must obtain a fresh generation.
-  rotatingAgentIds: boundedIds.default([]),
-  rotatingWorkspaceIds: boundedIds.default([]),
-  // Authority cleanup work only. It intentionally contains no enrollment or bearer material.
-  pendingRevocations: pendingRevocations.default([]),
-}).strict();
+export interface ConnectionDefaults {
+  bridgeCommand: string;
+  bridgeArgs: string[];
+  socketPath: string;
+}
 
-export const defaultTabGoblinSettings = tabGoblinSettingsSchema.parse({});
-export type TabGoblinSettings = z.infer<typeof tabGoblinSettingsSchema>;
+/**
+ * App-owned configuration schema. Connection defaults are supplied by the server
+ * so browser bundles never inspect the plugin process, filesystem, or environment.
+ */
+export function createTabGoblinSettingsSchema(defaults: ConnectionDefaults) {
+  return z.object({
+    enabled: z.boolean().default(false),
+    enabledWorkspaceCwds: z.array(boundedString).max(256).default([]),
+    bridgeCommand: boundedString.default(defaults.bridgeCommand),
+    bridgeArgs: z.array(boundedString).max(32).default(defaults.bridgeArgs),
+    socketPath: socketPathSchema.default(defaults.socketPath),
+    viewerUrl: viewerUrlSchema.default(""),
+    // The ephemeral gateway process identity fences durable lifecycle generations.
+    // It is not a credential and changes on every gateway restart.
+    gatewayInstanceId: z.string().uuid().nullable().default(null),
+    workspaceGenerations: generationMap.default({}),
+    agentGenerations: generationMap.default({}),
+    // Active IDs are cleanup targets, not credentials or lifecycle generations.
+    activeAgentIds: boundedIds.default([]),
+    // Agent tombstones are never implicitly revived by opening a session.
+    revokedAgentIds: boundedIds.default([]),
+    // A workspace tombstone is cleared only by explicit workspace opt-in/reset.
+    revokedWorkspaceIds: boundedIds.default([]),
+    // Cleanup rotates credentials without turning an active identity into an
+    // archive/opt-out tombstone. The next session must obtain a fresh generation.
+    rotatingAgentIds: boundedIds.default([]),
+    rotatingWorkspaceIds: boundedIds.default([]),
+    // Authority cleanup work only. It intentionally contains no enrollment or bearer material.
+    pendingRevocations: pendingRevocations.default([]),
+  }).strict();
+}
+
+export type TabGoblinSettings = z.output<ReturnType<typeof createTabGoblinSettingsSchema>>;

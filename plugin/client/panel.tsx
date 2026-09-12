@@ -471,14 +471,14 @@ export function TabGoblinPanel({ theme, host, layout, workspaceId }: PluginWorks
             >
               {!config ? <ActionButton label="Retry configuration" onPress={() => void configQuery.refetch()} disabled={!input || configQuery.isFetching} colors={theme.colors} /> : null}
             </SettingsRow>
-            <SettingsRow label="Gateway socket" hint="Absolute local Unix-socket path used by the plugin server.">
+            <SettingsRow label="Gateway socket" hint="Absolute local Unix-socket path used by the plugin server. Fresh installs default to the gateway user service runtime socket.">
               <TextInput
                 accessibilityLabel="Gateway socket path"
                 autoCapitalize="none"
                 autoCorrect={false}
                 editable={!busy && !!config}
                 onChangeText={setSocketDraft}
-                placeholder="/tmp/tabgoblin.sock"
+                placeholder="$XDG_RUNTIME_DIR/tabgoblin/gateway.sock"
                 placeholderTextColor={theme.colors.foregroundMuted}
                 style={styles.input}
                 value={socketDraft}

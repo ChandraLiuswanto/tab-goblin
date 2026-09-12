@@ -6,12 +6,13 @@ import { ADMIN_SOCKET_ENV, ENROLLMENT_ENV } from "@tab-goblin/protocol";
 import { createConfigStore } from "../server/config-store.js";
 import { registerHooks, shouldInject } from "../server/hooks.js";
 import { createLifecycleCoordinator } from "../server/lifecycle-coordinator.js";
-import { defaultTabGoblinSettings } from "../shared/settings.js";
+import { createTabGoblinSettingsSchema } from "../shared/settings.js";
 
 const directories: string[] = [];
 afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
 
-const SETTINGS = { ...defaultTabGoblinSettings, enabled: true, enabledWorkspaceCwds: ["/w/one"], socketPath: "/run/tabgoblin.sock", bridgeArgs: ["bridge.mjs"], workspaceGenerations: { "ws-1": 3 }, agentGenerations: { "agent-1": 4 } };
+const defaultTabGoblinSettings = createTabGoblinSettingsSchema({ bridgeCommand: "node", bridgeArgs: [], socketPath: "/run/tabgoblin.sock" }).parse({});
+const SETTINGS = { ...defaultTabGoblinSettings, enabled: true, enabledWorkspaceCwds: ["/w/one"], bridgeArgs: ["bridge.mjs"], workspaceGenerations: { "ws-1": 3 }, agentGenerations: { "agent-1": 4 } };
 function fakeServer() { const before = new Map<string, any>(); const on = new Map<string, any>(); return { before: (name: string, fn: any) => (before.set(name, fn), () => before.delete(name)), on: (name: string, fn: any) => (on.set(name, fn), () => on.delete(name)), beforeHandlers: before, onHandlers: on } as any; }
 
 describe("Claude-only scoped injection", () => {

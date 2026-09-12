@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { defaultTabGoblinSettings } from "../shared/settings.js";
+import { createTabGoblinSettingsSchema } from "../shared/settings.js";
 import { createHandlers } from "../server/handlers.js";
 
 const context = { paseo: { workspaces: { list: vi.fn().mockResolvedValue({ entries: [{ id: "ws-1", workspaceDirectory: "/w/one" }] }) } } } as any;
+const defaultTabGoblinSettings = createTabGoblinSettingsSchema({ bridgeCommand: "/usr/bin/node", bridgeArgs: ["/opt/tabgoblin/bridge.js"], socketPath: "/run/user/1000/tabgoblin/gateway.sock" }).parse({});
 function lifecycle(overrides: Record<string, unknown> = {}) {
   return {
     settings: vi.fn(() => ({

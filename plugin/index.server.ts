@@ -1,6 +1,7 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { randomUUID } from "node:crypto";
 import { createConfigStore } from "./server/config-store.js";
+import { deriveServerConnectionDefaults } from "./server/defaults.js";
 import { createGatewayManager, type GatewayClient } from "./server/gateway-client.js";
 import { createHandlers, ping } from "./server/handlers.js";
 import { registerHooks } from "./server/hooks.js";
@@ -14,7 +15,7 @@ export function cleanupPlugin(cleanupHooks: () => void, lifecycle: Pick<Lifecycl
 }
 
 export default function contribute(server: PluginServerContext) {
-  const settings = createConfigStore();
+  const settings = createConfigStore(undefined, deriveServerConnectionDefaults({ entrypointUrl: import.meta.url }));
   const gateway = createGatewayManager(() => settings.read().socketPath);
   const lifecycle = createLifecycleCoordinator(settings, gateway);
   void lifecycle.replayPending();

@@ -2,6 +2,7 @@ import { request as httpRequest } from "node:http";
 import { mkdtemp, mkdir, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createConnection } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActivityFeed } from "../src/activity-feed.js";
 import { createAdminServer } from "../src/admin-server.js";
@@ -104,6 +105,47 @@ async function post(socketPath: string, body: string): Promise<{ status: number;
     );
     request.on("error", reject);
     request.end(body);
+  });
+}
+
+async function postWithSlowDrip(socketPath: string, body: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(socketPath);
+    const chunks: Buffer[] = [];
+    let dripTimer: ReturnType<typeof setInterval> | undefined;
+    const cleanup = (): void => {
+      clearTimeout(safetyTimer);
+      if (dripTimer) clearInterval(dripTimer);
+    };
+    const safetyTimer = setTimeout(() => {
+      cleanup();
+      socket.destroy();
+      reject(new Error("admin socket did not enforce its request deadline"));
+    }, 750);
+    socket.on("connect", () => {
+      socket.write(
+        `POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body) + 1_024}\r\n\r\n${body}`,
+      );
+      dripTimer = setInterval(() => {
+        if (socket.writable) socket.write(" ", () => undefined);
+      }, 5);
+    });
+    socket.on("data", (chunk) => {
+      chunks.push(Buffer.from(chunk));
+      if (dripTimer) clearInterval(dripTimer);
+    });
+    socket.on("error", (error) => {
+      cleanup();
+      if (chunks.length > 0 && "code" in error && ["EPIPE", "ECONNRESET"].includes(error.code as string)) {
+        socket.destroy();
+        return;
+      }
+      reject(error);
+    });
+    socket.on("close", () => {
+      cleanup();
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
   });
 }
 
@@ -324,6 +366,32 @@ describe("unix socket transport", () => {
     await server.close();
     openServers.pop();
     await expect(stat(socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("applies one absolute deadline to a slow body and closes without dispatching or echoing it", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "tg-admin-slow-"));
+    const socketPath = join(directory, "gateway.sock");
+    const { services, enrollment, session } = harness();
+    enroll(enrollment);
+    const server = createAdminServer({
+      services: services as never,
+      enrollment,
+      socketPath,
+      handlerTimeoutMs: 30,
+    });
+    openServers.push(server);
+    await server.listen();
+
+    const requestBody = JSON.stringify(
+      tool("tabgoblin_fill", { tabId: "t1", ref: "r1-e0", value: "SLOW-SECRET" }),
+    );
+    const rawResponse = await postWithSlowDrip(socketPath, requestBody);
+    const responseBody = JSON.parse(rawResponse.slice(rawResponse.indexOf("\r\n\r\n") + 4));
+
+    expect(rawResponse).toMatch(/^HTTP\/1\.1 400/);
+    expect(responseBody).toMatchObject({ ok: false, error: { code: "timeout_uncertain" } });
+    expect(rawResponse).not.toContain("SLOW-SECRET");
+    expect(session.act).not.toHaveBeenCalled();
   });
 
   it("accepts bounded JSON and rejects malformed or over-64-KiB bodies without echoing them", async () => {

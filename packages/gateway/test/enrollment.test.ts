@@ -98,6 +98,49 @@ describe("EnrollmentRegistry", () => {
     await expect(bound.authorize(NONCE)).rejects.toMatchObject({ code: "not_enrolled" });
   });
 
+  it("bounds process-lifetime identities without evicting replay tombstones", () => {
+    let clock = 0;
+    const registry = new EnrollmentRegistry({
+      ttlMs: 1,
+      maxEnrollmentIdentities: 3,
+      now: () => clock,
+    });
+    const enrollments = [NONCE, SECOND, THIRD];
+    for (const enrollment of enrollments) registry.record(enrollment, "/w/one");
+
+    expect(() => registry.record(NONCE, "/w/one")).not.toThrow();
+    expect(() => registry.record("44444444-4444-4444-8444-444444444444", "/w/one")).toThrow(
+      expect.objectContaining({ code: "busy" }),
+    );
+
+    clock = 2;
+    registry.sweep();
+    for (const enrollment of enrollments) {
+      expect(() => registry.record(enrollment, "/w/one")).toThrow(
+        expect.objectContaining({ code: "auth_failed" }),
+      );
+    }
+    expect(() => registry.record("55555555-5555-4555-8555-555555555555", "/w/one")).toThrow(
+      expect.objectContaining({ code: "busy" }),
+    );
+  });
+
+  it("bounds open sessions independently and permits capacity reuse only after explicit revocation", () => {
+    const registry = new EnrollmentRegistry({
+      maxEnrollmentIdentities: 2,
+      maxOpenSessions: 2,
+    });
+    registry.noteSessionOpen("agent-1", "ws-1", "interactive");
+    registry.noteSessionOpen("agent-2", "ws-2", "interactive");
+
+    expect(() => registry.noteSessionOpen("agent-3", "ws-3", "interactive")).toThrow(
+      expect.objectContaining({ code: "busy" }),
+    );
+
+    registry.revokeAgent("agent-1");
+    expect(() => registry.noteSessionOpen("agent-3", "ws-3", "interactive")).not.toThrow();
+  });
+
   it("uses the credential binding as the authoritative agent, workspace, and cwd", async () => {
     const registry = new EnrollmentRegistry();
     bindInteractive(registry);

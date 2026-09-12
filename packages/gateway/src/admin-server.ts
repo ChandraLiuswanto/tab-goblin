@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { lstat, realpath, stat, unlink, chmod } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { isAbsolute, basename, relative, resolve, sep } from "node:path";
+import { performance } from "node:perf_hooks";
 import {
   AdminRequestSchema,
   AdminResponseSchema,
@@ -46,6 +47,14 @@ export interface AdminServer {
   listen(): Promise<void>;
   close(): Promise<void>;
   handle(request: unknown): Promise<AdminResponse>;
+}
+
+interface RequestDeadline {
+  readonly signal: AbortSignal;
+  check(): void;
+  remainingMs(): number;
+  run<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T>;
+  dispose(): void;
 }
 
 const MAX_REQUEST_BYTES = 64 * 1024;
@@ -157,20 +166,41 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
     });
   };
 
-  const runWithTimeout = async <T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+  const createRequestDeadline = (): RequestDeadline => {
     const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => {
-        controller.abort();
-        reject(timeoutFailure());
-      }, handlerTimeoutMs);
-    });
-    try {
-      return await Promise.race([operation(controller.signal), timeout]);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
+    const expiresAt = performance.now() + handlerTimeoutMs;
+    const expire = (): void => {
+      if (!controller.signal.aborted) controller.abort(timeoutFailure());
+    };
+    const check = (): void => {
+      if (performance.now() >= expiresAt) expire();
+      if (controller.signal.aborted) throw controller.signal.reason;
+    };
+    const timer = setTimeout(expire, handlerTimeoutMs);
+
+    return {
+      signal: controller.signal,
+      check,
+      remainingMs: () => {
+        check();
+        return Math.max(0, expiresAt - performance.now());
+      },
+      run: async <T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+        check();
+        let onAbort: (() => void) | undefined;
+        const timeout = new Promise<never>((_resolve, reject) => {
+          onAbort = () => reject(controller.signal.reason);
+          controller.signal.addEventListener("abort", onAbort, { once: true });
+        });
+        try {
+          const pending = Promise.resolve().then(() => operation(controller.signal));
+          return await Promise.race([pending, timeout]);
+        } finally {
+          if (onAbort) controller.signal.removeEventListener("abort", onAbort);
+        }
+      },
+      dispose: () => clearTimeout(timer),
+    };
   };
 
   const authorizeTool = async (request: Extract<AdminRequest, { op: "tool" }>): Promise<Binding> => {
@@ -353,7 +383,10 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
     }
   };
 
-  const executeTool = async (request: Extract<AdminRequest, { op: "tool" }>): Promise<AdminResponse> => {
+  const executeTool = async (
+    request: Extract<AdminRequest, { op: "tool" }>,
+    deadline: RequestDeadline,
+  ): Promise<AdminResponse> => {
     const schema = ToolInputSchemas[request.name];
     const parsedInput = schema.safeParse(request.input ?? {});
     if (!parsedInput.success) return failure(invalidInput());
@@ -361,17 +394,24 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
 
     let binding: Binding;
     try {
-      binding = await authorizeTool(request);
+      binding = await deadline.run(() => authorizeTool(request));
     } catch (error: unknown) {
       return failure(error);
     }
 
     if (request.name === "tabgoblin_status") {
       try {
+        deadline.check();
         return AdminResponseSchema.parse({ ok: true, status: statusFor(binding.workspaceId!) });
       } catch (error: unknown) {
         return failure(error);
       }
+    }
+
+    try {
+      deadline.check();
+    } catch (error: unknown) {
+      return failure(error);
     }
 
     if (
@@ -392,6 +432,7 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
     const operationId = randomUUID();
     let lease: Lease | null = null;
     try {
+      deadline.check();
       lease = ownership.acquireAgentLease(operationId);
       feed.begin({
         operationId,
@@ -400,7 +441,7 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
         action: request.name,
       });
 
-      const response = await runWithTimeout((signal) =>
+      const response = await deadline.run((signal) =>
         dispatchBrowserTool(
           request.name,
           input,
@@ -427,7 +468,10 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
     }
   };
 
-  const dispatchAdmin = async (request: AdminRequest): Promise<AdminResponse> => {
+  const dispatchAdmin = async (
+    request: AdminRequest,
+    deadline: RequestDeadline,
+  ): Promise<AdminResponse> => {
     switch (request.op) {
       case "status":
         return { ok: true, status: statusFor(request.workspaceId) };
@@ -452,7 +496,7 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
       case "resolve-enrollment": {
         const binding = await enrollment.resolve(
           request.enrollment,
-          Math.max(0, handlerTimeoutMs - POLL_COMPLETION_MARGIN_MS),
+          Math.max(0, deadline.remainingMs() - POLL_COMPLETION_MARGIN_MS),
         );
         return {
           ok: true,
@@ -472,20 +516,32 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
         enrollment.revokeWorkspace(request.workspaceId);
         return { ok: true };
       case "tool":
-        return executeTool(request);
+        return executeTool(request, deadline);
+    }
+  };
+
+  const handleWithDeadline = async (
+    unknownRequest: unknown,
+    deadline: RequestDeadline,
+  ): Promise<AdminResponse> => {
+    const parsed = AdminRequestSchema.safeParse(unknownRequest);
+    if (!parsed.success) return failure(invalidInput());
+    if (parsed.data.op === "tool") return executeTool(parsed.data, deadline);
+
+    try {
+      const response = await deadline.run(() => dispatchAdmin(parsed.data, deadline));
+      return AdminResponseSchema.parse(response);
+    } catch (error: unknown) {
+      return failure(error);
     }
   };
 
   const handle = async (unknownRequest: unknown): Promise<AdminResponse> => {
-    const parsed = AdminRequestSchema.safeParse(unknownRequest);
-    if (!parsed.success) return failure(invalidInput());
-    if (parsed.data.op === "tool") return executeTool(parsed.data);
-
+    const deadline = createRequestDeadline();
     try {
-      const response = await runWithTimeout(() => dispatchAdmin(parsed.data));
-      return AdminResponseSchema.parse(response);
-    } catch (error: unknown) {
-      return failure(error);
+      return await handleWithDeadline(unknownRequest, deadline);
+    } finally {
+      deadline.dispose();
     }
   };
 
@@ -499,31 +555,64 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
     response.end(json);
   };
 
-  const readBody = async (request: IncomingMessage): Promise<unknown> => {
-    const length = request.headers["content-length"];
-    if (typeof length === "string" && Number(length) > MAX_REQUEST_BYTES) {
-      request.resume();
-      throw REQUEST_TOO_LARGE;
-    }
-    const chunks: Buffer[] = [];
-    let size = 0;
-    let tooLarge = false;
-    for await (const chunk of request) {
-      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      size += bytes.length;
-      if (size > MAX_REQUEST_BYTES) {
-        tooLarge = true;
-        continue;
+  const readBody = (request: IncomingMessage, signal: AbortSignal): Promise<unknown> =>
+    new Promise((resolveBody, rejectBody) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      let settled = false;
+
+      const cleanup = (): void => {
+        request.off("data", onData);
+        request.off("end", onEnd);
+        request.off("error", onError);
+        request.off("aborted", onRequestAborted);
+        signal.removeEventListener("abort", onDeadline);
+      };
+      const reject = (error: unknown): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        request.pause();
+        rejectBody(error);
+      };
+      const onData = (chunk: Buffer | string): void => {
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        size += bytes.length;
+        if (size > MAX_REQUEST_BYTES) {
+          reject(REQUEST_TOO_LARGE);
+          return;
+        }
+        chunks.push(bytes);
+      };
+      const onEnd = (): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        try {
+          resolveBody(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+        } catch {
+          rejectBody(invalidInput());
+        }
+      };
+      const onError = (error: Error): void => reject(error);
+      const onRequestAborted = (): void => reject(invalidInput());
+      const onDeadline = (): void => reject(signal.reason ?? timeoutFailure());
+
+      const length = request.headers["content-length"];
+      if (typeof length === "string" && Number(length) > MAX_REQUEST_BYTES) {
+        reject(REQUEST_TOO_LARGE);
+        return;
       }
-      chunks.push(bytes);
-    }
-    if (tooLarge) throw REQUEST_TOO_LARGE;
-    try {
-      return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    } catch {
-      throw invalidInput();
-    }
-  };
+      if (signal.aborted) {
+        onDeadline();
+        return;
+      }
+      request.on("data", onData);
+      request.once("end", onEnd);
+      request.once("error", onError);
+      request.once("aborted", onRequestAborted);
+      signal.addEventListener("abort", onDeadline, { once: true });
+    });
 
   const listen = async (): Promise<void> => {
     if (listening) return;
@@ -540,21 +629,35 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
     }
 
     const created = createServer((request, response) => {
+      const deadline = createRequestDeadline();
       void (async () => {
-        if (request.method !== "POST" || request.url !== "/") {
-          request.resume();
-          writeJson(response, 404, failure(invalidInput()));
-          return;
-        }
         try {
-          const body = await readBody(request);
-          const result = await handle(body);
+          if (request.method !== "POST" || request.url !== "/") {
+            request.resume();
+            writeJson(response, 404, failure(invalidInput()));
+            return;
+          }
+
+          const body = await readBody(request, deadline.signal);
+          deadline.check();
+          const result = await handleWithDeadline(body, deadline);
           writeJson(response, result.ok ? 200 : 400, result);
         } catch (error: unknown) {
           const tooLarge = error === REQUEST_TOO_LARGE;
-          writeJson(response, tooLarge ? 413 : 400, failure(tooLarge ? invalidInput() : error));
+          const safe = structuredError(tooLarge ? invalidInput() : error);
+          const terminateInput = tooLarge || safe.code === "timeout_uncertain";
+          if (terminateInput) {
+            request.pause();
+            response.shouldKeepAlive = false;
+            response.setHeader("connection", "close");
+            response.once("finish", () => request.socket.end());
+          }
+          writeJson(response, tooLarge ? 413 : 400, { ok: false, error: safe });
+        } finally {
+          deadline.dispose();
         }
       })().catch(() => {
+        deadline.dispose();
         if (!response.headersSent) writeJson(response, 500, failure(unexpectedFailure()));
         else response.end();
       });

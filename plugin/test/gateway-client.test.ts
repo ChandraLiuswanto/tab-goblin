@@ -35,6 +35,15 @@ describe("gateway client", () => {
     expect(client.notify({ op: "stop", workspaceId: "ws-1" })).toBeUndefined();
   });
 
+  it("rejects an oversized byte response", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "tabgoblin-plugin-"));
+    const socketPath = join(directory, "gateway.sock");
+    const server = createServer((_request, response) => response.end(Buffer.alloc(1024 * 1024 + 1, 0x61)));
+    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+    cleanup.push(() => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))).then(() => rm(directory, { recursive: true })));
+    await expect(createGatewayClient(socketPath).request({ op: "status", workspaceId: "ws-1" })).resolves.toMatchObject({ ok: false, error: { code: "runtime_unavailable" } });
+  });
+
   it("returns runtime_unavailable rather than throwing on transport failure", async () => {
     const client = createGatewayClient(join(tmpdir(), "missing-tabgoblin.sock"));
     await expect(client.request({ op: "status", workspaceId: "ws-1" }, 100)).resolves.toMatchObject({

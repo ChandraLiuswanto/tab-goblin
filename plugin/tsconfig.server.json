@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "types": ["node"], "jsx": "preserve" },
+  "include": ["server/**/*.ts", "index.server.ts", "shared/**/*.ts"],
+  "exclude": ["client", "index.client.tsx", "test"]
+}

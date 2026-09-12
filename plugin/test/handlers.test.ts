@@ -1,37 +1,21 @@
 import { describe, expect, it, vi } from "vitest";
 import { createHandlers } from "../server/handlers.js";
-import type { TabGoblinSettings } from "../shared/settings.js";
+import { defaultTabGoblinSettings } from "../shared/settings.js";
 
-const SETTINGS = {
-  enabled: false,
-  enabledWorkspaceCwds: ["/w/one"],
-  mcpCapableProviders: ["claude"],
-  bridgeCommand: "node",
-  bridgeArgs: [],
-  socketPath: "/run/tabgoblin.sock",
-  viewerUrl: "https://viewer.example",
-};
-
+const context = { paseo: { workspaces: { list: vi.fn().mockResolvedValue({ entries: [{ id: "ws-1", workspaceDirectory: "/w/one" }] }) } } } as any;
+function store(value = defaultTabGoblinSettings) { let current = value; return { read: () => current, update: async (change: any) => (current = change(current)), path: "/tmp/settings.json" }; }
 describe("server RPC handlers", () => {
-  it("forwards only the typed workspace scope to the gateway", async () => {
-    const request = vi.fn().mockResolvedValue({ ok: true });
-    const handlers = createHandlers({ request, notify: vi.fn(), close: vi.fn() }, { read: () => SETTINGS, write: vi.fn() });
-
-    await expect(handlers.status({ workspaceId: "ws-1", cwd: "/w/one" })).resolves.toEqual({ ok: true });
+  it("validates the host workspace ID and cwd before forwarding", async () => {
+    const request = vi.fn().mockResolvedValue({ ok: true }); const handlers = createHandlers({ request, notify: vi.fn(), close: vi.fn() }, store());
+    await expect(handlers.status({ workspaceId: "ws-1", cwd: "/w/one" }, context)).resolves.toEqual({ ok: true });
     expect(request).toHaveBeenCalledWith({ op: "status", workspaceId: "ws-1" });
+    await expect(handlers.status({ workspaceId: "ws-1", cwd: "/wrong" }, context)).resolves.toMatchObject({ ok: false });
   });
-
-  it("adds and removes an opted-in cwd without mutating the settings object", () => {
-    let saved: TabGoblinSettings = SETTINGS;
-    const handlers = createHandlers(
-      { request: vi.fn(), notify: vi.fn(), close: vi.fn() },
-      { read: () => saved, write: (next) => { saved = next; } },
-    );
-
-    expect(handlers.enableWorkspace({ cwd: "/w/two", enabled: true })).toEqual({ ok: true });
-    expect(saved.enabledWorkspaceCwds).toEqual(["/w/one", "/w/two"]);
-    expect(SETTINGS.enabledWorkspaceCwds).toEqual(["/w/one"]);
-    handlers.enableWorkspace({ cwd: "/w/one", enabled: false });
-    expect(saved.enabledWorkspaceCwds).toEqual(["/w/two"]);
+  it("resets then durably enables a verified workspace", async () => {
+    const settings = store({ ...defaultTabGoblinSettings, enabled: true }); const request = vi.fn().mockResolvedValue({ ok: true, lifecycleGeneration: 7 });
+    const handlers = createHandlers({ request, notify: vi.fn(), close: vi.fn() }, settings);
+    await expect(handlers.enableWorkspace({ workspaceId: "ws-1", cwd: "/w/one", enabled: true }, context)).resolves.toEqual({ ok: true });
+    expect(settings.read().workspaceGenerations).toEqual({ "ws-1": 7 });
+    expect(settings.read().enabledWorkspaceCwds).toEqual(["/w/one"]);
   });
 });

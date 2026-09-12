@@ -2,7 +2,7 @@
   "name": "tab-goblin-plugin",
   "private": true,
   "version": "0.0.0",
-  "scripts": { "typecheck": "tsc --noEmit" },
+  "scripts": { "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.server.json --noEmit" },
   "dependencies": { "@tab-goblin/protocol": "*" },
   "devDependencies": {
     "@getpaseo/plugin": "0.8.0",

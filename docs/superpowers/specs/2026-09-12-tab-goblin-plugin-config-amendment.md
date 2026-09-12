@@ -14,9 +14,11 @@ Static `agent.create` MCP configuration contains only the bridge executable conf
 
 On workspace opt-out, workspace/agent archive, reset, reconfiguration, and all plugin cleanup, the plugin revokes affected gateway identities and advances/persists the corresponding durable generation. Cleanup is deliberately safe for both reload and disable because Paseo supplies no cleanup reason: it revokes authority but never stops the browser or deletes its profile. A fresh later session must reset and receive a new generation before it can enroll.
 
-## Platform gate
+## Claude environment integration verification
 
-Paseo 0.8 documents `agent.session_open.env` as a non-persisted provider launch override, but does not document that Claude Code propagates it to an MCP stdio child. Claude Code `2.1.267` is installed locally, but proving inheritance requires an isolated live Claude/MCP launch, which is outside the current no-live-service/config unit-work authorization. Therefore the credential injection path is a blocker until that provider behavior is established by an approved isolated test or an explicit provider contract. No implementation may place the credential back in persisted `mcpServers.env` as a workaround.
+Paseo 0.8 documents `agent.session_open.env` as a non-persisted provider launch override, but does not document that Claude Code propagates it to an MCP stdio child. This was verified on the installed Claude Code `2.1.267` with an approved isolated probe: a throwaway `HOME`, XDG config/state directories, and a temporary dummy stdio MCP server were used. A random synthetic marker was passed only as a launch environment variable. Claude's `mcp get` connected to that child, which observed the marker; a scan of the temporary persisted MCP configuration confirmed that it did not contain the marker. The temporary directory was removed at command exit. No enrollment, user configuration, browser profile, personal credential, listener, or real gateway was used.
+
+The probe establishes the deployed Claude stdio-child inheritance behavior needed for the session-open credential path. It does not relax the security requirement: no implementation may place an enrollment, bearer, socket credential, or other scoped secret in persisted `mcpServers.env`.
 
 ## Gateway transport requirements
 

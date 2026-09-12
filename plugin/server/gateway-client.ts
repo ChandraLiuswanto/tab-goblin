@@ -77,9 +77,14 @@ export function createGatewayManager(readSocketPath: () => string): GatewayManag
       if (socketPath === currentPath) return [];
       const responses: AdminResponse[] = [];
       for (const revocation of revocations) responses.push(await current.request(revocation, timeoutMs));
+      // Preserve both the old client and its durable intents unless every old-socket
+      // revoke was acknowledged. Retrying an old intent through the replacement
+      // socket could grant it authority over a different gateway instance.
+      if (responses.some((response) => !response.ok)) return responses;
+      const replacement = createGatewayClient(socketPath);
       current.close();
+      current = replacement;
       currentPath = socketPath;
-      current = createGatewayClient(socketPath);
       return responses;
     },
   };

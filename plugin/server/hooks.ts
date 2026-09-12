@@ -31,7 +31,7 @@ export function registerHooks(server: PluginServerContext, dependencies: HookDep
       return scope ? { ...request, env: { ...request.env, [ADMIN_SOCKET_ENV]: scope.socketPath, [ENROLLMENT_ENV]: enrollment } } : undefined;
     } catch { return undefined; }
   });
-  const stopArchived = server.on("agent.archived", ({ agent }) => { void dependencies.lifecycle.revokeAgent(agent.id); });
-  const stopWorkspaceArchived = server.on("workspace.archived", ({ workspace }) => { void dependencies.lifecycle.revokeWorkspace(workspace.id); });
+  const stopArchived = server.on("agent.archived", async ({ agent }) => { await dependencies.lifecycle.revokeAgent(agent.id); });
+  const stopWorkspaceArchived = server.on("workspace.archived", async ({ workspace }) => { await dependencies.lifecycle.revokeWorkspace(workspace.id); });
   return () => { stopCreate(); stopSessionOpen(); stopArchived(); stopWorkspaceArchived(); };
 }

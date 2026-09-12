@@ -748,11 +748,9 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
         });
         return { ok: true };
       case "revoke-agent":
-        enrollment.revokeAgent(request.agentId);
-        return { ok: true };
+        return { ok: true, lifecycleGeneration: enrollment.revokeAgent(request.agentId) };
       case "revoke-workspace":
-        enrollment.revokeWorkspace(request.workspaceId);
-        return { ok: true };
+        return { ok: true, lifecycleGeneration: enrollment.revokeWorkspace(request.workspaceId) };
       case "reset-agent":
         return { ok: true, lifecycleGeneration: enrollment.resetAgent(request.agentId) };
       case "reset-workspace":

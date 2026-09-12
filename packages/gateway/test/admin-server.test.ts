@@ -188,13 +188,13 @@ describe("admin request handling", () => {
       pairingExpiresAt: "2026-09-12T00:01:00.000Z",
     });
     await expect(server.handle({ op: "return-to-agent", workspaceId: "ws-1" })).resolves.toMatchObject({ ok: true });
-    await expect(server.handle({ op: "revoke-agent", agentId: "agent-1" })).resolves.toEqual({ ok: true });
+    await expect(server.handle({ op: "revoke-agent", agentId: "agent-1" })).resolves.toEqual({ ok: true, lifecycleGeneration: 1 });
     await expect(enrollment.authorize(NONCE)).rejects.toMatchObject({ code: "not_enrolled" });
     await expect(server.handle({ op: "reset-agent", agentId: "agent-1" })).resolves.toEqual({
       ok: true,
       lifecycleGeneration: 2,
     });
-    await expect(server.handle({ op: "revoke-workspace", workspaceId: "ws-1" })).resolves.toEqual({ ok: true });
+    await expect(server.handle({ op: "revoke-workspace", workspaceId: "ws-1" })).resolves.toEqual({ ok: true, lifecycleGeneration: 1 });
     await expect(enrollment.authorize(SECOND)).rejects.toMatchObject({ code: "not_enrolled" });
     await expect(server.handle({ op: "reset-workspace", workspaceId: "ws-1" })).resolves.toEqual({
       ok: true,

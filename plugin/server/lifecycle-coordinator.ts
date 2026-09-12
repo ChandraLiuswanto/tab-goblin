@@ -6,6 +6,13 @@ type Pending = { kind: "agent" | "workspace"; id: string };
 type Session = { agentId: string; workspaceId: string; cwd: string; purpose: "interactive" | "history"; enrollment: string };
 type SessionScope = { socketPath: string; agentGeneration: number; workspaceGeneration: number };
 
+function pendingKey(pending: Pending): string { return `${pending.kind}:${pending.id}`; }
+function revocationPending(body: Parameters<GatewayClient["request"]>[0]): Pending | undefined {
+  if (body.op === "revoke-agent") return { kind: "agent", id: body.agentId };
+  if (body.op === "revoke-workspace") return { kind: "workspace", id: body.workspaceId };
+  return undefined;
+}
+
 function isGeneration(response: AdminResponse | undefined): response is AdminResponse & { ok: true; lifecycleGeneration: number } {
   return !!response && response.ok && typeof response.lifecycleGeneration === "number";
 }
@@ -22,9 +29,9 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
     tail = result.then(() => undefined, () => undefined);
     return result;
   };
-  const synchronizeSocket = async (timeoutMs?: number) => {
+  const synchronizeSocket = async (timeoutMs?: number): Promise<Map<string, AdminResponse>> => {
     const manager = gateway as Partial<GatewayManager>;
-    if (typeof manager.switchSocketPath !== "function" || typeof manager.socketPath !== "function" || manager.socketPath() === settings.read().socketPath) return;
+    if (typeof manager.switchSocketPath !== "function" || typeof manager.socketPath !== "function" || manager.socketPath() === settings.read().socketPath) return new Map();
     const current = settings.read();
     const targets = [...current.pendingRevocations, ...current.activeAgentIds.map((id) => ({ kind: "agent" as const, id })), ...Object.keys(current.workspaceGenerations).map((id) => ({ kind: "workspace" as const, id }))];
     const pending = targets.filter((item, index) => targets.findIndex((candidate) => candidate.kind === item.kind && candidate.id === item.id) === index);
@@ -32,16 +39,28 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
     for (const item of pending) await remember(item);
     const revocations = pending.map((item) => item.kind === "agent" ? { op: "revoke-agent" as const, agentId: item.id } : { op: "revoke-workspace" as const, workspaceId: item.id });
     const responses = await manager.switchSocketPath(settings.read().socketPath, revocations, timeoutMs);
+    // The manager retains its old socket when any revoke fails. Keep every intent
+    // durable too: none may be replayed against the replacement socket.
+    if (responses.length !== pending.length || responses.some((response) => !response.ok)) return new Map();
     await settings.update((value) => ({
       ...value,
-      pendingRevocations: value.pendingRevocations.filter((_item, index) => !responses[index]?.ok),
-      activeAgentIds: value.activeAgentIds.filter((id) => !pending.some((item, index) => item.kind === "agent" && item.id === id && responses[index]?.ok)),
-      revokedAgentIds: [...new Set([...value.revokedAgentIds, ...pending.filter((item, index) => item.kind === "agent" && responses[index]?.ok).map((item) => item.id)])],
-      revokedWorkspaceIds: [...new Set([...value.revokedWorkspaceIds, ...pending.filter((item, index) => item.kind === "workspace" && responses[index]?.ok).map((item) => item.id)])],
+      pendingRevocations: value.pendingRevocations.filter((item) => !pending.some((candidate) => candidate.kind === item.kind && candidate.id === item.id)),
+      activeAgentIds: value.activeAgentIds.filter((id) => !pending.some((item) => item.kind === "agent" && item.id === id)),
+      agentGenerations: Object.fromEntries([...Object.entries(value.agentGenerations), ...pending.flatMap((item, index) => item.kind === "agent" && isGeneration(responses[index]) ? [[item.id, responses[index].lifecycleGeneration] as const] : [])]),
+      workspaceGenerations: Object.fromEntries([...Object.entries(value.workspaceGenerations), ...pending.flatMap((item, index) => item.kind === "workspace" && isGeneration(responses[index]) ? [[item.id, responses[index].lifecycleGeneration] as const] : [])]),
+      revokedAgentIds: [...new Set([...value.revokedAgentIds, ...pending.filter((item) => item.kind === "agent").map((item) => item.id)])],
+      revokedWorkspaceIds: [...new Set([...value.revokedWorkspaceIds, ...pending.filter((item) => item.kind === "workspace").map((item) => item.id)])],
     }));
+    return new Map(pending.map((item, index) => [pendingKey(item), responses[index]]));
   };
   const request = async (body: Parameters<GatewayClient["request"]>[0], timeoutMs?: number): Promise<AdminResponse | undefined> => {
-    try { await synchronizeSocket(timeoutMs); return await gateway.request(body, timeoutMs); } catch { return undefined; }
+    try {
+      const synchronized = await synchronizeSocket(timeoutMs);
+      const pending = revocationPending(body);
+      // A revoke acknowledged by the old socket during switching must not be
+      // retried against the new socket. Return its original acknowledgement.
+      return pending ? synchronized.get(pendingKey(pending)) ?? await gateway.request(body, timeoutMs) : await gateway.request(body, timeoutMs);
+    } catch { return undefined; }
   };
   const remember = async (pending: Pending) => settings.update((current) => {
     if (current.pendingRevocations.some((item) => item.kind === pending.kind && item.id === pending.id)) return current;
@@ -57,6 +76,8 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
       ...current,
       pendingRevocations: current.pendingRevocations.filter((item) => item.kind !== pending.kind || item.id !== pending.id),
       activeAgentIds: pending.kind === "agent" ? current.activeAgentIds.filter((id) => id !== pending.id) : current.activeAgentIds,
+      agentGenerations: pending.kind === "agent" && isGeneration(response) ? { ...current.agentGenerations, [pending.id]: response.lifecycleGeneration } : current.agentGenerations,
+      workspaceGenerations: pending.kind === "workspace" && isGeneration(response) ? { ...current.workspaceGenerations, [pending.id]: response.lifecycleGeneration } : current.workspaceGenerations,
       revokedAgentIds: pending.kind === "agent" ? [...new Set([...current.revokedAgentIds, pending.id])] : current.revokedAgentIds,
       revokedWorkspaceIds: pending.kind === "workspace" ? [...new Set([...current.revokedWorkspaceIds, pending.id])] : current.revokedWorkspaceIds,
     }));
@@ -86,7 +107,7 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
       await settings.update((current) => ({
         ...current,
         enabledWorkspaceCwds: current.enabledWorkspaceCwds.filter((item) => item !== cwd),
-        // Revocations deliberately do not invent a generation; only reset responses do.
+        // The revocation's acknowledged generation was persisted by revoke().
       }));
       return { ok: true as const };
     }),

@@ -26,6 +26,27 @@ describe("durable lifecycle coordinator", () => {
     expect(reloaded.settings().pendingRevocations).toEqual([]);
   });
 
+  it("does not retry an old-socket revoke on the replacement socket after a successful switch", async () => {
+    const settings = store(); await settings.update((current) => ({ ...current, socketPath: "/new.sock", workspaceGenerations: { ws: 3 } }));
+    const gateway = { socketPath: vi.fn(() => "/old.sock"), switchSocketPath: vi.fn().mockResolvedValue([{ ok: true, lifecycleGeneration: 8 }]), request: vi.fn(), notify: vi.fn(), close: vi.fn() } as any;
+    const coordinator = createLifecycleCoordinator(settings, gateway);
+    await coordinator.revokeWorkspace("ws");
+    expect(gateway.switchSocketPath).toHaveBeenCalledWith("/new.sock", [{ op: "revoke-workspace", workspaceId: "ws" }], undefined);
+    expect(gateway.request).not.toHaveBeenCalled();
+    expect(settings.read().workspaceGenerations.ws).toBe(8);
+  });
+
+  it("persists the exact acknowledged revocation generation with its revoked marker", async () => {
+    const settings = store(); await settings.update((current) => ({ ...current, agentGenerations: { agent: 2 }, workspaceGenerations: { ws: 3 } }));
+    const gateway = { request: vi.fn().mockResolvedValue({ ok: true, lifecycleGeneration: 9 }), notify: vi.fn(), close: vi.fn() } as any;
+    const coordinator = createLifecycleCoordinator(settings, gateway);
+    await coordinator.revokeAgent("agent"); await coordinator.revokeWorkspace("ws");
+    expect(settings.read().agentGenerations.agent).toBe(9);
+    expect(settings.read().workspaceGenerations.ws).toBe(9);
+    expect(settings.read().revokedAgentIds).toEqual(["agent"]);
+    expect(settings.read().revokedWorkspaceIds).toEqual(["ws"]);
+  });
+
   it("resets a previously revoked agent and persists the returned generation before recording enrollment", async () => {
     const settings = store(); await settings.update((current) => ({ ...current, enabled: true, enabledWorkspaceCwds: ["/w"], workspaceGenerations: { ws: 2 }, agentGenerations: { agent: 3 }, revokedAgentIds: ["agent"] }));
     const calls: unknown[] = []; const gateway = { request: vi.fn(async (body) => { calls.push(body); return body.op === "reset-agent" ? { ok: true, lifecycleGeneration: 9 } : { ok: true }; }), notify: vi.fn(), close: vi.fn() } as any;

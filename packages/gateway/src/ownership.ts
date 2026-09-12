@@ -123,6 +123,7 @@ export class OwnershipController {
       );
     }
 
+    this.advanceGeneration();
     this.state = "manual";
     this.owner = "viewer";
     this.ownerViewerSessionId = viewerSessionId;
@@ -137,23 +138,7 @@ export class OwnershipController {
     this.state = "returning-control";
     this.owner = null;
     this.ownerViewerSessionId = null;
-    this.generation += 1;
-
-    let listenerFailed = false;
-    for (const listener of [...this.generationListeners]) {
-      try {
-        listener(this.generation);
-      } catch {
-        listenerFailed = true;
-      }
-    }
-    if (listenerFailed) {
-      this.enterNeedsAttention();
-      throw tabGoblinError(
-        "timeout_uncertain",
-        "Browser references could not be invalidated safely; restart the session before continuing.",
-      );
-    }
+    this.advanceGeneration();
 
     this.state = "agent-ready";
     return this.snapshot();
@@ -163,6 +148,10 @@ export class OwnershipController {
     if (this.state !== "manual") {
       throw this.manualControlError();
     }
+
+    this.owner = null;
+    this.ownerViewerSessionId = null;
+    this.advanceGeneration();
 
     this.owner = "viewer";
     this.ownerViewerSessionId = viewerSessionId;
@@ -224,6 +213,26 @@ export class OwnershipController {
   private settleDrainWaiter(lease: ActiveLease, outcome: DrainOutcome): void {
     if (this.drainWaiter?.token === lease.token) {
       this.drainWaiter.settle(outcome);
+    }
+  }
+
+  private advanceGeneration(): void {
+    this.generation += 1;
+
+    let listenerFailed = false;
+    for (const listener of [...this.generationListeners]) {
+      try {
+        listener(this.generation);
+      } catch {
+        listenerFailed = true;
+      }
+    }
+    if (listenerFailed) {
+      this.enterNeedsAttention();
+      throw tabGoblinError(
+        "timeout_uncertain",
+        "Browser references could not be invalidated safely; restart the session before continuing.",
+      );
     }
   }
 

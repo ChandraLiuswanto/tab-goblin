@@ -478,7 +478,7 @@ describe("viewer WebSocket input gate", () => {
 
     const returned = await fetch(`${address.base}/api/return-to-agent`, { method: "POST", headers: authenticatedHeaders(second, address.origin), body: "{}" });
     expect(returned.status).toBe(200);
-    expect(h.ownership("ws-1").snapshot()).toMatchObject({ state: "agent-ready", generation: 1, owner: null });
+    expect(h.ownership("ws-1").snapshot()).toMatchObject({ state: "agent-ready", generation: 3, owner: null });
   });
 
   it("releases pressed input on disconnect without silently returning control", async () => {
@@ -579,7 +579,7 @@ describe("production gateway adapters and composition", () => {
     await services.browser("ws-1");
     await services.ownership("ws-1").requestTakeControl("viewer-1");
     await services.ownership("ws-1").returnToAgent();
-    expect(browser.invalidateRefs).toHaveBeenCalledOnce();
+    expect(browser.invalidateRefs).toHaveBeenCalledTimes(2);
   });
 
   it("composes loopback viewer/admin listeners and unlinks only the admin socket on shutdown", async () => {

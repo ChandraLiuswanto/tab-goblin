@@ -410,6 +410,35 @@ describe("admin and viewer wire contracts", () => {
       op: "revoke-workspace",
       workspaceId: "w1",
     });
+    expect(AdminRequestSchema.parse({
+      op: "record-enrollment",
+      enrollment,
+      cwd: "/w/one",
+    })).toMatchObject({ workspaceGeneration: 0 });
+    expect(AdminRequestSchema.parse({
+      op: "bind-enrollment",
+      cwd: "/w/one",
+      agentId: "a1",
+      workspaceId: "w1",
+    })).toMatchObject({ agentGeneration: 0, workspaceGeneration: 0 });
+    expect(AdminRequestSchema.parse({
+      op: "session-open",
+      agentId: "a1",
+      workspaceId: "w1",
+      purpose: "interactive",
+    })).toMatchObject({ agentGeneration: 0, workspaceGeneration: 0 });
+    expect(AdminRequestSchema.parse({ op: "reset-agent", agentId: "a1" })).toEqual({
+      op: "reset-agent",
+      agentId: "a1",
+    });
+    expect(AdminRequestSchema.parse({ op: "reset-workspace", workspaceId: "w1" })).toEqual({
+      op: "reset-workspace",
+      workspaceId: "w1",
+    });
+    expect(AdminResponseSchema.parse({ ok: true, lifecycleGeneration: 2 })).toEqual({
+      ok: true,
+      lifecycleGeneration: 2,
+    });
   });
 
   it("validates pairing and viewer sessions", () => {

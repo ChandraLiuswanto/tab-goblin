@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { lstat, realpath, stat, unlink, chmod } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, lstat, mkdtemp, open, realpath, rm, stat, unlink } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { isAbsolute, basename, relative, resolve, sep } from "node:path";
+import { tmpdir } from "node:os";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
   AdminRequestSchema,
@@ -47,6 +49,12 @@ export interface AdminServer {
   listen(): Promise<void>;
   close(): Promise<void>;
   handle(request: unknown): Promise<AdminResponse>;
+}
+
+interface PinnedUpload {
+  hostPath: string;
+  name: string;
+  cleanup(): Promise<void>;
 }
 
 interface RequestDeadline {
@@ -139,6 +147,120 @@ function isWithin(root: string, candidate: string): boolean {
   );
 }
 
+function sameInode(
+  first: { dev: number; ino: number },
+  second: { dev: number; ino: number },
+): boolean {
+  return first.dev === second.dev && first.ino === second.ino;
+}
+
+async function pinUpload(
+  bindingCwd: string,
+  requestedPath: string,
+  signal: AbortSignal,
+): Promise<PinnedUpload> {
+  let source: Awaited<ReturnType<typeof open>> | undefined;
+  let destination: Awaited<ReturnType<typeof open>> | undefined;
+  let privateDirectory: string | undefined;
+  try {
+    const root = await realpath(bindingCwd);
+    const requested = isAbsolute(requestedPath) ? requestedPath : resolve(root, requestedPath);
+    const canonicalPath = await realpath(requested);
+    if (!isWithin(root, canonicalPath)) throw invalidInput();
+
+    const beforeOpen = await stat(canonicalPath);
+    if (!beforeOpen.isFile()) throw invalidInput();
+    source = await open(canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const opened = await source.stat();
+    if (
+      !opened.isFile() ||
+      !sameInode(beforeOpen, opened) ||
+      !Number.isSafeInteger(opened.size) ||
+      opened.size < 0
+    ) {
+      throw invalidInput();
+    }
+
+    // Re-resolve every parent after opening. A parent/final-component swap either
+    // escapes containment or changes the path inode; the descriptor remains pinned.
+    const verifiedPath = await realpath(canonicalPath);
+    const afterOpen = await stat(verifiedPath);
+    if (
+      verifiedPath !== canonicalPath ||
+      !isWithin(root, verifiedPath) ||
+      !sameInode(opened, afterOpen)
+    ) {
+      throw invalidInput();
+    }
+
+    privateDirectory = await mkdtemp(join(tmpdir(), "tabgoblin-upload-"));
+    await chmod(privateDirectory, 0o700);
+    const privatePath = join(privateDirectory, "upload");
+    destination = await open(
+      privatePath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+      0o600,
+    );
+    await destination.chmod(0o600);
+
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let sourcePosition = 0;
+    let destinationPosition = 0;
+    while (sourcePosition < opened.size) {
+      if (signal.aborted) throw signal.reason ?? timeoutFailure();
+      const bytesRemaining = opened.size - sourcePosition;
+      const { bytesRead } = await source.read(
+        buffer,
+        0,
+        Math.min(buffer.length, bytesRemaining),
+        sourcePosition,
+      );
+      if (bytesRead === 0) throw invalidInput();
+      sourcePosition += bytesRead;
+      let written = 0;
+      while (written < bytesRead) {
+        if (signal.aborted) throw signal.reason ?? timeoutFailure();
+        const result = await destination.write(
+          buffer,
+          written,
+          bytesRead - written,
+          destinationPosition,
+        );
+        if (result.bytesWritten === 0) throw unexpectedFailure();
+        written += result.bytesWritten;
+        destinationPosition += result.bytesWritten;
+      }
+    }
+
+    const afterCopy = await source.stat();
+    if (
+      !sameInode(opened, afterCopy) ||
+      opened.size !== afterCopy.size ||
+      opened.mtimeMs !== afterCopy.mtimeMs ||
+      opened.ctimeMs !== afterCopy.ctimeMs
+    ) {
+      throw invalidInput();
+    }
+
+    await source.close();
+    source = undefined;
+    await destination.close();
+    destination = undefined;
+    const directoryToRemove = privateDirectory;
+    privateDirectory = undefined;
+    return {
+      hostPath: privatePath,
+      name: basename(canonicalPath),
+      cleanup: () => rm(directoryToRemove, { recursive: true, force: true }),
+    };
+  } catch (error: unknown) {
+    await source?.close().catch(() => undefined);
+    await destination?.close().catch(() => undefined);
+    if (privateDirectory) await rm(privateDirectory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
 export function createAdminServer(options: AdminServerOptions): AdminServer {
   const { services, enrollment, socketPath } = options;
   const handlerTimeoutMs = options.handlerTimeoutMs ?? DEFAULT_HANDLER_TIMEOUT_MS;
@@ -219,10 +341,12 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
     lease: Lease,
     bindingCwd: string,
     signal: AbortSignal,
+    ensureAuthorized: () => Promise<void>,
   ): Promise<AdminResponse> => {
     assertGeneration(ownership, lease);
 
     if (name === "tabgoblin_start") {
+      await ensureAuthorized();
       await services.runtime.start(workspaceId);
       assertGeneration(ownership, lease);
       return { ok: true, status: statusFor(workspaceId) };
@@ -236,21 +360,31 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
       );
     }
 
+    await ensureAuthorized();
     const browser = await services.browser(workspaceId);
     assertGeneration(ownership, lease);
+    const perform = async <T>(action: () => T | Promise<T>): Promise<T> => {
+      await ensureAuthorized();
+      return action();
+    };
 
     switch (name) {
       case "tabgoblin_list_tabs": {
-        const tabs = TabSchema.array().max(100).parse(await browser.listTabs(signal));
+        const tabs = TabSchema.array().max(100).parse(
+          await perform(() => browser.listTabs(signal)),
+        );
         return { ok: true, tabs };
       }
       case "tabgoblin_new_tab": {
         const value = input as { url: string };
-        return { ok: true, result: TabSchema.parse(await browser.newTab(value.url, signal)) };
+        return {
+          ok: true,
+          result: TabSchema.parse(await perform(() => browser.newTab(value.url, signal))),
+        };
       }
       case "tabgoblin_close_tab": {
         const value = input as { tabId: string };
-        await browser.closeTab(value.tabId, signal);
+        await perform(() => browser.closeTab(value.tabId, signal));
         return { ok: true };
       }
       case "tabgoblin_navigate": {
@@ -258,64 +392,123 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
         return {
           ok: true,
           result: TabSchema.parse(
-            await browser.navigate(value.tabId, value.url, value.timeoutMs, signal),
+            await perform(() => browser.navigate(value.tabId, value.url, value.timeoutMs, signal)),
           ),
         };
       }
       case "tabgoblin_back": {
         const value = input as { tabId: string; timeoutMs: number };
-        return { ok: true, result: TabSchema.parse(await browser.back(value.tabId, value.timeoutMs, signal)) };
+        return {
+          ok: true,
+          result: TabSchema.parse(
+            await perform(() => browser.back(value.tabId, value.timeoutMs, signal)),
+          ),
+        };
       }
       case "tabgoblin_forward": {
         const value = input as { tabId: string; timeoutMs: number };
-        return { ok: true, result: TabSchema.parse(await browser.forward(value.tabId, value.timeoutMs, signal)) };
+        return {
+          ok: true,
+          result: TabSchema.parse(
+            await perform(() => browser.forward(value.tabId, value.timeoutMs, signal)),
+          ),
+        };
       }
       case "tabgoblin_reload": {
         const value = input as { tabId: string; timeoutMs: number };
-        return { ok: true, result: TabSchema.parse(await browser.reload(value.tabId, value.timeoutMs, signal)) };
+        return {
+          ok: true,
+          result: TabSchema.parse(
+            await perform(() => browser.reload(value.tabId, value.timeoutMs, signal)),
+          ),
+        };
       }
       case "tabgoblin_snapshot": {
         const value = input as { tabId: string };
-        return { ok: true, snapshot: SnapshotSchema.parse(await browser.snapshot(value.tabId, signal)) };
+        return {
+          ok: true,
+          snapshot: SnapshotSchema.parse(await perform(() => browser.snapshot(value.tabId, signal))),
+        };
       }
       case "tabgoblin_click": {
         const value = input as { tabId: string; ref: string; timeoutMs: number };
-        await browser.act(value.tabId, { kind: "click", ref: value.ref, timeoutMs: value.timeoutMs }, signal);
+        await perform(() =>
+          browser.act(value.tabId, { kind: "click", ref: value.ref, timeoutMs: value.timeoutMs }, signal),
+        );
         return { ok: true };
       }
       case "tabgoblin_fill": {
         const value = input as { tabId: string; ref: string; value: string; timeoutMs: number };
-        await browser.act(value.tabId, { kind: "fill", ref: value.ref, value: value.value, timeoutMs: value.timeoutMs }, signal);
+        await perform(() =>
+          browser.act(
+            value.tabId,
+            { kind: "fill", ref: value.ref, value: value.value, timeoutMs: value.timeoutMs },
+            signal,
+          ),
+        );
         return { ok: true };
       }
       case "tabgoblin_type": {
         const value = input as { tabId: string; ref: string; text: string; timeoutMs: number };
-        await browser.act(value.tabId, { kind: "type", ref: value.ref, text: value.text, timeoutMs: value.timeoutMs }, signal);
+        await perform(() =>
+          browser.act(
+            value.tabId,
+            { kind: "type", ref: value.ref, text: value.text, timeoutMs: value.timeoutMs },
+            signal,
+          ),
+        );
         return { ok: true };
       }
       case "tabgoblin_keypress": {
         const value = input as { tabId: string; key: string; timeoutMs: number };
-        await browser.act(value.tabId, { kind: "keypress", key: value.key, timeoutMs: value.timeoutMs }, signal);
+        await perform(() =>
+          browser.act(
+            value.tabId,
+            { kind: "keypress", key: value.key, timeoutMs: value.timeoutMs },
+            signal,
+          ),
+        );
         return { ok: true };
       }
       case "tabgoblin_select": {
         const value = input as { tabId: string; ref: string; values: string[]; timeoutMs: number };
-        await browser.act(value.tabId, { kind: "select", ref: value.ref, values: value.values, timeoutMs: value.timeoutMs }, signal);
+        await perform(() =>
+          browser.act(
+            value.tabId,
+            { kind: "select", ref: value.ref, values: value.values, timeoutMs: value.timeoutMs },
+            signal,
+          ),
+        );
         return { ok: true };
       }
       case "tabgoblin_hover": {
         const value = input as { tabId: string; ref: string; timeoutMs: number };
-        await browser.act(value.tabId, { kind: "hover", ref: value.ref, timeoutMs: value.timeoutMs }, signal);
+        await perform(() =>
+          browser.act(value.tabId, { kind: "hover", ref: value.ref, timeoutMs: value.timeoutMs }, signal),
+        );
         return { ok: true };
       }
       case "tabgoblin_scroll": {
         const value = input as { tabId: string; dx: number; dy: number };
-        await browser.act(value.tabId, { kind: "scroll", dx: value.dx, dy: value.dy }, signal);
+        await perform(() =>
+          browser.act(value.tabId, { kind: "scroll", dx: value.dx, dy: value.dy }, signal),
+        );
         return { ok: true };
       }
       case "tabgoblin_drag": {
         const value = input as { tabId: string; fromRef: string; toRef: string; timeoutMs: number };
-        await browser.act(value.tabId, { kind: "drag", fromRef: value.fromRef, toRef: value.toRef, timeoutMs: value.timeoutMs }, signal);
+        await perform(() =>
+          browser.act(
+            value.tabId,
+            {
+              kind: "drag",
+              fromRef: value.fromRef,
+              toRef: value.toRef,
+              timeoutMs: value.timeoutMs,
+            },
+            signal,
+          ),
+        );
         return { ok: true };
       }
       case "tabgoblin_wait": {
@@ -326,57 +519,74 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
           ...(value.text === undefined ? {} : { text: value.text }),
           timeoutMs: value.timeoutMs,
         };
-        await browser.act(value.tabId, action, signal);
+        await perform(() => browser.act(value.tabId, action, signal));
         return { ok: true };
       }
       case "tabgoblin_text": {
         const value = input as { tabId: string; maxChars: number };
-        return { ok: true, result: await browser.text(value.tabId, value.maxChars, signal) };
+        return {
+          ok: true,
+          result: await perform(() => browser.text(value.tabId, value.maxChars, signal)),
+        };
       }
       case "tabgoblin_screenshot": {
         const value = input as { tabId: string; fullPage: boolean };
-        return { ok: true, result: await browser.screenshot(value.tabId, value.fullPage, signal) };
+        return {
+          ok: true,
+          result: await perform(() => browser.screenshot(value.tabId, value.fullPage, signal)),
+        };
       }
       case "tabgoblin_logs": {
         const value = input as { tabId: string; maxEntries: number };
-        return { ok: true, result: await browser.logs(value.tabId, value.maxEntries) };
+        return {
+          ok: true,
+          result: await perform(() => browser.logs(value.tabId, value.maxEntries)),
+        };
       }
       case "tabgoblin_network": {
         const value = input as { tabId: string; maxEntries: number };
         const entries = NetworkDiagnosticSchema.array().max(value.maxEntries).parse(
-          browser.network(value.tabId, value.maxEntries),
+          await perform(() => browser.network(value.tabId, value.maxEntries)),
         );
         return { ok: true, result: entries };
       }
       case "tabgoblin_upload": {
         const value = input as { tabId: string; ref: string; path: string };
-        let root: string;
-        let filePath: string;
+        let pinned: PinnedUpload;
         try {
-          root = await realpath(bindingCwd);
-          const requested = isAbsolute(value.path) ? value.path : resolve(root, value.path);
-          filePath = await realpath(requested);
-          if (!isWithin(root, filePath) || !(await stat(filePath)).isFile()) throw invalidInput();
-        } catch {
+          pinned = await pinUpload(bindingCwd, value.path, signal);
+        } catch (error: unknown) {
+          if (TabGoblinErrorSchema.safeParse(error).success) throw error;
           throw tabGoblinError(
             "invalid_input",
-            "Uploads must resolve to a file inside the workspace",
+            "Uploads must resolve to a stable file inside the workspace",
             false,
           );
         }
-        const name = basename(filePath);
-        if (name.includes("\\") || name.includes("\0")) {
-          throw tabGoblinError("invalid_input", "The upload filename is invalid", false);
+        try {
+          if (pinned.name.includes("\\") || pinned.name.includes("\0")) {
+            throw tabGoblinError("invalid_input", "The upload filename is invalid", false);
+          }
+          await ensureAuthorized();
+          const staged = await services.runtime.stageFile(
+            workspaceId,
+            pinned.hostPath,
+            pinned.name,
+          );
+          await perform(() => browser.upload(value.tabId, value.ref, staged, signal));
+          return { ok: true };
+        } finally {
+          await pinned.cleanup();
         }
-        assertGeneration(ownership, lease);
-        const staged = await services.runtime.stageFile(workspaceId, filePath, name);
-        assertGeneration(ownership, lease);
-        await browser.upload(value.tabId, value.ref, staged, signal);
-        return { ok: true };
       }
       case "tabgoblin_evaluate": {
         const value = input as { tabId: string; expression: string; maxChars: number };
-        return { ok: true, result: await browser.evaluate(value.tabId, value.expression, value.maxChars, signal) };
+        return {
+          ok: true,
+          result: await perform(() =>
+            browser.evaluate(value.tabId, value.expression, value.maxChars, signal),
+          ),
+        };
       }
       case "tabgoblin_status":
         throw unexpectedFailure();
@@ -441,6 +651,22 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
         action: request.name,
       });
 
+      const ensureAuthorized = async (): Promise<void> => {
+        deadline.check();
+        const current = await enrollment.authorize(request.enrollment);
+        deadline.check();
+        if (
+          current.cwd !== binding.cwd ||
+          current.agentId !== binding.agentId ||
+          current.workspaceId !== binding.workspaceId ||
+          current.agentGeneration !== binding.agentGeneration ||
+          current.workspaceGeneration !== binding.workspaceGeneration
+        ) {
+          throw tabGoblinError("auth_failed", "The enrollment binding changed", false);
+        }
+        assertGeneration(ownership, lease!);
+      };
+
       const response = await deadline.run((signal) =>
         dispatchBrowserTool(
           request.name,
@@ -450,6 +676,7 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
           lease!,
           binding.cwd,
           signal,
+          ensureAuthorized,
         ),
       );
       const checked = AdminResponseSchema.parse(response);
@@ -491,7 +718,7 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
         await services.ownership(request.workspaceId).returnToAgent();
         return { ok: true, status: statusFor(request.workspaceId) };
       case "record-enrollment":
-        enrollment.record(request.enrollment, request.cwd);
+        enrollment.record(request.enrollment, request.cwd, request.workspaceGeneration);
         return { ok: true };
       case "resolve-enrollment": {
         const binding = await enrollment.resolve(
@@ -504,10 +731,16 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
         };
       }
       case "bind-enrollment":
-        enrollment.bind(request.cwd, request.agentId, request.workspaceId);
+        enrollment.bind(request.cwd, request.agentId, request.workspaceId, {
+          agentGeneration: request.agentGeneration,
+          workspaceGeneration: request.workspaceGeneration,
+        });
         return { ok: true };
       case "session-open":
-        enrollment.noteSessionOpen(request.agentId, request.workspaceId, request.purpose);
+        enrollment.noteSessionOpen(request.agentId, request.workspaceId, request.purpose, {
+          agentGeneration: request.agentGeneration,
+          workspaceGeneration: request.workspaceGeneration,
+        });
         return { ok: true };
       case "revoke-agent":
         enrollment.revokeAgent(request.agentId);
@@ -515,6 +748,13 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
       case "revoke-workspace":
         enrollment.revokeWorkspace(request.workspaceId);
         return { ok: true };
+      case "reset-agent":
+        return { ok: true, lifecycleGeneration: enrollment.resetAgent(request.agentId) };
+      case "reset-workspace":
+        return {
+          ok: true,
+          lifecycleGeneration: enrollment.resetWorkspace(request.workspaceId),
+        };
       case "tool":
         return executeTool(request, deadline);
     }

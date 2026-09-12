@@ -12,6 +12,9 @@ const workspaceId = z.string().min(1).max(128);
 const agentId = z.string().min(1).max(128);
 const cwd = z.string().min(1).max(4096);
 const enrollment = z.string().uuid();
+// Generation zero is the initial lifecycle. T12 must persist generations returned
+// by explicit reset operations and attach them to every later lifecycle notification.
+const lifecycleGeneration = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 const scopedOperation = (op: "status" | "start" | "stop" | "activity" | "pair" | "return-to-agent") =>
   z.object({ op: z.literal(op), workspaceId }).strict();
 
@@ -33,7 +36,14 @@ export const AdminRequestSchema = z.discriminatedUnion("op", [
       source: z.string().min(1).max(80),
     })
     .strict(),
-  z.object({ op: z.literal("record-enrollment"), enrollment, cwd }).strict(),
+  z
+    .object({
+      op: z.literal("record-enrollment"),
+      enrollment,
+      cwd,
+      workspaceGeneration: lifecycleGeneration.default(0),
+    })
+    .strict(),
   // The bridge's only call before it knows its workspace scope.
   z.object({ op: z.literal("resolve-enrollment"), enrollment }).strict(),
   z
@@ -42,6 +52,8 @@ export const AdminRequestSchema = z.discriminatedUnion("op", [
       cwd,
       agentId,
       workspaceId: workspaceId.nullable(),
+      agentGeneration: lifecycleGeneration.default(0),
+      workspaceGeneration: lifecycleGeneration.default(0),
     })
     .strict(),
   z
@@ -50,10 +62,14 @@ export const AdminRequestSchema = z.discriminatedUnion("op", [
       agentId,
       workspaceId: workspaceId.nullable(),
       purpose: z.enum(["interactive", "history"]),
+      agentGeneration: lifecycleGeneration.default(0),
+      workspaceGeneration: lifecycleGeneration.default(0),
     })
     .strict(),
   z.object({ op: z.literal("revoke-agent"), agentId }).strict(),
   z.object({ op: z.literal("revoke-workspace"), workspaceId }).strict(),
+  z.object({ op: z.literal("reset-agent"), agentId }).strict(),
+  z.object({ op: z.literal("reset-workspace"), workspaceId }).strict(),
 ]);
 export type AdminRequest = z.infer<typeof AdminRequestSchema>;
 
@@ -67,6 +83,7 @@ export const AdminResponseSchema = z.discriminatedUnion("ok", [
       snapshot: SnapshotSchema.optional(),
       pairingCode: z.string().min(8).max(64).optional(),
       pairingExpiresAt: z.string().max(64).optional(),
+      lifecycleGeneration: lifecycleGeneration.optional(),
       binding: z
         .object({ agentId, workspaceId })
         .strict()

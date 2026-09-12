@@ -156,6 +156,98 @@ describe("EnrollmentRegistry", () => {
     });
   });
 
+  it("rejects delayed workspace lifecycle events until an explicit reset generation", async () => {
+    const registry = new EnrollmentRegistry();
+    registry.record(NONCE, "/w/one", 0);
+
+    expect(registry.revokeWorkspace("ws-1")).toBe(1);
+    // A delayed record does not yet know its workspace ID. It may be retained,
+    // but its stale generation can never bind or authorize after revocation.
+    registry.record(SECOND, "/w/one", 0);
+    expect(() => registry.bind(
+      "/w/one",
+      "agent-1",
+      "ws-1",
+      { agentGeneration: 0, workspaceGeneration: 0 },
+    )).toThrow(expect.objectContaining({ code: "auth_failed" }));
+    expect(() => registry.noteSessionOpen(
+      "agent-1",
+      "ws-1",
+      "interactive",
+      { agentGeneration: 0, workspaceGeneration: 0 },
+    )).toThrow(expect.objectContaining({ code: "auth_failed" }));
+    await expect(registry.authorize(NONCE)).rejects.toMatchObject({ code: "not_enrolled" });
+
+    const workspaceGeneration = registry.resetWorkspace("ws-1");
+    expect(workspaceGeneration).toBe(2);
+    registry.record(THIRD, "/w/one", workspaceGeneration);
+    expect(() => registry.bind(
+      "/w/one",
+      "agent-1",
+      "ws-1",
+      { agentGeneration: 0, workspaceGeneration: 0 },
+    )).toThrow(expect.objectContaining({ code: "auth_failed" }));
+    registry.bind(
+      "/w/one",
+      "agent-1",
+      "ws-1",
+      { agentGeneration: 0, workspaceGeneration },
+    );
+    registry.noteSessionOpen(
+      "agent-1",
+      "ws-1",
+      "interactive",
+      { agentGeneration: 0, workspaceGeneration },
+    );
+    await expect(registry.authorize(SECOND)).rejects.toMatchObject({ code: "not_enrolled" });
+    await expect(registry.authorize(THIRD)).resolves.toMatchObject({ workspaceGeneration });
+  });
+
+  it("rejects delayed agent lifecycle events and bounds lifecycle tombstones", async () => {
+    const registry = new EnrollmentRegistry({ maxLifecycleIdentities: 3 });
+    registry.record(NONCE, "/w/one", 0);
+    expect(registry.revokeAgent("agent-1")).toBe(1);
+    expect(() => registry.bind(
+      "/w/one",
+      "agent-1",
+      "ws-1",
+      { agentGeneration: 0, workspaceGeneration: 0 },
+    )).toThrow(expect.objectContaining({ code: "auth_failed" }));
+    expect(() => registry.noteSessionOpen(
+      "agent-1",
+      "ws-1",
+      "interactive",
+      { agentGeneration: 0, workspaceGeneration: 0 },
+    )).toThrow(expect.objectContaining({ code: "auth_failed" }));
+
+    const agentGeneration = registry.resetAgent("agent-1");
+    expect(agentGeneration).toBe(2);
+    registry.bind(
+      "/w/one",
+      "agent-1",
+      "ws-1",
+      { agentGeneration, workspaceGeneration: 0 },
+    );
+    registry.noteSessionOpen(
+      "agent-1",
+      "ws-1",
+      "interactive",
+      { agentGeneration, workspaceGeneration: 0 },
+    );
+    await expect(registry.authorize(NONCE)).resolves.toMatchObject({ agentGeneration });
+
+    registry.revokeAgent("agent-2");
+    registry.revokeAgent("agent-3");
+    expect(() => registry.revokeAgent("agent-4")).toThrow(
+      expect.objectContaining({ code: "busy" }),
+    );
+    registry.revokeWorkspace("ws-2");
+    registry.revokeWorkspace("ws-3");
+    expect(() => registry.revokeWorkspace("ws-4")).toThrow(
+      expect.objectContaining({ code: "busy" }),
+    );
+  });
+
   it("revokes already-bound agent credentials without affecting another agent", async () => {
     const registry = new EnrollmentRegistry();
     bindInteractive(registry);

@@ -1,7 +1,7 @@
 import { request as httpRequest } from "node:http";
-import { mkdtemp, mkdir, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createConnection } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActivityFeed } from "../src/activity-feed.js";
@@ -190,8 +190,16 @@ describe("admin request handling", () => {
     await expect(server.handle({ op: "return-to-agent", workspaceId: "ws-1" })).resolves.toMatchObject({ ok: true });
     await expect(server.handle({ op: "revoke-agent", agentId: "agent-1" })).resolves.toEqual({ ok: true });
     await expect(enrollment.authorize(NONCE)).rejects.toMatchObject({ code: "not_enrolled" });
+    await expect(server.handle({ op: "reset-agent", agentId: "agent-1" })).resolves.toEqual({
+      ok: true,
+      lifecycleGeneration: 2,
+    });
     await expect(server.handle({ op: "revoke-workspace", workspaceId: "ws-1" })).resolves.toEqual({ ok: true });
     await expect(enrollment.authorize(SECOND)).rejects.toMatchObject({ code: "not_enrolled" });
+    await expect(server.handle({ op: "reset-workspace", workspaceId: "ws-1" })).resolves.toEqual({
+      ok: true,
+      lifecycleGeneration: 2,
+    });
 
     expect(runtime.start).toHaveBeenCalledWith("ws-1");
     expect(runtime.stop).toHaveBeenCalledWith("ws-1");
@@ -238,6 +246,28 @@ describe("authenticated tool dispatch", () => {
       error: { code: "not_enrolled" },
     });
     expect(session.listTabs).toHaveBeenCalledTimes(1);
+  });
+
+  it("reauthorizes after awaiting browser acquisition and blocks post-revoke dispatch", async () => {
+    const { server, services, enrollment, session } = harness();
+    enroll(enrollment);
+    let releaseBrowser!: () => void;
+    const heldBrowser = new Promise<void>((resolve) => { releaseBrowser = resolve; });
+    services.browser.mockImplementationOnce(async () => {
+      await heldBrowser;
+      return session;
+    });
+
+    const pending = server.handle(tool("tabgoblin_list_tabs"));
+    await vi.waitFor(() => expect(services.browser).toHaveBeenCalledOnce());
+    enrollment.revokeWorkspace("ws-1");
+    releaseBrowser();
+
+    await expect(pending).resolves.toMatchObject({
+      ok: false,
+      error: { code: "not_enrolled" },
+    });
+    expect(session.listTabs).not.toHaveBeenCalled();
   });
 
   it("re-validates tool input before runtime, ownership, or browser access", async () => {
@@ -313,12 +343,90 @@ describe("authenticated tool dispatch", () => {
     enroll(enrollment, { cwd: workspace });
 
     await expect(server.handle(tool("tabgoblin_upload", { tabId: "t1", ref: "r1-e0", path: "inside.txt" }))).resolves.toEqual({ ok: true });
-    expect(runtime.stageFile).toHaveBeenCalledWith("ws-1", join(workspace, "inside.txt"), "inside.txt");
+    const stagedHostPath = runtime.stageFile.mock.calls[0]?.[1] as string;
+    expect(runtime.stageFile).toHaveBeenCalledWith("ws-1", expect.any(String), "inside.txt");
+    expect(stagedHostPath).not.toBe(join(workspace, "inside.txt"));
+    await expect(stat(stagedHostPath)).rejects.toMatchObject({ code: "ENOENT" });
     expect(session.upload).toHaveBeenCalledWith("t1", "r1-e0", "/staging/inside.txt", expect.any(AbortSignal));
 
     const escaped = await server.handle(tool("tabgoblin_upload", { tabId: "t1", ref: "r1-e0", path: "escape.txt" }));
     expect(escaped).toMatchObject({ ok: false, error: { code: "invalid_input" } });
     expect(runtime.stageFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("reauthorizes after the upload staging gap before browser upload", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tg-upload-revoke-"));
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    await writeFile(join(workspace, "inside.txt"), "inside");
+
+    const { server, enrollment, runtime, session } = harness();
+    enroll(enrollment, { cwd: workspace });
+    let releaseStage!: () => void;
+    const heldStage = new Promise<void>((resolve) => { releaseStage = resolve; });
+    let stagedHostPath = "";
+    runtime.stageFile.mockImplementationOnce(async (_workspaceId, hostPath) => {
+      stagedHostPath = hostPath;
+      await heldStage;
+      return "/staging/inside.txt";
+    });
+
+    const pending = server.handle(tool("tabgoblin_upload", {
+      tabId: "t1",
+      ref: "r1-e0",
+      path: "inside.txt",
+    }));
+    await vi.waitFor(() => expect(runtime.stageFile).toHaveBeenCalledOnce());
+    enrollment.revokeWorkspace("ws-1");
+    releaseStage();
+
+    await expect(pending).resolves.toMatchObject({
+      ok: false,
+      error: { code: "not_enrolled" },
+    });
+    expect(session.upload).not.toHaveBeenCalled();
+    await expect(stat(stagedHostPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("stages uploads from a pinned private copy despite a validated parent-path swap", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tg-upload-race-"));
+    const workspace = join(root, "workspace");
+    const documents = join(workspace, "documents");
+    const movedDocuments = join(workspace, "documents-original");
+    const outside = join(root, "outside");
+    await mkdir(documents, { recursive: true });
+    await mkdir(outside);
+    await writeFile(join(documents, "report.txt"), "INSIDE-SECRET");
+    await writeFile(join(outside, "report.txt"), "OUTSIDE-SECRET");
+
+    const { server, enrollment, runtime, activity } = harness();
+    enroll(enrollment, { cwd: workspace });
+    let stagedHostPath = "";
+    let stagedContent = "";
+    let stagedMode = 0;
+    let stagedDirectoryMode = 0;
+    runtime.stageFile.mockImplementationOnce(async (_workspaceId, hostPath, name) => {
+      await rename(documents, movedDocuments);
+      await symlink(outside, documents, "dir");
+      stagedHostPath = hostPath;
+      stagedContent = await readFile(hostPath, "utf8");
+      stagedMode = (await stat(hostPath)).mode & 0o777;
+      stagedDirectoryMode = (await stat(dirname(hostPath))).mode & 0o777;
+      return `/staging/${name}`;
+    });
+
+    await expect(server.handle(tool("tabgoblin_upload", {
+      tabId: "t1",
+      ref: "r1-e0",
+      path: "documents/report.txt",
+    }))).resolves.toEqual({ ok: true });
+
+    expect(stagedContent).toBe("INSIDE-SECRET");
+    expect(stagedHostPath).not.toBe(join(documents, "report.txt"));
+    expect(stagedMode).toBe(0o600);
+    expect(stagedDirectoryMode).toBe(0o700);
+    await expect(stat(stagedHostPath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(JSON.stringify(activity.list())).not.toMatch(/INSIDE-SECRET|OUTSIDE-SECRET|documents/);
   });
 
   it("sanitizes unexpected dependency failures", async () => {

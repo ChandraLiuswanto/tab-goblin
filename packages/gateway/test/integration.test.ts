@@ -576,14 +576,11 @@ describeLive(`TabGoblin integrated runtime${LIVE_IMAGE ? "" : " (skipped: set TA
       afterReclaim: reclaimStatus.ownership.generation,
       afterReturn: returnedStatus.ownership.generation,
     };
-    expect({
-      takeoverAdvanced: ownershipGenerations.afterTakeover > ownershipGenerations.beforeTakeover,
-      reclaimAdvanced: ownershipGenerations.afterReclaim > ownershipGenerations.afterTakeover,
-      returnAdvanced: ownershipGenerations.afterReturn > ownershipGenerations.afterReclaim,
-    }, `ownership generations: ${JSON.stringify(ownershipGenerations)}`).toEqual({
-      takeoverAdvanced: true,
-      reclaimAdvanced: true,
-      returnAdvanced: true,
+    expect(ownershipGenerations, `ownership generations: ${JSON.stringify(ownershipGenerations)}`).toEqual({
+      beforeTakeover: 0,
+      afterTakeover: 1,
+      afterReclaim: 2,
+      afterReturn: 3,
     });
   }, 300_000);
 });

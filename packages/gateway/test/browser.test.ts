@@ -854,28 +854,38 @@ describeLive(
       });
     });
 
-    it("uploads a file staged inside the real rootless container", async () => {
-      const hostPath = join(temporaryDirectory!, "meaningful-upload.txt");
-      await writeFile(hostPath, "rootless container upload\n");
-      await requirePodman([
-        "cp",
-        hostPath,
-        `${containerName}:/staging/meaningful-upload.txt`,
-      ]);
-      const tab = await session!.newTab(`${fixtureUrl}/upload`);
-      const snapshot = await session!.snapshot(tab.tabId);
-      const file = snapshot.nodes.find((node) => node.name === "file")!;
-      const send = snapshot.nodes.find((node) => node.name === "Send")!;
+    it("uploads exact file bytes staged inside the real rootless container", async () => {
+      const filename = "meaningful-upload.txt";
+      const hostPath = join(temporaryDirectory!, filename);
+      const containerPath = `/staging/${filename}`;
+      const submit = async (contents: string): Promise<number> => {
+        await writeFile(hostPath, contents);
+        await requirePodman(["cp", hostPath, `${containerName}:${containerPath}`]);
+        const tab = await session!.newTab(`${fixtureUrl}/upload`);
+        const snapshot = await session!.snapshot(tab.tabId);
+        const file = snapshot.nodes.find((node) => node.name === "file")!;
+        const send = snapshot.nodes.find((node) => node.name === "Send")!;
 
-      expect(file).toBeTruthy();
-      expect(send).toBeTruthy();
-      await session!.upload(tab.tabId, file.ref, "/staging/meaningful-upload.txt");
-      await session!.act(tab.tabId, {
-        kind: "click",
-        ref: send.ref,
-        timeoutMs: 5000,
-      });
-      expect(await session!.text(tab.tabId, 1000)).toContain("meaningful-upload.txt");
+        expect(file).toBeTruthy();
+        expect(send).toBeTruthy();
+        await session!.upload(tab.tabId, file.ref, containerPath);
+        await session!.act(tab.tabId, {
+          kind: "click",
+          ref: send.ref,
+          timeoutMs: 5000,
+        });
+        const result = await session!.text(tab.tabId, 1000);
+        const reportedLength = new RegExp(`${filename} (\\d+)`).exec(result)?.[1];
+        expect(reportedLength).toBeDefined();
+        return Number(reportedLength);
+      };
+
+      const emptyMultipartLength = await submit("");
+      const contents = "rootless container upload\n";
+      const populatedMultipartLength = await submit(contents);
+
+      expect(Buffer.byteLength(contents)).toBe(26);
+      expect(populatedMultipartLength - emptyMultipartLength).toBe(26);
     });
 
     it("never aliases tab IDs after a fresh attachment to the real runtime", async () => {

@@ -450,9 +450,10 @@ describe("admin and viewer wire contracts", () => {
       ok: true,
       lifecycleGeneration: 2,
     });
-    expect(AdminResponseSchema.parse({ ok: true, protocolVersion: 1 })).toEqual({
+    expect(AdminResponseSchema.parse({ ok: true, protocolVersion: 1, gatewayInstanceId: "11111111-1111-4111-8111-111111111111" })).toEqual({
       ok: true,
       protocolVersion: 1,
+      gatewayInstanceId: "11111111-1111-4111-8111-111111111111",
     });
   });
 

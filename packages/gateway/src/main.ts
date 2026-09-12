@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -263,7 +264,9 @@ export async function runGateway(options: RunGatewayOptions = {}): Promise<Gatew
     pairing,
     viewerUrl: () => advertisedViewerUrl,
   });
-  const admin = createAdminServer({ services, enrollment, socketPath });
+  // This non-secret process epoch makes a fresh in-memory lifecycle registry
+  // distinguishable from the one a durable plugin last reconciled with.
+  const admin = createAdminServer({ services, enrollment, socketPath, gatewayInstanceId: randomUUID() });
   const viewer = createViewerServer({
     services,
     pairing,

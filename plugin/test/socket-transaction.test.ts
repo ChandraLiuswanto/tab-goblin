@@ -23,7 +23,7 @@ async function unixServer(socketPath: string, events: string[]) {
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       events.push(body.op);
       response.setHeader("content-type", "application/json");
-      if (body.op === "health") response.end(JSON.stringify({ ok: true, protocolVersion: 1 }));
+      if (body.op === "health") response.end(JSON.stringify({ ok: true, protocolVersion: 1, gatewayInstanceId: "11111111-1111-4111-8111-111111111111" }));
       else if (body.op === "revoke-workspace" || body.op === "revoke-agent") response.end(JSON.stringify({ ok: true, lifecycleGeneration: 4 }));
       else response.end(JSON.stringify({ ok: true }));
     });

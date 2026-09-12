@@ -138,29 +138,68 @@ describe("durable lifecycle coordinator", () => {
     expect(settings.read().revokedWorkspaceIds).toEqual(["ws"]);
   });
 
-  it("resets a previously revoked agent and persists the returned generation before recording enrollment", async () => {
-    const settings = store(); await settings.update((current) => ({ ...current, enabled: true, enabledWorkspaceCwds: ["/w"], workspaceGenerations: { ws: 2 }, agentGenerations: { agent: 3 }, revokedAgentIds: ["agent"] }));
-    const calls: unknown[] = []; const gateway = { request: vi.fn(async (body) => { calls.push(body); return body.op === "reset-agent" ? { ok: true, lifecycleGeneration: 9 } : { ok: true }; }), notify: vi.fn(), close: vi.fn() } as any;
+  it("reconciles durable nonzero generations after a gateway identity change without reviving tombstones", async () => {
+    const initial = store();
+    await initial.update((current) => ({
+      ...current,
+      gatewayInstanceId: "11111111-1111-4111-8111-111111111111",
+      enabled: true,
+      enabledWorkspaceCwds: ["/live", "/revoked"],
+      activeAgentIds: ["live-agent"],
+      agentGenerations: { "live-agent": 3, "revoked-agent": 4 },
+      workspaceGenerations: { "live-workspace": 5, "revoked-workspace": 6 },
+      revokedAgentIds: ["revoked-agent"],
+      revokedWorkspaceIds: ["revoked-workspace"],
+    }));
+    // Reopen the same durable config against a new, empty gateway process.
+    const settings = createConfigStore(dirname(initial.path));
+    const calls: any[] = [];
+    const gateway = { request: vi.fn(async (body) => {
+      calls.push(body);
+      if (body.op === "health") return { ok: true, protocolVersion: 1, gatewayInstanceId: "22222222-2222-4222-8222-222222222222" };
+      if (body.op === "reset-agent") return { ok: true, lifecycleGeneration: 11 };
+      if (body.op === "reset-workspace") return { ok: true, lifecycleGeneration: body.workspaceId === "revoked-workspace" ? 21 : 12 };
+      if (body.op.startsWith("revoke-")) return { ok: true, lifecycleGeneration: 13 };
+      return { ok: true };
+    }), notify: vi.fn(), close: vi.fn() } as any;
     const coordinator = createLifecycleCoordinator(settings, gateway);
-    await expect(coordinator.openSession({ agentId: "agent", workspaceId: "ws", cwd: "/w", purpose: "interactive", enrollment: "11111111-1111-4111-8111-111111111111" })).resolves.toMatchObject({ agentGeneration: 9, workspaceGeneration: 2 });
-    expect(calls).toEqual([
-      { op: "reset-agent", agentId: "agent" },
-      { op: "record-enrollment", enrollment: "11111111-1111-4111-8111-111111111111", cwd: "/w", workspaceId: "ws", workspaceGeneration: 2 },
-      { op: "bind-enrollment", cwd: "/w", agentId: "agent", workspaceId: "ws", agentGeneration: 9, workspaceGeneration: 2 },
-      { op: "session-open", agentId: "agent", workspaceId: "ws", purpose: "interactive", agentGeneration: 9, workspaceGeneration: 2 },
+
+    await expect(coordinator.openSession({ agentId: "live-agent", workspaceId: "live-workspace", cwd: "/live", purpose: "interactive", enrollment: "11111111-1111-4111-8111-111111111111" })).resolves.toEqual({ socketPath: settings.read().socketPath, agentGeneration: 11, workspaceGeneration: 12 });
+    expect(calls.slice(0, 8)).toEqual([
+      { op: "health" },
+      { op: "reset-agent", agentId: "live-agent" },
+      { op: "revoke-agent", agentId: "revoked-agent" },
+      { op: "reset-workspace", workspaceId: "live-workspace" },
+      { op: "revoke-workspace", workspaceId: "revoked-workspace" },
+      { op: "record-enrollment", enrollment: "11111111-1111-4111-8111-111111111111", cwd: "/live", workspaceId: "live-workspace", workspaceGeneration: 12 },
+      { op: "bind-enrollment", cwd: "/live", agentId: "live-agent", workspaceId: "live-workspace", agentGeneration: 11, workspaceGeneration: 12 },
+      { op: "session-open", agentId: "live-agent", workspaceId: "live-workspace", purpose: "interactive", agentGeneration: 11, workspaceGeneration: 12 },
     ]);
-    expect(settings.read().agentGenerations.agent).toBe(9);
+    expect(settings.read()).toMatchObject({ gatewayInstanceId: "22222222-2222-4222-8222-222222222222", revokedAgentIds: ["revoked-agent"], revokedWorkspaceIds: ["revoked-workspace"] });
+
+    // No session request is an implicit tombstone reset.
+    await expect(coordinator.openSession({ agentId: "revoked-agent", workspaceId: "live-workspace", cwd: "/live", purpose: "interactive", enrollment: "33333333-3333-4333-8333-333333333333" })).resolves.toBeUndefined();
+    await expect(coordinator.openSession({ agentId: "new-agent", workspaceId: "revoked-workspace", cwd: "/revoked", purpose: "interactive", enrollment: "44444444-4444-4444-8444-444444444444" })).resolves.toBeUndefined();
+    expect(calls.filter((body) => body.op === "record-enrollment")).toHaveLength(1);
+
+    // Explicit workspace opt-in is the only reset path, and preserves exact IDs.
+    await expect(coordinator.enableWorkspace("revoked-workspace", "/revoked")).resolves.toEqual({ ok: true });
+    await expect(coordinator.openSession({ agentId: "new-agent", workspaceId: "revoked-workspace", cwd: "/revoked", purpose: "interactive", enrollment: "44444444-4444-4444-8444-444444444444" })).resolves.toMatchObject({ workspaceGeneration: 21 });
+    expect(calls).toContainEqual({ op: "reset-workspace", workspaceId: "revoked-workspace" });
   });
 
-  it("persists cleanup intent before a failed revoke and resets only the still-enabled workspace", async () => {
-    const settings = store(); await settings.update((current) => ({ ...current, enabled: true, enabledWorkspaceCwds: ["/w"], workspaceGenerations: { ws: 5 } }));
-    const gateway = { request: vi.fn().mockResolvedValueOnce(unavailable).mockResolvedValueOnce({ ok: true, lifecycleGeneration: 7 }).mockResolvedValueOnce({ ok: true, lifecycleGeneration: 8 }).mockResolvedValue({ ok: true }), notify: vi.fn(), close: vi.fn() } as any;
+  it("persists cleanup intent before a failed revoke and leaves the workspace fail-closed", async () => {
+    const settings = store(); await settings.update((current) => ({ ...current, gatewayInstanceId: "11111111-1111-4111-8111-111111111111", enabled: true, enabledWorkspaceCwds: ["/w"], workspaceGenerations: { ws: 5 } }));
+    const gateway = { request: vi.fn(async (body) => body.op === "health"
+      ? { ok: true, protocolVersion: 1, gatewayInstanceId: "11111111-1111-4111-8111-111111111111" }
+      : gateway.request.mock.calls.filter(([request]: any[]) => request.op === "revoke-workspace").length === 1 ? unavailable : { ok: true, lifecycleGeneration: 7 }), notify: vi.fn(), close: vi.fn() } as any;
     const coordinator = createLifecycleCoordinator(settings, gateway);
     await coordinator.cleanup();
     expect(settings.read().pendingRevocations).toEqual([{ kind: "workspace", id: "ws" }]);
     await coordinator.replayPending();
-    await expect(coordinator.openSession({ agentId: "new", workspaceId: "ws", cwd: "/w", purpose: "interactive", enrollment: "11111111-1111-4111-8111-111111111111" })).resolves.toMatchObject({ workspaceGeneration: 8 });
-    expect(gateway.request.mock.calls.map(([body]: any[]) => body.op)).toEqual(["revoke-workspace", "revoke-workspace", "reset-workspace", "record-enrollment", "bind-enrollment", "session-open"]);
+    await expect(coordinator.openSession({ agentId: "new", workspaceId: "ws", cwd: "/w", purpose: "interactive", enrollment: "11111111-1111-4111-8111-111111111111" })).resolves.toBeUndefined();
+    expect(gateway.request.mock.calls.map(([body]: any[]) => body.op)).toEqual(["revoke-workspace", "revoke-workspace", "health"]);
+    expect(settings.read().revokedWorkspaceIds).toEqual(["ws"]);
   });
 
   it("serializes deferred enables so an older response cannot roll back a newer generation", async () => {

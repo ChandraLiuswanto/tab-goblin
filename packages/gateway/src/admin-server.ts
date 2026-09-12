@@ -43,6 +43,8 @@ export interface AdminServerOptions {
   services: WorkspaceServices;
   enrollment: EnrollmentRegistry;
   socketPath: string;
+  /** A process-unique, non-secret epoch used to fence durable plugin state. */
+  gatewayInstanceId?: string;
   /** Test seam; production callers should use the bounded default. */
   handlerTimeoutMs?: number;
 }
@@ -265,6 +267,7 @@ async function pinUpload(
 
 export function createAdminServer(options: AdminServerOptions): AdminServer {
   const { services, enrollment, socketPath } = options;
+  const gatewayInstanceId = options.gatewayInstanceId ?? randomUUID();
   const handlerTimeoutMs = options.handlerTimeoutMs ?? DEFAULT_HANDLER_TIMEOUT_MS;
   if (!Number.isSafeInteger(handlerTimeoutMs) || handlerTimeoutMs <= 0) {
     throw new RangeError("handlerTimeoutMs must be a positive safe integer");
@@ -703,7 +706,7 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
   ): Promise<AdminResponse> => {
     switch (request.op) {
       case "health":
-        return { ok: true, protocolVersion: PROTOCOL_VERSION };
+        return { ok: true, protocolVersion: PROTOCOL_VERSION, gatewayInstanceId };
       case "status":
         return { ok: true, status: statusFor(request.workspaceId) };
       case "tabs": {

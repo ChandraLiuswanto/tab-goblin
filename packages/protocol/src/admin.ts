@@ -12,6 +12,7 @@ const workspaceId = z.string().min(1).max(128);
 const agentId = z.string().min(1).max(128);
 const cwd = z.string().min(1).max(4096);
 const enrollment = z.string().uuid();
+const gatewayInstanceId = z.string().uuid();
 // Generation zero is the initial lifecycle. T12 must persist generations returned
 // by explicit reset operations and attach them to every later lifecycle notification.
 const lifecycleGeneration = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
@@ -88,6 +89,8 @@ export const AdminResponseSchema = z.discriminatedUnion("ok", [
       pairingExpiresAt: z.string().max(64).optional(),
       lifecycleGeneration: lifecycleGeneration.optional(),
       protocolVersion: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
+      // New on every gateway process. Plugins reconcile only when this changes.
+      gatewayInstanceId: gatewayInstanceId.optional(),
       binding: z
         .object({ agentId, workspaceId })
         .strict()

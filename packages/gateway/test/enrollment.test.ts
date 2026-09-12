@@ -277,6 +277,37 @@ describe("EnrollmentRegistry", () => {
     );
   });
 
+  it("requires gateway-issued resets to recover durable nonzero generations after restart", async () => {
+    const firstProcess = new EnrollmentRegistry();
+    const agentGeneration = firstProcess.resetAgent("durable-agent");
+    const workspaceGeneration = firstProcess.resetWorkspace("durable-workspace");
+    firstProcess.record(NONCE, "/w/durable", "durable-workspace", workspaceGeneration);
+    firstProcess.bind("/w/durable", "durable-agent", "durable-workspace", { agentGeneration, workspaceGeneration });
+    firstProcess.noteSessionOpen("durable-agent", "durable-workspace", "interactive", { agentGeneration, workspaceGeneration });
+    await expect(firstProcess.authorize(NONCE)).resolves.toMatchObject({ agentGeneration, workspaceGeneration });
+
+    // Restarting loses all enrollment nonces and lifecycle authority. A durable
+    // generation is rejected until this *new* registry issues its reset epoch.
+    const restarted = new EnrollmentRegistry();
+    expect(() => restarted.record(SECOND, "/w/durable", "durable-workspace", workspaceGeneration)).toThrow(
+      expect.objectContaining({ code: "auth_failed" }),
+    );
+    const restartedAgentGeneration = restarted.resetAgent("durable-agent");
+    const restartedWorkspaceGeneration = restarted.resetWorkspace("durable-workspace");
+    restarted.record(SECOND, "/w/durable", "durable-workspace", restartedWorkspaceGeneration);
+    restarted.bind("/w/durable", "durable-agent", "durable-workspace", { agentGeneration: restartedAgentGeneration, workspaceGeneration: restartedWorkspaceGeneration });
+    restarted.noteSessionOpen("durable-agent", "durable-workspace", "interactive", { agentGeneration: restartedAgentGeneration, workspaceGeneration: restartedWorkspaceGeneration });
+    await expect(restarted.authorize(SECOND)).resolves.toMatchObject({ agentGeneration: restartedAgentGeneration, workspaceGeneration: restartedWorkspaceGeneration });
+    await expect(restarted.authorize(NONCE)).rejects.toMatchObject({ code: "not_enrolled" });
+
+    // Replayed tombstones stay closed and cannot affect a same-cwd workspace.
+    const revoked = new EnrollmentRegistry();
+    revoked.revokeAgent("revoked-agent");
+    revoked.revokeWorkspace("revoked-workspace");
+    expect(() => revoked.record(THIRD, "/w/shared", "revoked-workspace", 1)).toThrow(expect.objectContaining({ code: "auth_failed" }));
+    revoked.record("44444444-4444-4444-8444-444444444444", "/w/shared", "other-workspace", 0);
+  });
+
   it("revokes already-bound agent credentials without affecting another agent", async () => {
     const registry = new EnrollmentRegistry();
     bindInteractive(registry);

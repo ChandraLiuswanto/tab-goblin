@@ -159,9 +159,11 @@ describe("admin request handling", () => {
     expect(JSON.stringify(response)).not.toContain("do-not-echo");
   });
 
-  it("returns only the bounded protocol version for an unscoped health probe", async () => {
+  it("returns a process-unique bounded identity on an unscoped health probe", async () => {
     const { server, services } = harness();
-    await expect(server.handle({ op: "health" })).resolves.toEqual({ ok: true, protocolVersion: 1 });
+    const response = await server.handle({ op: "health" });
+    expect(response).toMatchObject({ ok: true, protocolVersion: 1, gatewayInstanceId: expect.any(String) });
+    expect(response.ok && response.gatewayInstanceId).toMatch(/^[-0-9a-f]{36}$/i);
     expect(services.browser).not.toHaveBeenCalled();
     expect(services.runtime.state).not.toHaveBeenCalled();
   });

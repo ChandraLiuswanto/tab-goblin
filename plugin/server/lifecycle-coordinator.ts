@@ -1,4 +1,4 @@
-import type { AdminResponse } from "@tab-goblin/protocol";
+import { PROTOCOL_VERSION, type AdminResponse } from "@tab-goblin/protocol";
 import type { ConfigStore } from "./config-store.js";
 import type { GatewayClient, GatewayManager } from "./gateway-client.js";
 
@@ -36,7 +36,7 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
     const targets = [...current.pendingRevocations, ...current.activeAgentIds.map((id) => ({ kind: "agent" as const, id })), ...Object.keys(current.workspaceGenerations).map((id) => ({ kind: "workspace" as const, id }))];
     return targets.filter((item, index) => targets.findIndex((candidate) => candidate.kind === item.kind && candidate.id === item.id) === index);
   };
-  const commitRevocations = async (pending: Pending[], responses: readonly AdminResponse[], connection?: { socketPath: string; viewerUrl: string }) => {
+  const commitRevocations = async (pending: Pending[], responses: readonly AdminResponse[], connection?: { socketPath: string; viewerUrl: string; gatewayInstanceId?: null }) => {
     if (responses.length !== pending.length || responses.some((response) => !isGeneration(response))) throw new Error("socket revocation was not acknowledged");
     await settings.update((value) => ({
       ...value,
@@ -77,6 +77,59 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
     if (current.pendingRevocations.length >= 512) throw new Error("too many pending authority revocations");
     return { ...current, pendingRevocations: [...current.pendingRevocations, pending] };
   });
+  /**
+   * A gateway restart forgets its in-memory lifecycle registry. Its fresh process
+   * identity authorizes this one-time reconciliation; a generation by itself
+   * never does. Tombstones are replayed as revocations, while previously enabled
+   * IDs receive a fresh, gateway-issued generation for this new identity.
+   */
+  const reconcileGatewayInstance = async (): Promise<boolean> => {
+    let health: AdminResponse;
+    try { health = await gateway.request({ op: "health" }); }
+    catch { return false; }
+    if (!health.ok || health.protocolVersion !== PROTOCOL_VERSION || !health.gatewayInstanceId) return false;
+    // Capture the validated optional protocol field before awaits and the
+    // durable-store callback, where TypeScript correctly stops narrowing it.
+    const gatewayInstanceId = health.gatewayInstanceId;
+    const current = settings.read();
+    if (current.gatewayInstanceId === gatewayInstanceId) return true;
+
+    const pending = new Set(current.pendingRevocations.map(pendingKey));
+    const revokedAgents = new Set([...current.revokedAgentIds, ...current.pendingRevocations.filter((item) => item.kind === "agent").map((item) => item.id)]);
+    const revokedWorkspaces = new Set([...current.revokedWorkspaceIds, ...current.pendingRevocations.filter((item) => item.kind === "workspace").map((item) => item.id)]);
+    const agents = new Set([...Object.keys(current.agentGenerations), ...current.activeAgentIds, ...revokedAgents]);
+    const workspaces = new Set([...Object.keys(current.workspaceGenerations), ...revokedWorkspaces]);
+    const acknowledged: Array<{ kind: Pending["kind"]; id: string; generation: number; revoked: boolean }> = [];
+    for (const id of agents) {
+      const revoked = revokedAgents.has(id);
+      const response = await gateway.request(revoked ? { op: "revoke-agent", agentId: id } : { op: "reset-agent", agentId: id });
+      if (!isGeneration(response)) return false;
+      acknowledged.push({ kind: "agent", id, generation: response.lifecycleGeneration, revoked });
+    }
+    for (const id of workspaces) {
+      const revoked = revokedWorkspaces.has(id);
+      const response = await gateway.request(revoked ? { op: "revoke-workspace", workspaceId: id } : { op: "reset-workspace", workspaceId: id });
+      if (!isGeneration(response)) return false;
+      acknowledged.push({ kind: "workspace", id, generation: response.lifecycleGeneration, revoked });
+    }
+    await settings.update((value) => ({
+      ...value,
+      gatewayInstanceId,
+      pendingRevocations: value.pendingRevocations.filter((item) => !pending.has(pendingKey(item))),
+      activeAgentIds: value.activeAgentIds.filter((id) => !revokedAgents.has(id)),
+      agentGenerations: {
+        ...value.agentGenerations,
+        ...Object.fromEntries(acknowledged.filter((item) => item.kind === "agent").map((item) => [item.id, item.generation])),
+      },
+      workspaceGenerations: {
+        ...value.workspaceGenerations,
+        ...Object.fromEntries(acknowledged.filter((item) => item.kind === "workspace").map((item) => [item.id, item.generation])),
+      },
+      revokedAgentIds: [...new Set([...value.revokedAgentIds, ...acknowledged.filter((item) => item.kind === "agent" && item.revoked).map((item) => item.id)])],
+      revokedWorkspaceIds: [...new Set([...value.revokedWorkspaceIds, ...acknowledged.filter((item) => item.kind === "workspace" && item.revoked).map((item) => item.id)])],
+    }));
+    return true;
+  };
   const revoke = async (pending: Pending, timeoutMs?: number): Promise<boolean> => {
     // Persist intent before I/O: a reload can replay an interrupted cleanup safely.
     await remember(pending);
@@ -153,7 +206,7 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
       try {
         const result = await manager.switchSocketPath(connection.socketPath, revocations, {
           beforeRevocations: async () => { for (const item of pending) await remember(item); },
-          commit: (responses) => commitRevocations(pending, responses, connection),
+          commit: (responses) => commitRevocations(pending, responses, { ...connection, gatewayInstanceId: null }),
         });
         return { ok: result.ok && manager.socketPath() === connection.socketPath };
       } catch {
@@ -183,22 +236,15 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
     openSession: (session: Session) => serialize(async (): Promise<SessionScope | undefined> => {
       const current = settings.read();
       if (!current.enabled || !current.enabledWorkspaceCwds.includes(session.cwd)) return undefined;
-      let agentGeneration = current.agentGenerations[session.agentId] ?? 0;
-      let workspaceGeneration = current.workspaceGenerations[session.workspaceId] ?? 0;
-      // A known ID was revoked earlier. The reset acknowledgement is durable before it is reused.
-      if (current.revokedAgentIds.includes(session.agentId)) {
-        const reset = await request({ op: "reset-agent", agentId: session.agentId });
-        if (!isGeneration(reset)) return undefined;
-        agentGeneration = reset.lifecycleGeneration;
-        await settings.update((value) => ({ ...value, agentGenerations: { ...value.agentGenerations, [session.agentId]: agentGeneration }, revokedAgentIds: value.revokedAgentIds.filter((id) => id !== session.agentId) }));
-      }
-      // A cleanup/archival revocation never implicitly revives an opted-out workspace.
-      if (current.revokedWorkspaceIds.includes(session.workspaceId)) {
-        const reset = await request({ op: "reset-workspace", workspaceId: session.workspaceId });
-        if (!isGeneration(reset)) return undefined;
-        workspaceGeneration = reset.lifecycleGeneration;
-        await settings.update((value) => ({ ...value, workspaceGenerations: { ...value.workspaceGenerations, [session.workspaceId]: workspaceGeneration }, revokedWorkspaceIds: value.revokedWorkspaceIds.filter((id) => id !== session.workspaceId) }));
-      }
+      // A restart may only recover durable state after the new gateway proves a
+      // distinct process identity. No persisted generation is accepted alone.
+      if (!await reconcileGatewayInstance()) return undefined;
+      const reconciled = settings.read();
+      // Archived/opted-out identities are tombstones. Session opening is never an
+      // approval to reset them; enableWorkspace is the explicit workspace reset.
+      if (reconciled.revokedAgentIds.includes(session.agentId) || reconciled.revokedWorkspaceIds.includes(session.workspaceId)) return undefined;
+      const agentGeneration = reconciled.agentGenerations[session.agentId] ?? 0;
+      const workspaceGeneration = reconciled.workspaceGenerations[session.workspaceId] ?? 0;
       const recorded = await request({ op: "record-enrollment", enrollment: session.enrollment, cwd: session.cwd, workspaceId: session.workspaceId, workspaceGeneration });
       if (!recorded?.ok) return undefined;
       const bound = await request({ op: "bind-enrollment", cwd: session.cwd, agentId: session.agentId, workspaceId: session.workspaceId, agentGeneration, workspaceGeneration });

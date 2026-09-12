@@ -95,7 +95,7 @@ export function createGatewayManager(readSocketPath: () => string): GatewayManag
       const candidate = createGatewayClient(socketPath);
       const probeTimeout = Math.min(timeoutMs ?? CANDIDATE_PROBE_TIMEOUT_MS, CANDIDATE_PROBE_TIMEOUT_MS);
       const health = await candidate.request({ op: "health" }, probeTimeout);
-      if (!health.ok || health.protocolVersion !== PROTOCOL_VERSION) {
+      if (!health.ok || health.protocolVersion !== PROTOCOL_VERSION || !health.gatewayInstanceId) {
         candidate.close();
         return { ok: false, responses: [] };
       }

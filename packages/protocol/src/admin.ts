@@ -19,6 +19,7 @@ const scopedOperation = (op: "status" | "tabs" | "start" | "stop" | "activity" |
   z.object({ op: z.literal(op), workspaceId }).strict();
 
 export const AdminRequestSchema = z.discriminatedUnion("op", [
+  z.object({ op: z.literal("health") }).strict(),
   scopedOperation("status"),
   scopedOperation("tabs"),
   scopedOperation("start"),
@@ -86,6 +87,7 @@ export const AdminResponseSchema = z.discriminatedUnion("ok", [
       pairingCode: z.string().min(8).max(64).optional(),
       pairingExpiresAt: z.string().max(64).optional(),
       lifecycleGeneration: lifecycleGeneration.optional(),
+      protocolVersion: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
       binding: z
         .object({ agentId, workspaceId })
         .strict()

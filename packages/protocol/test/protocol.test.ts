@@ -373,6 +373,7 @@ describe("admin and viewer wire contracts", () => {
       op: "tabs",
       workspaceId: "w1",
     });
+    expect(AdminRequestSchema.parse({ op: "health" })).toEqual({ op: "health" });
     expect(
       AdminRequestSchema.safeParse({ op: "tool", workspaceId: "w1", name: "other", source: "a" })
         .success,
@@ -448,6 +449,10 @@ describe("admin and viewer wire contracts", () => {
     expect(AdminResponseSchema.parse({ ok: true, lifecycleGeneration: 2 })).toEqual({
       ok: true,
       lifecycleGeneration: 2,
+    });
+    expect(AdminResponseSchema.parse({ ok: true, protocolVersion: 1 })).toEqual({
+      ok: true,
+      protocolVersion: 1,
     });
   });
 

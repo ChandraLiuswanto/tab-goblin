@@ -158,6 +158,13 @@ describe("admin request handling", () => {
     expect(JSON.stringify(response)).not.toContain("do-not-echo");
   });
 
+  it("returns only the bounded protocol version for an unscoped health probe", async () => {
+    const { server, services } = harness();
+    await expect(server.handle({ op: "health" })).resolves.toEqual({ ok: true, protocolVersion: 1 });
+    expect(services.browser).not.toHaveBeenCalled();
+    expect(services.runtime.state).not.toHaveBeenCalled();
+  });
+
   it("returns bounded status without exposing runtime endpoints or profile paths", async () => {
     const { server } = harness();
     const response = await server.handle({ op: "status", workspaceId: "ws-1" });

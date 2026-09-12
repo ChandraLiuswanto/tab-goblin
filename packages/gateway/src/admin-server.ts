@@ -9,6 +9,7 @@ import {
   AdminRequestSchema,
   AdminResponseSchema,
   NetworkDiagnosticSchema,
+  PROTOCOL_VERSION,
   SessionStatusSchema,
   SnapshotSchema,
   TabGoblinErrorSchema,
@@ -700,6 +701,8 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
     deadline: RequestDeadline,
   ): Promise<AdminResponse> => {
     switch (request.op) {
+      case "health":
+        return { ok: true, protocolVersion: PROTOCOL_VERSION };
       case "status":
         return { ok: true, status: statusFor(request.workspaceId) };
       case "tabs": {

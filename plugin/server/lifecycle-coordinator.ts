@@ -31,21 +31,16 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
     tail = result.then(() => undefined, () => undefined);
     return result;
   };
-  const synchronizeSocket = async (timeoutMs?: number): Promise<Map<string, AdminResponse>> => {
-    const manager = gateway as Partial<GatewayManager>;
-    if (typeof manager.switchSocketPath !== "function" || typeof manager.socketPath !== "function" || manager.socketPath() === settings.read().socketPath) return new Map();
+  const authorityTargets = () => {
     const current = settings.read();
     const targets = [...current.pendingRevocations, ...current.activeAgentIds.map((id) => ({ kind: "agent" as const, id })), ...Object.keys(current.workspaceGenerations).map((id) => ({ kind: "workspace" as const, id }))];
-    const pending = targets.filter((item, index) => targets.findIndex((candidate) => candidate.kind === item.kind && candidate.id === item.id) === index);
-    // A socket replacement is a lifecycle boundary: make old-socket cleanup replayable first.
-    for (const item of pending) await remember(item);
-    const revocations = pending.map((item) => item.kind === "agent" ? { op: "revoke-agent" as const, agentId: item.id } : { op: "revoke-workspace" as const, workspaceId: item.id });
-    const responses = await manager.switchSocketPath(settings.read().socketPath, revocations, timeoutMs);
-    // The manager retains its old socket when any revoke fails. Keep every intent
-    // durable too: none may be replayed against the replacement socket.
-    if (responses.length !== pending.length || responses.some((response) => !isGeneration(response))) return new Map();
+    return targets.filter((item, index) => targets.findIndex((candidate) => candidate.kind === item.kind && candidate.id === item.id) === index);
+  };
+  const commitRevocations = async (pending: Pending[], responses: readonly AdminResponse[], connection?: { socketPath: string; viewerUrl: string }) => {
+    if (responses.length !== pending.length || responses.some((response) => !isGeneration(response))) throw new Error("socket revocation was not acknowledged");
     await settings.update((value) => ({
       ...value,
+      ...(connection ?? {}),
       pendingRevocations: value.pendingRevocations.filter((item) => !pending.some((candidate) => candidate.kind === item.kind && candidate.id === item.id)),
       activeAgentIds: value.activeAgentIds.filter((id) => !pending.some((item) => item.kind === "agent" && item.id === id)),
       agentGenerations: Object.fromEntries([...Object.entries(value.agentGenerations), ...pending.flatMap((item, index) => item.kind === "agent" && isGeneration(responses[index]) ? [[item.id, responses[index].lifecycleGeneration] as const] : [])]),
@@ -53,7 +48,20 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
       revokedAgentIds: [...new Set([...value.revokedAgentIds, ...pending.filter((item) => item.kind === "agent").map((item) => item.id)])],
       revokedWorkspaceIds: [...new Set([...value.revokedWorkspaceIds, ...pending.filter((item) => item.kind === "workspace").map((item) => item.id)])],
     }));
-    return new Map(pending.map((item, index) => [pendingKey(item), responses[index]]));
+  };
+  const synchronizeSocket = async (timeoutMs?: number): Promise<Map<string, AdminResponse>> => {
+    const manager = gateway as Partial<GatewayManager>;
+    if (typeof manager.switchSocketPath !== "function" || typeof manager.socketPath !== "function" || manager.socketPath() === settings.read().socketPath) return new Map();
+    const pending = authorityTargets();
+    const revocations = pending.map((item) => item.kind === "agent" ? { op: "revoke-agent" as const, agentId: item.id } : { op: "revoke-workspace" as const, workspaceId: item.id });
+    const result = await manager.switchSocketPath(settings.read().socketPath, revocations, {
+      beforeRevocations: async () => { for (const item of pending) await remember(item); },
+      commit: (responses) => commitRevocations(pending, responses),
+    }, timeoutMs);
+    // A failed probe or old-socket revoke keeps the old client and every old-origin
+    // intent. No response may be replayed against the candidate.
+    if (!result.ok) return new Map();
+    return new Map(pending.map((item, index) => [pendingKey(item), result.responses[index]]));
   };
   const request = async (body: Parameters<GatewayClient["request"]>[0], timeoutMs?: number): Promise<AdminResponse | undefined> => {
     try {
@@ -133,13 +141,21 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
       return { ok: acknowledged };
     }),
     updateConnection: (connection: { socketPath: string; viewerUrl: string }) => serialize(async () => {
-      const previousSocketPath = settings.read().socketPath;
-      await settings.update((value) => ({ ...value, socketPath: connection.socketPath, viewerUrl: connection.viewerUrl }));
-      if (previousSocketPath === connection.socketPath) return { ok: true as const };
+      const current = settings.read();
+      if (current.socketPath === connection.socketPath) {
+        await settings.update((value) => ({ ...value, viewerUrl: connection.viewerUrl }));
+        return { ok: true as const };
+      }
+      const manager = gateway as Partial<GatewayManager>;
+      if (typeof manager.switchSocketPath !== "function" || typeof manager.socketPath !== "function") return { ok: false as const };
+      const pending = authorityTargets();
+      const revocations = pending.map((item) => item.kind === "agent" ? { op: "revoke-agent" as const, agentId: item.id } : { op: "revoke-workspace" as const, workspaceId: item.id });
       try {
-        await synchronizeSocket();
-        const manager = gateway as Partial<GatewayManager>;
-        return { ok: typeof manager.socketPath === "function" && manager.socketPath() === connection.socketPath };
+        const result = await manager.switchSocketPath(connection.socketPath, revocations, {
+          beforeRevocations: async () => { for (const item of pending) await remember(item); },
+          commit: (responses) => commitRevocations(pending, responses, connection),
+        });
+        return { ok: result.ok && manager.socketPath() === connection.socketPath };
       } catch {
         return { ok: false as const };
       }

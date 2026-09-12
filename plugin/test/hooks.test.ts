@@ -12,18 +12,17 @@ describe("Claude-only scoped injection", () => {
     expect(shouldInject(SETTINGS, { cwd: "/w/one", provider: "codex" })).toBe(false);
   });
   it("keeps static MCP configuration free of credentials and adds fresh session env", async () => {
-    const server = fakeServer(); const request = vi.fn().mockResolvedValue({ ok: true }); const notify = vi.fn();
-    registerHooks(server, { readSettings: () => SETTINGS, gateway: { request, notify }, newEnrollment: () => "synthetic-nonce", advanceAgentGeneration: vi.fn(), advanceWorkspaceGeneration: vi.fn() });
+    const server = fakeServer(); const openSession = vi.fn().mockResolvedValue({ socketPath: "/run/tabgoblin.sock", agentGeneration: 4, workspaceGeneration: 3 });
+    registerHooks(server, { readSettings: () => SETTINGS, lifecycle: { openSession, revokeAgent: vi.fn(), revokeWorkspace: vi.fn() } as any, newEnrollment: () => "synthetic-nonce" });
     const created = server.beforeHandlers.get("agent.create")({ request: { config: { provider: "claude", cwd: "/w/one", mcpServers: {} }, env: { KEEP: "1" } } });
     expect(created.config.mcpServers.tabgoblin).toEqual({ type: "stdio", command: "node", args: ["bridge.mjs"] });
     expect(JSON.stringify(created.config.mcpServers)).not.toContain("synthetic-nonce");
     const opened = await server.beforeHandlers.get("agent.session_open")({ request: { agentId: "agent-1", workspaceId: "ws-1", provider: "claude", cwd: "/w/one", purpose: "history", reason: "resume", env: { KEEP: "1" } } });
     expect(opened.env).toMatchObject({ KEEP: "1", [ADMIN_SOCKET_ENV]: "/run/tabgoblin.sock", [ENROLLMENT_ENV]: "synthetic-nonce" });
-    expect(request).toHaveBeenCalledWith({ op: "record-enrollment", enrollment: "synthetic-nonce", cwd: "/w/one", workspaceId: "ws-1", workspaceGeneration: 3 });
-    expect(notify).toHaveBeenCalledWith({ op: "session-open", agentId: "agent-1", workspaceId: "ws-1", purpose: "history", agentGeneration: 4, workspaceGeneration: 3 });
+    expect(openSession).toHaveBeenCalledWith({ agentId: "agent-1", workspaceId: "ws-1", cwd: "/w/one", purpose: "history", enrollment: "synthetic-nonce" });
   });
   it("fails open when enrollment recording fails", async () => {
-    const server = fakeServer(); registerHooks(server, { readSettings: () => SETTINGS, gateway: { request: vi.fn().mockRejectedValue(new Error("down")), notify: vi.fn() }, newEnrollment: () => "x", advanceAgentGeneration: vi.fn(), advanceWorkspaceGeneration: vi.fn() });
+    const server = fakeServer(); registerHooks(server, { readSettings: () => SETTINGS, lifecycle: { openSession: vi.fn().mockRejectedValue(new Error("down")), revokeAgent: vi.fn(), revokeWorkspace: vi.fn() } as any, newEnrollment: () => "x" });
     await expect(server.beforeHandlers.get("agent.session_open")({ request: { agentId: "a", workspaceId: "ws-1", provider: "claude", cwd: "/w/one", purpose: "interactive", reason: "resume", env: {} } })).resolves.toBeUndefined();
   });
 });

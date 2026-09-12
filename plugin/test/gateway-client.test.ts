@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createGatewayClient } from "../server/gateway-client.js";
+import { createGatewayClient, createGatewayManager } from "../server/gateway-client.js";
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -42,6 +42,18 @@ describe("gateway client", () => {
     await new Promise<void>((resolve) => server.listen(socketPath, resolve));
     cleanup.push(() => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))).then(() => rm(directory, { recursive: true })));
     await expect(createGatewayClient(socketPath).request({ op: "status", workspaceId: "ws-1" })).resolves.toMatchObject({ ok: false, error: { code: "runtime_unavailable" } });
+  });
+
+  it("revokes through the old socket before selecting a replacement socket", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "tabgoblin-plugin-")); const oldPath = join(directory, "old.sock"); const newPath = join(directory, "new.sock"); const events: string[] = [];
+    const oldServer = createServer((request, response) => { events.push(`old:${request.url}`); response.end(JSON.stringify({ ok: true })); });
+    const newServer = createServer((request, response) => { events.push(`new:${request.url}`); response.end(JSON.stringify({ ok: true })); });
+    await Promise.all([new Promise<void>((resolve) => oldServer.listen(oldPath, resolve)), new Promise<void>((resolve) => newServer.listen(newPath, resolve))]);
+    cleanup.push(() => Promise.all([oldServer, newServer].map((server) => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())))).then(() => rm(directory, { recursive: true })));
+    const manager = createGatewayManager(() => oldPath);
+    await manager.switchSocketPath(newPath, [{ op: "revoke-workspace", workspaceId: "ws-1" }]);
+    await manager.request({ op: "status", workspaceId: "ws-1" });
+    expect(events).toEqual(["old:/", "new:/"]);
   });
 
   it("returns runtime_unavailable rather than throwing on transport failure", async () => {

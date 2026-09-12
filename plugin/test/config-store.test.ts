@@ -13,8 +13,13 @@ describe("app-owned durable config", () => {
     const dir = directory(); const first = createConfigStore(dir);
     await first.update((current) => ({ ...current, enabled: true, enabledWorkspaceCwds: ["/work"] }));
     expect(lstatSync(dir).mode & 0o077).toBe(0);
-    expect(lstatSync(first.path).mode & 0o077).toBe(0);
+    expect(lstatSync(first.path).mode & 0o777).toBe(0o600);
+    chmodSync(first.path, 0o700);
     expect(createConfigStore(dir).read()).toMatchObject({ enabled: true, enabledWorkspaceCwds: ["/work"] });
+    expect(lstatSync(first.path).mode & 0o777).toBe(0o600);
+    chmodSync(first.path, 0o400);
+    createConfigStore(dir);
+    expect(lstatSync(first.path).mode & 0o777).toBe(0o600);
   });
   it("rejects a symlinked app directory", () => {
     const root = directory(); const target = join(root, "target"); mkdirSync(target); const linked = join(root, "linked"); symlinkSync(target, linked);

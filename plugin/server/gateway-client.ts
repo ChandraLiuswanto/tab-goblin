@@ -16,6 +16,12 @@ export interface GatewayClient {
   close(): void;
 }
 
+export interface GatewayManager extends GatewayClient {
+  socketPath(): string;
+  /** Revoke through the current socket before closing it and selecting a new one. */
+  switchSocketPath(socketPath: string, revocations: readonly AdminRequest[], timeoutMs?: number): Promise<AdminResponse[]>;
+}
+
 export function createGatewayClient(socketPath: string): GatewayClient {
   const pending = new Set<{ destroy(error?: Error): void }>();
   function request(body: AdminRequest, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<AdminResponse> {
@@ -58,14 +64,23 @@ export function createGatewayClient(socketPath: string): GatewayClient {
   return { request, notify(body) { void request(body, NOTIFY_TIMEOUT_MS); }, close() { for (const request of pending) request.destroy(); pending.clear(); } };
 }
 
-/** Replaces the socket client lazily after an atomic configuration update. */
-export function createGatewayManager(readSocketPath: () => string): GatewayClient {
-  let currentPath = "";
-  let current: GatewayClient | undefined;
-  const client = () => {
-    const path = readSocketPath();
-    if (!current || path !== currentPath) { current?.close(); currentPath = path; current = createGatewayClient(path); }
-    return current;
+/** The active socket is only switched through switchSocketPath, after old-socket revocation. */
+export function createGatewayManager(readSocketPath: () => string): GatewayManager {
+  let currentPath = readSocketPath();
+  let current = createGatewayClient(currentPath);
+  return {
+    request: (body, timeout) => current.request(body, timeout),
+    notify: (body) => current.notify(body),
+    close: () => current.close(),
+    socketPath: () => currentPath,
+    async switchSocketPath(socketPath, revocations, timeoutMs) {
+      if (socketPath === currentPath) return [];
+      const responses: AdminResponse[] = [];
+      for (const revocation of revocations) responses.push(await current.request(revocation, timeoutMs));
+      current.close();
+      currentPath = socketPath;
+      current = createGatewayClient(socketPath);
+      return responses;
+    },
   };
-  return { request: (body, timeout) => client().request(body, timeout), notify: (body) => client().notify(body), close: () => current?.close() };
 }

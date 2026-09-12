@@ -34,6 +34,10 @@ import {
 
 const NUL = String.fromCharCode(0);
 const ESC = String.fromCharCode(27);
+const C1_CSI = String.fromCharCode(155);
+const HIGH_SURROGATE = String.fromCharCode(0xd83d);
+const LOW_SURROGATE = String.fromCharCode(0xde00);
+const REPLACEMENT = String.fromCharCode(0xfffd);
 const ELLIPSIS = String.fromCharCode(8230);
 
 describe("redactUrl", () => {
@@ -88,8 +92,24 @@ describe("boundedText", () => {
     expect(boundedText("abc", 5)).toBe("abc");
   });
 
-  it("strips unsafe control characters before applying the cap", () => {
-    expect(boundedText("a" + NUL + "b" + ESC + "c", 3)).toBe("abc");
+  it("strips C0, DEL, and C1 control characters before applying the cap", () => {
+    expect(boundedText("a" + NUL + "b" + ESC + "c" + C1_CSI + "d", 4)).toBe("abcd");
+  });
+
+  it("does not split a surrogate pair while truncating to a UTF-16 schema cap", () => {
+    const result = boundedText("123😀SECRET", 5);
+
+    expect(result).toBe("123" + ELLIPSIS);
+    expect(result.length).toBeLessThanOrEqual(5);
+  });
+
+  it("replaces lone surrogates while preserving valid pairs", () => {
+    expect(boundedText("a" + HIGH_SURROGATE + "b" + LOW_SURROGATE + "c", 10)).toBe(
+      "a" + REPLACEMENT + "b" + REPLACEMENT + "c",
+    );
+    expect(boundedText(HIGH_SURROGATE + LOW_SURROGATE, 2)).toBe(
+      HIGH_SURROGATE + LOW_SURROGATE,
+    );
   });
 
   it.each([
@@ -134,6 +154,25 @@ describe("structured errors", () => {
     expect(tabGoblinError("timeout_uncertain", "Inspect state before retrying").retryable).toBe(
       false,
     );
+  });
+
+  it("allows callers to disable safe retries but never enable unsafe retries", () => {
+    expect(tabGoblinError("busy", "Try later", false).retryable).toBe(false);
+    expect(tabGoblinError("timeout_uncertain", "unknown result", true).retryable).toBe(false);
+  });
+
+  it("rejects forged unsafe retry flags at the wire boundary", () => {
+    expect(
+      TabGoblinErrorSchema.safeParse({
+        code: "timeout_uncertain",
+        message: "unknown result",
+        retryable: true,
+      }).success,
+    ).toBe(false);
+    expect(
+      TabGoblinErrorSchema.safeParse({ code: "busy", message: "Try later", retryable: true })
+        .success,
+    ).toBe(true);
   });
 
   it("uses the full schema allowance when bounding long messages", () => {
@@ -233,6 +272,27 @@ describe("privacy-safe diagnostics", () => {
     };
     expect(ActivityRecordSchema.safeParse(record).success).toBe(false);
     expect(ACTIVITY_LIMIT).toBe(200);
+  });
+
+  it("redacts activity URLs and sanitizes bounded titles at the schema boundary", () => {
+    const record = ActivityRecordSchema.parse({
+      operationId: "op1",
+      source: "agent:a1",
+      tabId: "t1",
+      action: "navigate",
+      status: "ok",
+      startedAt: "2026-09-12T00:00:00.000Z",
+      endedAt: null,
+      code: null,
+      url: "https://alice:secret@example.com/a?token=secret#fragment",
+      title: "safe" + C1_CSI + NUL + "t".repeat(300),
+    });
+
+    expect(record.url).toBe("https://example.com/a");
+    expect(record.title).toHaveLength(200);
+    expect(record.title).not.toContain(C1_CSI);
+    expect(record.title).not.toContain(NUL);
+    expect(record.title?.endsWith(ELLIPSIS)).toBe(true);
   });
 
   it("keeps network diagnostics body-free and redacts their URL", () => {

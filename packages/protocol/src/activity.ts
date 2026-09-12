@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { boundedText, redactUrl } from "./text.js";
 
 export const ACTIVITY_LIMIT = 200;
 
@@ -14,8 +15,12 @@ export const ActivityRecordSchema = z
     startedAt: z.string().max(64),
     endedAt: z.string().max(64).nullable(),
     code: z.string().max(40).nullable(),
-    url: z.string().max(2048).nullable(),
-    title: z.string().max(200).nullable(),
+    url: z.string().transform(redactUrl).pipe(z.string().max(2048)).nullable(),
+    title: z
+      .string()
+      .transform((value) => boundedText(value, 200))
+      .pipe(z.string().max(200))
+      .nullable(),
   })
   .strict();
 export type ActivityRecord = z.infer<typeof ActivityRecordSchema>;

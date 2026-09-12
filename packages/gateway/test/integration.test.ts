@@ -86,8 +86,15 @@ createServer(async (req, res) => {
   if (url.pathname === "/login" && req.method === "GET") return send(200, page("Login", '<form method="post"><label for="login-user">Login user</label><input id="login-user" name="username"><label for="password">Password</label><input id="password" name="password" type="password"><button type="submit">Sign in</button></form>'));
   if (url.pathname === "/login" && req.method === "POST") { const form = new URLSearchParams((await body(req)).toString()); const user = form.get("username") || "anonymous"; return send(302, "", {location:"/account", "set-cookie":'tg_fixture_user='+encodeURIComponent(user)+'; Max-Age=3600; Path=/; SameSite=Lax'}); }
   if (url.pathname === "/account") { const user = cookie(req, "tg_fixture_user"); return user ? send(200, page("Account", '<h1>Signed in as '+esc(user)+'</h1>')) : send(401, page("Denied", '<h1>Not signed in</h1>')); }
-  if (url.pathname === "/upload" && req.method === "GET") return send(200, page("Upload", '<label for="attachment">Attachment</label><input id="attachment" type="file">'));
-  if (url.pathname === "/upload" && req.method === "POST") return send(200, page("Uploaded", '<p>uploaded '+(await body(req)).length+'</p>'));
+  if (url.pathname === "/upload" && req.method === "GET") return send(200, page("Upload", '<form method="post" enctype="multipart/form-data"><label for="attachment">Attachment</label><input id="attachment" name="attachment" type="file" aria-label="Attachment"><button type="submit">Submit upload</button></form>'));
+  if (url.pathname === "/upload" && req.method === "POST") {
+    const payload = await body(req);
+    const contentStart = payload.indexOf(Buffer.from("\\r\\n\\r\\n"));
+    const contentEnd = payload.indexOf(Buffer.from("\\r\\n--"), contentStart + 4);
+    if (contentStart < 0 || contentEnd < 0) return send(400, page("Invalid upload", "invalid multipart body"));
+    const uploaded = payload.subarray(contentStart + 4, contentEnd);
+    return send(200, page("Uploaded", '<p id="uploaded-bytes">'+uploaded.toString("hex")+'</p>'));
+  }
   send(404, page("Missing", "missing"));
 }).listen(${FIXTURE_PORT}, "127.0.0.1");
 `;
@@ -223,13 +230,13 @@ describeLive(`TabGoblin integrated runtime${LIVE_IMAGE ? "" : " (skipped: set TA
     return next;
   }
 
-  async function tryConfigurePlugin(enrollment: string, stateName = "plugin-state"): Promise<Client | undefined> {
+  async function openPluginSession(enrollment: string, enableWorkspace = true): Promise<Client | undefined> {
     activeEnrollment = enrollment;
-    const store = createConfigStore(join(directory, stateName));
+    const store = createConfigStore(join(directory, "plugin-state"));
     await store.update((current) => ({ ...current, enabled: true, socketPath: app!.socketPath, bridgeCommand: process.execPath, bridgeArgs: [fileURLToPath(new URL("../../mcp-bridge/dist/index.js", import.meta.url))] }));
     gateway = createGatewayManager(() => store.read().socketPath);
     lifecycle = createLifecycleCoordinator(store, gateway);
-    if (!store.read().enabledWorkspaceCwds.includes(cwd)) {
+    if (enableWorkspace && !store.read().enabledWorkspaceCwds.includes(cwd)) {
       expect(await lifecycle.enableWorkspace(workspaceId, cwd)).toEqual({ ok: true });
     }
     const scope = await lifecycle.openSession({ agentId, workspaceId, cwd, purpose: "interactive", enrollment });
@@ -238,8 +245,8 @@ describeLive(`TabGoblin integrated runtime${LIVE_IMAGE ? "" : " (skipped: set TA
     return scope?.socketPath === app!.socketPath ? openBridge(enrollment) : undefined;
   }
 
-  async function configurePlugin(enrollment: string, stateName = "plugin-state"): Promise<Client> {
-    const bridge = await tryConfigurePlugin(enrollment, stateName);
+  async function configurePlugin(enrollment: string): Promise<Client> {
+    const bridge = await openPluginSession(enrollment);
     expect(bridge, "plugin lifecycle did not enroll the session").toBeDefined();
     return bridge!;
   }
@@ -314,24 +321,25 @@ describeLive(`TabGoblin integrated runtime${LIVE_IMAGE ? "" : " (skipped: set TA
     // Forward at the newest history entry is an intentional, bounded no-op.
     expect(jsonContent<{ title: string }>(await call("tabgoblin_forward", { tabId: tab.tabId, timeoutMs: 5000 })).title).toBe("Upload");
     expect(jsonContent<{ title: string }>(await call("tabgoblin_reload", { tabId: tab.tabId, timeoutMs: 5000 })).title).toBe("Upload");
+    expect(jsonContent<{ title: string }>(await call("tabgoblin_back", { tabId: tab.tabId, timeoutMs: 5000 })).title).toBe("Second");
+    expect(jsonContent<{ title: string }>(await call("tabgoblin_forward", { tabId: tab.tabId, timeoutMs: 5000 })).title).toBe("Upload");
     snapshot = jsonContent(await call("tabgoblin_snapshot", { tabId: tab.tabId }));
-    const uploadPath = join(cwd, "meaningful-upload.txt");
-    await writeFile(uploadPath, "integration upload\n");
-    called.add("tabgoblin_upload");
-    const upload = await bridge.callTool({ name: "tabgoblin_upload", arguments: { tabId: tab.tabId, ref: ref("Attachment"), path: uploadPath } });
-    if (upload.isError) {
-      // Known remote-CDP boundary failure: staging succeeds in-container, but the
-      // host-side Playwright client cannot resolve the container-only path.
-      expect(jsonContent<{ code: string }>(upload).code).toBe("runtime_unavailable");
-      expect(requirePodman(["exec", containerName, "cat", "/staging/meaningful-upload.txt"])).toBe("integration upload\n");
-    } else {
-      expect(jsonContent<string>(await call("tabgoblin_evaluate", { tabId: tab.tabId, expression: "attachment.files[0].name", maxChars: 100 }))).toBe('"meaningful-upload.txt"');
-    }
+    const uploadPath = join(cwd, "meaningful-upload.bin");
+    const uploadBytes = Buffer.from([0x00, 0x01, 0x02, 0x0a, 0x0d, 0x41, 0x7f, 0x80, 0xfe, 0xff]);
+    await writeFile(uploadPath, uploadBytes);
+    const attachment = snapshot.nodes.find((node) => node.name === "Attachment" && node.role === "textbox");
+    if (!attachment) throw new Error(`missing file input: ${JSON.stringify(snapshot.nodes)}`);
+    await call("tabgoblin_upload", { tabId: tab.tabId, ref: attachment.ref, path: uploadPath });
+    const selectedFile = JSON.parse(jsonContent<string>(await call("tabgoblin_evaluate", {
+      tabId: tab.tabId,
+      expression: "({name:attachment.files[0].name,size:attachment.files[0].size})",
+      maxChars: 200,
+    }))) as { name: string; size: number };
+    expect(selectedFile).toEqual({ name: "meaningful-upload.bin", size: uploadBytes.length });
+    snapshot = jsonContent(await call("tabgoblin_snapshot", { tabId: tab.tabId }));
+    await call("tabgoblin_click", { tabId: tab.tabId, ref: ref("Submit upload"), timeoutMs: 5000 });
+    expect(jsonContent<string>(await call("tabgoblin_text", { tabId: tab.tabId, maxChars: 1000 }))).toContain(uploadBytes.toString("hex"));
 
-    const currentTabs = jsonContent<Array<{ tabId: string; title: string }>>(await call("tabgoblin_list_tabs"));
-    const blankTab = currentTabs.find((item) => item.tabId !== tab.tabId);
-    if (!blankTab) throw new Error("runtime did not expose its initial blank tab");
-    await call("tabgoblin_back", { tabId: blankTab.tabId, timeoutMs: 5000 });
     const temporaryTab = jsonContent<{ tabId: string }>(await call("tabgoblin_new_tab", { url: `${fixtureUrl}/second` }));
     await call("tabgoblin_close_tab", { tabId: temporaryTab.tabId });
     expect(jsonContent<Array<{ tabId: string }>>(await call("tabgoblin_list_tabs")).some((item) => item.tabId === temporaryTab.tabId)).toBe(false);
@@ -436,35 +444,35 @@ describeLive(`TabGoblin integrated runtime${LIVE_IMAGE ? "" : " (skipped: set TA
     await startFixture(containerName);
 
     app = await runGateway({ xdgRuntimeDir: directory, viewerPort, viewerOrigins: [base], image: LIVE_IMAGE! });
-    // Durable nonzero lifecycle generations are currently rejected by a fresh
-    // gateway registry. Record the release blocker, then use isolated fresh plugin
-    // state to continue verifying browser-profile persistence itself.
-    expect(await tryConfigurePlugin(randomUUID())).toBeUndefined();
-    gateway!.close();
-    const recovered = await configurePlugin(randomUUID(), "plugin-state-fresh-recovery");
+    const recovered = await configurePlugin(randomUUID());
     expect(jsonContent<{ sessionState: string }>(await recovered.callTool({ name: "tabgoblin_start", arguments: {} })).sessionState).toBe("ready");
     expect((await fetch(`${base}/api/status`, { headers: { cookie: staleViewerCookie, [CSRF_HEADER]: secondAuth.csrf } })).status).toBe(403);
     const tabsAfterRestart = jsonContent<Array<{ tabId: string }>>(await recovered.callTool({ name: "tabgoblin_list_tabs", arguments: {} }));
     const restartedIds = tabsAfterRestart.map(({ tabId }) => tabId);
     expect(new Set(restartedIds).size).toBe(restartedIds.length);
-    // Pin the reproduced release blocker: current production restarts the
-    // BrowserSession counter and aliases at least one old tab ID. Replace this
-    // characterization with an empty-intersection assertion when the bug is fixed.
-    const recycledTabIds = restartedIds.filter((tabId) => oldTabIds.includes(tabId));
-    expect(recycledTabIds.length).toBeGreaterThan(0);
+    expect(restartedIds.filter((tabId) => oldTabIds.includes(tabId))).toEqual([]);
     const account = jsonContent<{ tabId: string }>(await recovered.callTool({ name: "tabgoblin_new_tab", arguments: { url: `${fixtureUrl}/account` } }));
     expect(jsonContent<string>(await recovered.callTool({ name: "tabgoblin_text", arguments: { tabId: account.tabId, maxChars: 1000 } }))).toContain("Signed in as grace");
 
-    // Release-blocker probe, deliberately last among browser operations: history
-    // back currently times out between two static pages in the shipped runtime.
-    await recovered.callTool({ name: "tabgoblin_navigate", arguments: { tabId: account.tabId, url: `${fixtureUrl}/second`, timeoutMs: 5000 } });
-    await recovered.callTool({ name: "tabgoblin_navigate", arguments: { tabId: account.tabId, url: `${fixtureUrl}/upload`, timeoutMs: 5000 } });
+    const navigateSecond = await recovered.callTool({ name: "tabgoblin_navigate", arguments: { tabId: account.tabId, url: `${fixtureUrl}/second`, timeoutMs: 5000 } });
+    expect(navigateSecond.isError, textContent(navigateSecond)).not.toBe(true);
+    const navigateUpload = await recovered.callTool({ name: "tabgoblin_navigate", arguments: { tabId: account.tabId, url: `${fixtureUrl}/upload`, timeoutMs: 5000 } });
+    expect(navigateUpload.isError, textContent(navigateUpload)).not.toBe(true);
     const historyBack = await recovered.callTool({ name: "tabgoblin_back", arguments: { tabId: account.tabId, timeoutMs: 5000 } });
-    if (historyBack.isError) expect(jsonContent<{ code: string }>(historyBack).code).toBe("timeout_uncertain");
-    else expect(jsonContent<{ title: string }>(historyBack).title).toBe("Second");
+    expect(historyBack.isError, textContent(historyBack)).not.toBe(true);
+    expect(jsonContent<{ title: string }>(historyBack).title).toBe("Second");
 
     const stopped = await gateway!.request({ op: "stop", workspaceId });
     expect(stopped).toEqual({ ok: true });
     expect(podman(["volume", "exists", profileVolume]).code).toBe(0);
+
+    expect(await lifecycle!.disableWorkspace(workspaceId, cwd)).toEqual({ ok: true });
+    await expectToolError(recovered, "tabgoblin_status", {}, "not_enrolled");
+    await recovered.close(); client = undefined; gateway!.close();
+    await app!.close(); app = undefined;
+    app = await runGateway({ xdgRuntimeDir: directory, viewerPort, viewerOrigins: [base], image: LIVE_IMAGE! });
+    expect(await openPluginSession(randomUUID(), false)).toBeUndefined();
+    expect(lifecycle!.settings().enabledWorkspaceCwds).not.toContain(cwd);
+    expect(lifecycle!.settings().revokedWorkspaceIds).toContain(workspaceId);
   }, 300_000);
 });

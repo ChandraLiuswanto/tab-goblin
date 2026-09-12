@@ -45,6 +45,10 @@ export const tabGoblinSettingsSchema = z.object({
   revokedAgentIds: boundedIds.default([]),
   // A workspace tombstone is cleared only by explicit workspace opt-in/reset.
   revokedWorkspaceIds: boundedIds.default([]),
+  // Cleanup rotates credentials without turning an active identity into an
+  // archive/opt-out tombstone. The next session must obtain a fresh generation.
+  rotatingAgentIds: boundedIds.default([]),
+  rotatingWorkspaceIds: boundedIds.default([]),
   // Authority cleanup work only. It intentionally contains no enrollment or bearer material.
   pendingRevocations: pendingRevocations.default([]),
 }).strict();

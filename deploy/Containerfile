@@ -1,0 +1,24 @@
+# Fedora keeps SELinux labelling and Chromium packaging consistent with the host.
+FROM registry.fedoraproject.org/fedora:41
+
+RUN dnf -y install --setopt=install_weak_deps=False \
+      chromium xorg-x11-server-Xvfb xdpyinfo x11vnc nginx openbox procps-ng dbus-x11 \
+      nss alsa-lib liberation-fonts google-noto-sans-fonts \
+ && dnf clean all
+
+# Non-root inside the container as well as outside it. UID 1000 lines up with the
+# default rootless mapping, so named volumes remain writable without --userns tricks.
+RUN useradd --create-home --uid 1000 goblin \
+ && mkdir -p /profile /staging /tmp/.X11-unix \
+ && chown goblin:goblin /profile /staging \
+ && chmod 1777 /tmp/.X11-unix
+
+COPY runtime-entrypoint.sh /usr/local/bin/runtime-entrypoint.sh
+COPY cdp-relay.conf /etc/tabgoblin/cdp-relay.conf
+RUN chmod 0755 /usr/local/bin/runtime-entrypoint.sh
+
+USER goblin
+ENV HOME=/home/goblin DISPLAY=:99 TG_SCREEN=1280x800x24
+VOLUME ["/profile", "/staging"]
+EXPOSE 9222 5900
+ENTRYPOINT ["/usr/local/bin/runtime-entrypoint.sh"]

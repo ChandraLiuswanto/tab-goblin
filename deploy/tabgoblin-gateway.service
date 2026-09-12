@@ -1,0 +1,19 @@
+[Unit]
+Description=TabGoblin gateway
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=NODE_ENV=production
+Environment=TABGOBLIN_IMAGE=localhost/tabgoblin-runtime:dev
+Environment=TABGOBLIN_VIEWER_PORT=8931
+WorkingDirectory=%h/paseo-plugins/tab-goblin
+ExecStart=/usr/bin/node packages/gateway/dist/main.js
+Restart=on-failure
+RestartSec=5
+# This is one unprivileged user service, not a host-security change.
+RuntimeDirectory=tabgoblin
+RuntimeDirectoryMode=0700
+
+[Install]
+WantedBy=default.target

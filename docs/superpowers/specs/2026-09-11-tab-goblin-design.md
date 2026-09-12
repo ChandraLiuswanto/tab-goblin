@@ -2,192 +2,189 @@
 
 ## Summary
 
-TabGoblin is a public Paseo v0.8 plugin that lets Paseo agents operate server-side Playwright browsers through an agent skill and a machine-readable CLI. The Paseo daemon-side plugin owns browser processes, named persistent profiles, queues, and artifacts. A responsive Paseo workspace panel lets humans observe and control sessions without becoming a full embedded browser.
+TabGoblin is a frontend-first Paseo plugin that makes agent browser activity easier to follow. Agents use Paseo's existing `browser_*` MCP tools; Paseo owns browser hosting, tab routing, browser state, and action execution. TabGoblin provides a responsive workspace activity panel, readable browser-tool timeline cards, and an agent skill. It does not build a second browser automation service.
+
+This revision replaces the original server-side Playwright, local API, and CLI architecture. Reusing Paseo deliberately changes the first-release scope: browsers require a connected Paseo desktop app, use Paseo's shared browser profile, and are addressed by workspace-scoped tab IDs rather than TabGoblin sessions.
 
 ## Goals
 
-- Give agents general browser actions: navigation, inspection, clicking, typing, extraction, screenshots, and downloads.
-- Support individual CLI commands and batched JSON workflows.
-- Store authenticated browser state in named persistent profiles.
-- Support isolated sessions and intentionally shared sessions.
-- Serialize independent controllers that target the same persistent profile.
-- Run headless by default and offer an explicit visible debug mode.
-- Provide a themed, mobile-compatible Paseo status panel.
-- Publish the source as the public GitHub repository `ChandraLiuswanto/tab-goblin`.
+- Reuse existing Paseo browser tools for navigation, inspection, interaction, extraction, screenshots, and uploads.
+- Focus implementation on themed, mobile-compatible frontend activity and error presentation.
+- Teach agents the native tool workflow without introducing a competing CLI or workflow engine.
+- Distinguish observed activity from live browser state and make unsupported capabilities explicit.
+- Publish source as `ChandraLiuswanto/tab-goblin` only on the user's explicit publication instruction.
 
 ## Non-goals
 
-- Embedding a live browser viewport in Paseo.
-- Providing a complete manual browser controller in the first release.
-- Isolating named profiles from other trusted local Paseo agents.
-- Exposing the browser service over LAN or the public internet.
-- Automating website-specific workflows in the core plugin.
-- Returning cookies, local storage, credentials, or sensitive headers to agents.
+- Owning Playwright, browser processes, browser profiles, locks, queues, or artifact storage.
+- A custom localhost API, bearer token, discovery file, browser MCP server, or CLI.
+- Headless daemon-only browsing, named persistent profiles, or isolated browser contexts.
+- Embedding another browser viewport or replacing Paseo's native browser UI.
+- A download manager or declarative JSON batch-workflow runtime.
+- Guaranteeing exclusive control of a tab shared by agents or a human.
+- Adding private Paseo API dependencies to obtain missing browser controls.
 
-## Target and compatibility
+## Compatibility and verified capability boundary
 
-TabGoblin targets the Paseo v0.8 beta plugin API and declares the appropriate `requirements.paseo` range in `paseo-plugin.json`. It uses separate client and server entry points. The README will state that Paseo v0.8 is beta and plugin contracts may change.
+Target the Paseo v0.8 plugin API. Set `requirements.paseo` to the actual tested release range, explicitly including beta versions when applicable. Validate both app and daemon compatibility; do not infer browser or plugin features from the version label alone.
 
-The plugin source lives at `~/paseo-plugins/tab-goblin`. Runtime profiles and artifacts live under the effective Paseo daemon home, outside the Git checkout.
+References checked for this revision:
+
+- [Browser architecture and prerequisites](https://paseo.sh/docs/browser.md)
+- [Browser tools and errors](https://paseo.sh/docs/browser-tools.md)
+- [Plugin reference](https://paseo.sh/docs/plugins/v0.8/reference.md)
+- [SDK reference](https://paseo.sh/docs/sdk/reference.md)
+
+Paseo documents these constraints:
+
+- Browser tools and Paseo MCP tools must be enabled for the agent's host. Existing agents may need reloading.
+- The daemon brokers operations to a connected desktop browser host; it does not run a browser itself.
+- Tabs are workspace-scoped. Listing aggregates connected browser hosts, and tab actions route by `browserId`.
+- Tabs share Paseo browser profile state, including logins. This is not named-profile isolation or a TabGoblin persistence guarantee.
+- Element refs come from the latest snapshot of the same tab and expire when the page changes.
+- Upload paths must be inside the agent's workspace.
+
+The browser MCP tools available to agents are not automatically callable functions inside a plugin frontend. The documented plugin SDK does not establish a browser-control API equivalent to these tools. First release therefore uses supported agent timeline access for observation and leaves browser execution to agents and Paseo's native UI.
+
+Before implementing the activity adapter, verify the installed SDK's timeline types and representative browser-tool payloads. If a provider omits structured browser results, show a generic activity card rather than inventing metadata. If supported timeline access cannot support the panel at all, report a compatibility blocker rather than adding a browser backend.
+
+## Approaches and decision
+
+1. **Frontend observer plus native MCP tools — selected.** Smallest implementation and no duplicated automation infrastructure. Direct panel browser controls and custom profiles are not promised.
+2. **Thin adapter to a supported Paseo browser API — deferred.** Appropriate only if an actual public plugin-callable contract is verified. Tool names alone are not sufficient evidence.
+3. **Independent Playwright backend — rejected for this release.** Would retain headless and custom-profile features but duplicate the machinery this revision aims to remove.
 
 ## Architecture
 
-### Paseo server plugin
+### Paseo-owned execution
 
-The server entry starts and stops TabGoblin's localhost browser API with the plugin lifecycle. It owns Playwright browser processes, persistent profile directories, session metadata, profile queues, and artifact storage. Cleanup closes browsers, rejects or resolves queued work with structured shutdown errors, and releases locks.
+The execution path remains:
 
-### Local browser API
+`agent → Paseo MCP → daemon browser broker → connected desktop browser host → tab`
 
-The API binds only to `127.0.0.1` on an available port. It requires a generated bearer token stored in a daemon-user-readable discovery file. That file contains the endpoint and token so the local CLI can discover the current plugin process after reloads. Files are created with restrictive permissions.
+TabGoblin does not intercept, proxy, schedule, or replay these calls. Existing Paseo permission and workspace boundaries remain authoritative.
 
-The API provides operations for session lifecycle, page lifecycle, browser actions, batch workflows, artifacts, health, and administrative status. Inputs and outputs use versioned JSON schemas. Responses have a consistent envelope containing success or error status, relevant session/page identifiers, current URL and title when available, result data or artifact paths, and a stable error code with retryability.
+### Client-only plugin
 
-### CLI
+Use `index.client.tsx`, `client/`, and pure shared contracts/helpers under `shared/`. No server entry is required for the selected first-release design. No Playwright dependency, Node imports in client code, extra connection, or standalone MCP client is introduced.
 
-The `tab-goblin` CLI discovers the plugin endpoint locally and emits JSON by default. It supports individual commands including:
+Register a workspace panel with `addWorkspacePanel` and a Command Center action that opens it. Use `usePaseo()` to borrow the selected host's connection and supported workspace/agent selectors to establish context.
 
-- `session create`, `session status`, `session list`, and `session close`
-- `open`
-- `inspect`
-- `click`
-- `type`
-- `extract`
-- `screenshot`
-- `download`
-- `run <workflow.json>`
+A small activity adapter reads and subscribes to supported agent timelines for the selected workspace. It normalizes recognized native browser-tool calls into presentation records. Records are keyed by host, workspace, agent, and source timeline item identity, so streaming updates replace existing records rather than duplicate them. Handle timeline replacement, reconnect, workspace changes, and subscription cleanup according to the SDK contract.
 
-Human-readable output may be selected explicitly, but agent documentation always uses JSON. Selectors follow Playwright conventions and support role/text-oriented targeting. Commands require explicit session identifiers after session creation.
+Keep at most the latest 200 normalized activity records per active workspace in memory. Do not persist raw tool payloads or build an independent historical database. Unavailable or truncated history is labeled as such.
 
-### Agent skill and scripts
+### Workspace panel
 
-The repository includes a TabGoblin skill that teaches agents to:
+Display:
 
-1. Confirm service health.
-2. Create or join the intended session.
-3. Inspect the current page before acting.
-4. Prefer accessible role, label, and text selectors over fragile CSS.
-5. Execute individual actions or a bounded JSON workflow.
-6. inspect structured failures and retry only retryable errors.
-7. Close sessions they created when work is complete.
+- observed browser actions, grouped or filterable by agent and tab when identifiers are available;
+- action name, source agent, pending/completed/failed state, and available timing information;
+- last observed URL/title and `browserId`, only when present in supported results;
+- a compact action summary and recognized structured error with recovery guidance;
+- setup guidance and explicit empty, loading, disconnected, unsupported-payload, and error states.
 
-Companion scripts provide health checks and representative workflows without duplicating browser logic. The plugin remains the sole owner of Playwright.
+All metadata is labeled as observed activity, not an authoritative live tab inventory. A successfully observed close action may mark a tab closed; disappearance from a timeline does not. Lack of activity does not prove browser tools are disabled or no browser host is connected.
 
-### Paseo frontend
+Panel actions are limited to refreshing available activity and filtering it. It must not display nonfunctional create-tab, close-tab, navigate, stale-lock-release, or debug-session buttons. Users control tabs in Paseo's native browser UI or ask an agent to use the existing tools.
 
-A workspace panel registered by the client entry displays:
+Screenshots remain available through Paseo's original tool result. Inline previews or links may be added only when the public result and attachment APIs support them; otherwise retain the original timeline entry as the place to inspect the image. Never assume screenshots return daemon-local file paths.
 
-- named profiles;
-- active and queued sessions;
-- current URL and title;
-- headless or visible mode;
-- session owner metadata;
-- queue position and elapsed time;
-- recent screenshots and artifact paths;
-- structured errors and browser health.
+Use React Native primitives, theme tokens for every text color, accessible labels, and compact layouts. Mobile can display the panel but does not itself satisfy the desktop browser-host requirement.
 
-The panel supports refreshing status, stopping a session, opening a new visible debug session, and releasing a stale lock only after the server verifies it is stale. It opens artifacts through supported Paseo capabilities where available and otherwise copies or displays their path.
+### Timeline cards
 
-The panel uses React Native primitives, Paseo theme tokens, and compact layouts. It contains no browser runtime or Node imports. Client/server communication uses schema-validated plugin RPCs.
+Use `addTimelineTransformer` for `tool_call` items and `addTimelineRenderer` for validated TabGoblin presentation records. Recognize exact browser-tool names and verified provider namespace forms, not arbitrary substring matches.
 
-## Sessions and profiles
+Transform only payload shapes the adapter understands. Leave unrelated or unsupported items unchanged. Preserve original rendering for image-bearing or otherwise rich results that cannot be represented without losing access to their content. Transformers are synchronous, deterministic, and side-effect-free; panel subscriptions are separate from rendering.
 
-A named persistent profile maps to one Playwright user-data directory. Any trusted local Paseo agent with the profile name and local service credentials may request it. This is an explicit trust model, not profile-level authorization.
+### Optional backend rule
 
-A session is either:
+A server entry is permitted in a future approved revision only for a concrete plugin-specific requirement that cannot run client-side. Any adapter must use a verified public API and preserve host/workspace scoping. Missing browser APIs are not permission to recreate Playwright, expose a new local service, scrape private app state, or drive a hidden agent as a control proxy.
 
-- **isolated:** a newly created controller with its own session identifier; or
-- **shared:** multiple agents intentionally use the same session identifier and therefore the same pages and state.
+## Native capability mapping
 
-Only one independently controlled session may hold a named profile at a time. Requests for that profile enter a FIFO queue. Queue requests have configurable deadlines and are removed on cancellation, client disconnect where detectable, or expiry. Shared access to an existing session bypasses profile acquisition because it uses the current controller.
+| Need | Existing Paseo tools / first-release treatment |
+| --- | --- |
+| List, open, close tabs | `browser_list_tabs`, `browser_new_tab`, `browser_close_tab` |
+| Navigate and history | `browser_navigate`, `browser_back`, `browser_forward`, `browser_reload` |
+| Inspect and wait | `browser_snapshot`, `browser_wait` |
+| Click and enter text | `browser_click`, `browser_fill`, `browser_type`, `browser_keypress` |
+| Other interaction | `browser_hover`, `browser_select`, `browser_drag`, `browser_scroll` |
+| Extract page information | Snapshot first; bounded `browser_evaluate` when necessary |
+| Visual verification | `browser_screenshot`, `browser_resize` |
+| Debugging | `browser_logs` |
+| Upload files | `browser_upload`, subject to workspace-path restrictions |
+| Download management | No documented dedicated browser download tool; out of scope |
+| Batch workflows | Agent executes ordinary ordered MCP calls; no new workflow interpreter |
+| Named profiles / headless sessions | Not supplied by the documented native tools; out of scope |
 
-Profiles persist until manually removed outside the first-release API. Closing a session closes its browser context and releases the profile to the next queued request without deleting profile data.
+## Agent skill and interaction flow
 
-## Interaction flow
+The repository includes a skill that teaches agents to:
 
-1. An agent runs `tab-goblin session create --profile <name>` with optional `--visible`.
-2. The CLI reads the protected discovery file and authenticates to the localhost API.
-3. The service acquires the profile or reports its queue state until acquisition or timeout.
-4. The CLI returns a session identifier and initial page metadata.
-5. Subsequent actions reference that session and a page identifier when necessary.
-6. Screenshots and downloads are stored beneath a per-session artifact directory and returned as paths with metadata.
-7. `tab-goblin session close` closes resources and releases the profile lock.
+1. Verify browser tools are available. Explain setup or no-host failures without changing host configuration automatically.
+2. Call `browser_list_tabs` before reusing a tab, or `browser_new_tab` to create one. Use the returned `browserId`, never an invented identifier.
+3. Snapshot the intended tab and act using refs from that tab's latest snapshot.
+4. Re-snapshot after page changes or `browser_stale_ref`; do not blindly repeat a mutating action after an uncertain result.
+5. Prefer accessibility snapshots and native actions over page evaluation. Use evaluation only when needed for bounded page inspection or extraction.
+6. Capture screenshots and logs through Paseo when verifying a result.
+7. Close only tabs the agent created for the task, unless the user asks to retain them. Do not close pre-existing user or other-agent tabs without permission.
 
-A JSON workflow declares a schema version, session options or an existing session, bounded ordered actions, and failure behavior. The server validates the whole workflow before execution. First release workflows execute sequentially and stop on the first failure unless an action explicitly permits continuation.
+Sequential tool calls replace CLI workflows. Shared tabs can be modified by another agent or the human between actions; there is no exclusive session lock. Use separate tabs where appropriate, while documenting that separate tabs still share profile state.
 
-## Safety and trust
+## Safety and privacy
 
-Paseo plugins are trusted, unsandboxed code. TabGoblin's backend can access the daemon machine with the daemon user's privileges. The documentation warns users to inspect the source and protect named profiles because they may contain authenticated sessions.
+Paseo plugins are trusted code, and browser tools can operate authenticated pages. Users must enable these capabilities only for agents and plugins they trust.
 
-Controls include:
+TabGoblin introduces no new credentials or transport. It does not read profile directories or deliberately extract cookies, storage values, credentials, or authorization headers. It cannot claim the underlying tools prevent all sensitive access: evaluation, screenshots, and page content may expose authenticated data.
 
-- localhost-only binding;
-- generated bearer authentication and restrictive discovery-file permissions;
-- no normal API for cookies, storage values, credential fields, or raw sensitive headers;
-- redaction of authorization headers and form values in logs;
-- navigation, action, workflow, and queue timeouts;
-- limits on workflow action count, request size, extracted text, and response size;
-- safe artifact filenames and containment beneath the configured artifact root;
-- URL validation that allows normal public browsing but rejects non-HTTP browser navigation schemes by default;
-- explicit visible-mode selection;
-- graceful shutdown and stale-lock verification.
+Activity cards use an allowlist of metadata. Do not copy typed/fill values, arbitrary evaluation source/results, raw snapshots, or console payloads into summaries or logs. Display URLs with userinfo, query, and fragment removed. Render page titles as untrusted plain text, and avoid logging them. Retain original sensitive content only where Paseo already renders it; TabGoblin does not create an additional persistent copy.
 
-Because all local agents are trusted equally, TabGoblin does not claim to prevent one local agent from using another agent's named profile.
+Use native HTTP(S) navigation and workspace upload restrictions. Do not claim stronger isolation than Paseo supplies. Switching hosts must not fall through to another connected host.
 
 ## Errors and recovery
 
-Errors have stable codes, human-readable messages, optional details safe for agents, and a `retryable` boolean. Expected classes include invalid input, authentication failure, unknown session/page, profile busy or queue timeout, selector not found, action timeout, navigation failure, browser crash, artifact failure, and plugin shutdown.
+Preserve recognized native codes rather than replacing them with a new automation error taxonomy:
 
-On a browser crash, the service records a sanitized error, terminates remaining resources, releases the profile lock, preserves profile data, and returns a retryable browser-crash error. It does not silently replay mutating actions. Stale locks are removed only after confirming no live owning session or process exists.
+- `browser_disabled`: explain enabling Browser tools and Paseo tools, with user consent.
+- `browser_no_host`: explain that a connected desktop browser host is required.
+- `browser_stale_ref`: instruct the agent to take a fresh snapshot.
+- `browser_timeout`: show failure and recommend inspecting current state before another action.
+- `browser_denied`: show the denial without attempting a bypass.
 
-## Persistence and configuration
-
-Configuration covers profile root, artifact root, default headless mode, browser executable override, action timeout, navigation timeout, queue timeout, maximum workflow actions, extraction/response limits, and artifact retention. Defaults are safe and usable without configuration.
-
-The authentication token and endpoint discovery data are runtime state, not committed configuration. Logs never include the token. Profile and artifact directories are ignored by Git.
+Unknown failures receive a safe generic summary while the original timeline result remains available. Panel read/subscription errors have their own UI state and must not be reported as browser execution failures. Reconnecting refreshes observation only; it never replays browser actions. Plugin unload removes subscriptions and registrations but does not close Paseo-owned tabs.
 
 ## Testing and acceptance criteria
 
-### Unit tests
+### Unit and contract tests
 
-- Schema validation and response envelopes.
-- FIFO profile queue behavior, cancellation, expiry, and stale-lock checks.
-- Session/page registries and lifecycle cleanup.
-- Error classification and redaction.
-- Path containment and request/response limits.
+- Normalize representative supported browser-tool timeline payloads, including streaming completion, failure, and unknown shapes.
+- Verify exact tool recognition, safe fallback, metadata redaction, URL sanitization, and rich-result preservation.
+- Verify stable identity, duplicate prevention, timeline replacement, record limits, workspace/host isolation, and subscription cleanup.
+- Verify no activity is mislabeled as a live tab inventory or definitive browser health check.
 
-### Integration tests
+### Frontend tests
 
-A local fixture website verifies navigation, accessible selectors, clicking, typing, extraction, screenshots, downloads, multiple pages, and action timeouts without relying on external sites.
+- Panel loading, empty, activity, disconnected, failure, and unsupported-data states.
+- Refresh and agent/tab filters, including missing tab metadata.
+- Wide and compact layouts, accessible controls, and light/dark theme colors.
+- Timeline cards update without duplicate entries or losing original screenshot access.
+- Import boundaries and typechecking against the tested Paseo plugin SDK.
 
-### Persistence and concurrency tests
+### Integration verification
 
-- State written in a profile survives session closure and reopening.
-- A second independent session for the same profile queues.
-- Different profiles run concurrently.
-- Agents sharing one session observe the same pages.
-- Crash and shutdown paths release locks without deleting profile state.
+Use a local fixture website and a connected Paseo desktop browser host. An agent following only the included skill must list/create a tab, navigate, snapshot, click, fill, extract page text, capture a screenshot, and close its own tab using native MCP tools. Verify the panel reflects supported observed activity.
 
-### CLI tests
-
-- Every individual command emits valid machine-readable JSON.
-- JSON workflows are validated before execution and obey stop/continue behavior.
-- Discovery, authentication, unavailable-service, and retryable errors have stable exit codes.
-
-### Plugin and frontend tests
-
-- Typecheck client/server import boundaries against Paseo v0.8.
-- Verify plugin startup, reload, cleanup, and subprocess termination.
-- Verify the workspace panel in wide and compact layouts and light/dark themes.
-- Verify panel status, stop, stale-release, and visible-debug actions through RPCs.
+Exercise stale refs, a missing browser host, host disconnect/reconnect, plugin reload, and unknown provider payloads. Verify cleanup does not close native tabs and unsupported data does not crash the UI. Use mocks for failure paths unsafe or impractical to induce in the active development host.
 
 ### Release acceptance
 
-The release is complete when:
-
-1. `npm run typecheck` and all automated tests pass.
-2. The installed plugin reports `running` in `paseo plugin ls`.
-3. An agent using only the included skill can create a persistent session, navigate the fixture site, interact, extract text, capture a screenshot, close, reopen, and observe persisted state.
-4. Concurrent requests serialize per profile while different profiles run concurrently.
-5. The Paseo panel accurately displays and controls sessions on desktop and compact/mobile layouts.
-6. No sensitive profile state or authentication token appears in normal output or logs.
-7. The repository is published publicly as `ChandraLiuswanto/tab-goblin` only after implementation and verification are complete.
+1. Typechecking and automated tests pass.
+2. The installed client plugin is running without a required TabGoblin server entry or browser subprocess.
+3. Agent browser actions use existing Paseo MCP tools, with no custom browser API, CLI, or automation runtime.
+4. Panel and timeline presentation work for the documented tested provider payloads; unsupported shapes preserve native rendering.
+5. The panel behaves correctly on desktop and compact/mobile layouts, including its desktop-host prerequisite messaging.
+6. Documentation explicitly states shared profile behavior and excludes headless execution, named profiles, guaranteed download handling, and direct panel browser controls.
+7. No raw form values, credentials, or browser payloads are added to TabGoblin logs or persistent storage.
+8. Publishing or pushing the public repository requires the user's explicit command after implementation and verification.

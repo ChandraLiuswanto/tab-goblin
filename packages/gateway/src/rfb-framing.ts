@@ -217,7 +217,12 @@ export class RfbClientStreamGate {
           throw new RfbProtocolError("Unsupported RFB security selection");
         }
         output.push(frame);
-        this.state = selected === 1 ? "server-security-result" : "server-challenge";
+        this.state =
+          selected === 1 && this.serverMinor === 7
+            ? "client-init"
+            : selected === 1
+              ? "server-security-result"
+              : "server-challenge";
         continue;
       }
       if (this.state === "client-auth-response") {

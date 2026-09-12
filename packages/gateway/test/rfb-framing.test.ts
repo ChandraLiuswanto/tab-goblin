@@ -88,6 +88,34 @@ describe("RFB client framing", () => {
     completeHandshake(gate);
   });
 
+  it("completes an RFB 3.7 None handshake with byte-fragmented server data and coalesced client data", () => {
+    const gate = new RfbClientStreamGate();
+    for (const byte of Buffer.from("RFB 003.007\n")) gate.observeServer(Buffer.from([byte]));
+
+    const versionOutput: Buffer[] = [];
+    for (const byte of Buffer.from("RFB 003.007\n")) {
+      versionOutput.push(gate.pushClient(Buffer.from([byte]), denied()).forward);
+    }
+    expect(Buffer.concat(versionOutput).toString()).toBe("RFB 003.007\n");
+    for (const byte of Buffer.from([1, 1])) gate.observeServer(Buffer.from([byte]));
+
+    expect(gate.pushClient(Buffer.from([1, 1]), denied()).forward).toEqual(Buffer.from([1, 1]));
+    expect(gate.handshakeComplete).toBe(true);
+  });
+
+  it("still waits for the SecurityResult before ClientInit for RFB 3.8 None", () => {
+    const gate = new RfbClientStreamGate();
+    gate.observeServer(Buffer.from("RFB 003.008\n"));
+    gate.pushClient(Buffer.from("RFB 003.008\n"), denied());
+    gate.observeServer(Buffer.from([1, 1]));
+
+    expect(gate.pushClient(Buffer.from([1, 1]), denied()).forward).toEqual(Buffer.from([1]));
+    expect(gate.handshakeComplete).toBe(false);
+    gate.observeServer(Buffer.alloc(4));
+    expect(gate.pushClient(Buffer.alloc(0), denied()).forward).toEqual(Buffer.from([1]));
+    expect(gate.handshakeComplete).toBe(true);
+  });
+
   it("accepts a client-negotiated downgrade from RFB 3.8 to 3.3", () => {
     const gate = new RfbClientStreamGate();
     gate.observeServer(Buffer.from("RFB 003.008\n"));

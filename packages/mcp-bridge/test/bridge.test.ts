@@ -1,38 +1,44 @@
 import { createServer } from "node:http";
-import { chmod, cp, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TOOL_NAMES, type AdminResponse } from "@tab-goblin/protocol";
 import { buildToolDefinitions, createBridge } from "../src/index.js";
+import {
+  createIsolatedWorkspace,
+  workspaceEnvironment,
+} from "../../protocol/test/isolated-workspace.js";
 
 const binding = async () => ({ agentId: "agent-1", workspaceId: "ws-1" });
-const bridgePackage = fileURLToPath(new URL("..", import.meta.url));
-const protocolPackage = fileURLToPath(new URL("../../protocol", import.meta.url));
-const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
 
-function run(command: string, args: string[]): Promise<void> {
+function run(command: string, args: string[], cwd: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: "inherit" });
+    const child = spawn(command, args, {
+      cwd,
+      env: workspaceEnvironment(cwd),
+      stdio: "inherit",
+    });
     child.once("error", reject);
     child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`${command} failed: ${code}`)));
   });
 }
 
 async function prepareIsolatedBridgeRuntime(): Promise<{ entry: string; directory: string }> {
-  const directory = await mkdtemp(join(bridgePackage, ".mcp-runtime-"));
-  const protocolTarget = join(directory, "node_modules", "@tab-goblin", "protocol");
-  await cp(join(bridgePackage, "dist"), join(directory, "bridge"), { recursive: true });
-  await cp(join(protocolPackage, "package.json"), join(protocolTarget, "package.json"));
-  await run(process.execPath, [
-    join(repoRoot, "node_modules", "typescript", "bin", "tsc"),
-    "-p", join(protocolPackage, "tsconfig.json"),
-    "--outDir", join(protocolTarget, "dist"),
-    "--tsBuildInfoFile", join(protocolTarget, ".tsbuildinfo"),
-  ]);
-  return { entry: join(directory, "bridge", "index.js"), directory };
+  const workspace = createIsolatedWorkspace(["protocol", "mcp-bridge"]);
+  try {
+    for (const packageName of ["@tab-goblin/protocol", "@tab-goblin/mcp-bridge"]) {
+      await run("npm", ["run", "build", "-w", packageName], workspace.root);
+    }
+    return {
+      entry: join(workspace.packagePath("mcp-bridge"), "dist", "index.js"),
+      directory: workspace.root,
+    };
+  } catch (error) {
+    workspace.cleanup();
+    throw error;
+  }
 }
 
 describe("tool definitions", () => {
@@ -291,11 +297,6 @@ describe("stdio MCP process", () => {
   });
 
   it("registers every actual tool and sends scoped calls through the unix admin socket", async () => {
-    for (const workspace of ["@tab-goblin/protocol", "@tab-goblin/mcp-bridge"]) {
-      const build = spawn("npm", ["run", "build", "-w", workspace], { stdio: "inherit" });
-      await new Promise<void>((resolve, reject) => build.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`${workspace} build failed: ${code}`))));
-    }
-
     const runtime = await prepareIsolatedBridgeRuntime();
     const child = spawn(process.execPath, [runtime.entry], {
       env: {

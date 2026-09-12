@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "scripts": { "test": "vitest run --root ../.. packages/viewer/test" },
-  "dependencies": { "@novnc/novnc": "^1.6.0", "@tab-goblin/protocol": "*" }
+  "scripts": {
+    "build": "esbuild src/viewer.ts --bundle --format=esm --outfile=public/viewer.js",
+    "test": "vitest run --root ../.. packages/viewer/test",
+    "typecheck": "tsc --noEmit --target ES2023 --module ESNext --moduleResolution Bundler --lib ES2023,DOM --strict --skipLibCheck src/*.ts"
+  },
+  "dependencies": { "@novnc/novnc": "^1.6.0", "@tab-goblin/protocol": "*" },
+  "devDependencies": { "esbuild": "^0.28.2" }
 }

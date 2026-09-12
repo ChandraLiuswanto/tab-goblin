@@ -3,5 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "scripts": { "test": "vitest run --root ../.. packages/fixture-site/test" }
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run --root ../.. packages/fixture-site/test",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
 }

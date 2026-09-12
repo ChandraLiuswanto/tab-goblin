@@ -5,8 +5,8 @@
   "workspaces": ["packages/*", "plugin"],
   "scripts": {
     "test": "vitest run",
-    "typecheck": "npm run typecheck -w @tab-goblin/protocol && npm run typecheck -w plugin",
-    "build": "npm run build -w @tab-goblin/protocol"
+    "typecheck": "npm run typecheck -w @tab-goblin/protocol && npm run typecheck -w @tab-goblin/fixture-site && npm run typecheck -w @tab-goblin/gateway && npm run typecheck -w @tab-goblin/mcp-bridge && npm run typecheck -w @tab-goblin/viewer && npm run typecheck -w plugin",
+    "build": "npm run build -w @tab-goblin/protocol && npm run build -w @tab-goblin/fixture-site && npm run build -w @tab-goblin/gateway && npm run build -w @tab-goblin/mcp-bridge && npm run build -w @tab-goblin/viewer"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

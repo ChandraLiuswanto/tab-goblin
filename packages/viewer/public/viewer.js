@@ -34005,6 +34005,7 @@ var workspaceId = external_exports.string().min(1).max(128);
 var agentId = external_exports.string().min(1).max(128);
 var cwd = external_exports.string().min(1).max(4096);
 var enrollment = external_exports.string().uuid();
+var lifecycleGeneration = external_exports.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 var scopedOperation = (op) => external_exports.object({ op: external_exports.literal(op), workspaceId }).strict();
 var AdminRequestSchema = external_exports.discriminatedUnion("op", [
   scopedOperation("status"),
@@ -34016,26 +34017,41 @@ var AdminRequestSchema = external_exports.discriminatedUnion("op", [
   // Tool input is validated again against the selected ToolInputSchemas member server-side.
   external_exports.object({
     op: external_exports.literal("tool"),
+    enrollment,
     workspaceId,
     name: external_exports.enum(TOOL_NAMES),
     input: external_exports.record(external_exports.string(), external_exports.unknown()),
     source: external_exports.string().min(1).max(80)
   }).strict(),
-  external_exports.object({ op: external_exports.literal("record-enrollment"), enrollment, cwd }).strict(),
+  external_exports.object({
+    op: external_exports.literal("record-enrollment"),
+    enrollment,
+    cwd,
+    workspaceId,
+    workspaceGeneration: lifecycleGeneration.default(0)
+  }).strict(),
   // The bridge's only call before it knows its workspace scope.
   external_exports.object({ op: external_exports.literal("resolve-enrollment"), enrollment }).strict(),
   external_exports.object({
     op: external_exports.literal("bind-enrollment"),
     cwd,
     agentId,
-    workspaceId: workspaceId.nullable()
+    workspaceId: workspaceId.nullable(),
+    agentGeneration: lifecycleGeneration.default(0),
+    workspaceGeneration: lifecycleGeneration.default(0)
   }).strict(),
   external_exports.object({
     op: external_exports.literal("session-open"),
     agentId,
     workspaceId: workspaceId.nullable(),
-    purpose: external_exports.enum(["interactive", "history"])
-  }).strict()
+    purpose: external_exports.enum(["interactive", "history"]),
+    agentGeneration: lifecycleGeneration.default(0),
+    workspaceGeneration: lifecycleGeneration.default(0)
+  }).strict(),
+  external_exports.object({ op: external_exports.literal("revoke-agent"), agentId }).strict(),
+  external_exports.object({ op: external_exports.literal("revoke-workspace"), workspaceId }).strict(),
+  external_exports.object({ op: external_exports.literal("reset-agent"), agentId }).strict(),
+  external_exports.object({ op: external_exports.literal("reset-workspace"), workspaceId }).strict()
 ]);
 var AdminResponseSchema = external_exports.discriminatedUnion("ok", [
   external_exports.object({
@@ -34046,6 +34062,7 @@ var AdminResponseSchema = external_exports.discriminatedUnion("ok", [
     snapshot: SnapshotSchema.optional(),
     pairingCode: external_exports.string().min(8).max(64).optional(),
     pairingExpiresAt: external_exports.string().max(64).optional(),
+    lifecycleGeneration: lifecycleGeneration.optional(),
     binding: external_exports.object({ agentId, workspaceId }).strict().optional(),
     // Tool responses are operation-specific and validated/bounded by their producers.
     result: external_exports.unknown().optional()

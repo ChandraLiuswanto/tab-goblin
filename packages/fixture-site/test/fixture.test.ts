@@ -5,9 +5,13 @@ import { startFixtureSite } from "../src/server.js";
 let site: Awaited<ReturnType<typeof startFixtureSite>>;
 const MAX_FIXTURE_BODY_BYTES = 1024 * 1024;
 
-function postChunked(url: string, body: Buffer): Promise<{ status: number; body: string }> {
+function postChunkedWithDelayedTail(
+  url: string,
+  body: Buffer,
+): Promise<{ status: number; connection: string; delayedWriteAttempted: boolean }> {
   const target = new URL(url);
   return new Promise((resolve, reject) => {
+    let responseStarted = false;
     const request = httpRequest(
       {
         hostname: target.hostname,
@@ -20,16 +24,29 @@ function postChunked(url: string, body: Buffer): Promise<{ status: number; body:
         },
       },
       (response) => {
-        const chunks: Buffer[] = [];
-        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        responseStarted = true;
+        response.resume();
         response.on("end", () => {
-          resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") });
+          setTimeout(() => {
+            try {
+              request.write("delayed-tail");
+              request.end();
+            } catch {
+              // A 413 closes this connection deliberately before a malicious sender can continue.
+            }
+            resolve({
+              status: response.statusCode ?? 0,
+              connection: String(response.headers.connection ?? ""),
+              delayedWriteAttempted: true,
+            });
+          }, 25);
         });
       },
     );
-    request.on("error", reject);
-    request.write(body.subarray(0, 32 * 1024));
-    request.end(body.subarray(32 * 1024));
+    request.on("error", (error) => {
+      if (!responseStarted) reject(error);
+    });
+    request.write(body);
   });
 }
 
@@ -95,8 +112,10 @@ describe("fixture site", () => {
     });
     expect(declared.status).toBe(413);
 
-    const chunked = await postChunked(site.url + "/upload", oversized);
+    const chunked = await postChunkedWithDelayedTail(site.url + "/upload", oversized);
     expect(chunked.status).toBe(413);
+    expect(chunked.connection.toLowerCase()).toBe("close");
+    expect(chunked.delayedWriteAttempted).toBe(true);
 
     const login = await fetch(site.url + "/login", {
       method: "POST",

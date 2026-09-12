@@ -32,25 +32,52 @@ function cookieOf(request: IncomingMessage, name: string): string | null {
   return null;
 }
 
-async function readBody(request: IncomingMessage): Promise<Buffer> {
+function readBody(request: IncomingMessage): Promise<Buffer> {
   const declaredLength = Number(request.headers["content-length"] ?? "0");
   if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BODY_BYTES) {
-    request.resume();
-    throw new PayloadTooLargeError();
+    return Promise.reject(new PayloadTooLargeError());
   }
 
-  const chunks: Buffer[] = [];
-  let byteLength = 0;
-  for await (const chunk of request) {
-    const buffer = Buffer.from(chunk);
-    byteLength += buffer.length;
-    if (byteLength > MAX_REQUEST_BODY_BYTES) {
-      request.resume();
-      throw new PayloadTooLargeError();
-    }
-    chunks.push(buffer);
-  }
-  return Buffer.concat(chunks, byteLength);
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let byteLength = 0;
+    let settled = false;
+    const cleanup = () => {
+      request.off("data", onData);
+      request.off("end", onEnd);
+      request.off("error", onError);
+      request.off("aborted", onAborted);
+    };
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const onData = (chunk: Buffer) => {
+      const buffer = Buffer.from(chunk);
+      byteLength += buffer.length;
+      if (byteLength > MAX_REQUEST_BODY_BYTES) {
+        request.pause();
+        fail(new PayloadTooLargeError());
+        return;
+      }
+      chunks.push(buffer);
+    };
+    const onEnd = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(Buffer.concat(chunks, byteLength));
+    };
+    const onError = (error: Error) => fail(error);
+    const onAborted = () => fail(new Error("request aborted"));
+
+    request.on("data", onData);
+    request.once("end", onEnd);
+    request.once("error", onError);
+    request.once("aborted", onAborted);
+  });
 }
 
 function slowDelay(value: string | null): number {
@@ -65,9 +92,18 @@ export async function startFixtureSite(
   const sessions = new Map<string, string>();
   const server = createServer((request, response) => {
     void handle(request, response, sessions).catch((error: unknown) => {
-      if (response.writableEnded) return;
+      if (response.headersSent || response.writableEnded) {
+        response.destroy();
+        return;
+      }
       if (error instanceof PayloadTooLargeError) {
-        response.writeHead(413, { "content-type": "text/html; charset=utf-8" }).end(page("Too large", "<h1>413</h1>"));
+        request.pause();
+        // Closing after the response can emit a request error after readBody detached its listener.
+        request.once("error", () => undefined);
+        response.shouldKeepAlive = false;
+        response
+          .writeHead(413, { "content-type": "text/html; charset=utf-8", connection: "close" })
+          .end(page("Too large", "<h1>413</h1>"));
         return;
       }
       response.writeHead(500).end("error");

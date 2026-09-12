@@ -1,16 +1,11 @@
 import RFB from "@novnc/novnc";
-import { CSRF_HEADER, PairResponseSchema, type OwnershipState } from "@tab-goblin/protocol";
-import { nextUi, scaleToFit, type ViewerUi } from "./ui-state.js";
+import { CSRF_HEADER, PairResponseSchema, SessionStatusSchema } from "@tab-goblin/protocol";
+import { nextUi, type ViewerUi } from "./ui-state.js";
 
-const OWNERSHIP_STATES: readonly OwnershipState[] = [
-  "agent-ready",
-  "taking-control",
-  "manual",
-  "returning-control",
-  "needs-attention",
-];
 const STATUS_POLL_MS = 3_000;
-const RECONNECT_GRACE_MS = 5_000;
+const MAX_RECONNECT_ATTEMPTS = 3;
+const RECONNECT_DELAY_MS = 500;
+const MAX_SIGN_OUT_ATTEMPTS = 3;
 
 function requiredElement<T extends HTMLElement>(id: string): T {
   const element = document.getElementById(id);
@@ -38,21 +33,55 @@ let rfb: RFB | null = null;
 let ui: ViewerUi = { kind: "pairing", error: null };
 let pollTimer: number | null = null;
 let reconnectTimer: number | null = null;
-let remoteSize = { width: 1, height: 1 };
-let pinchScale = 1;
-const pointers = new Map<number, { x: number; y: number }>();
-let pinchDistance: number | null = null;
+let statusAbort: AbortController | null = null;
+let transportEpoch = 0;
+let statusSequence = 0;
+let lastOwnershipGeneration = -1;
+let reconnectAttempts = 0;
+let transportConnected = false;
+let controlExplicitlyRequested = false;
+let ownershipActionPending = false;
+let signOutPending = false;
+let signOutAttempts = 0;
+let signOutFailure: string | null = null;
+let composing = false;
+let suppressInputText: string | null = null;
+const pressedKeys = new Map<string, number>();
+const PHYSICAL_KEYSYMS: Readonly<Record<string, number>> = {
+  Alt: 0xffe9,
+  ArrowDown: 0xff54,
+  ArrowLeft: 0xff51,
+  ArrowRight: 0xff53,
+  ArrowUp: 0xff52,
+  Backspace: 0xff08,
+  CapsLock: 0xffe5,
+  Control: 0xffe3,
+  Delete: 0xffff,
+  End: 0xff57,
+  Enter: 0xff0d,
+  Escape: 0xff1b,
+  Home: 0xff50,
+  Insert: 0xff63,
+  Meta: 0xffe7,
+  PageDown: 0xff56,
+  PageUp: 0xff55,
+  Shift: 0xffe1,
+  Tab: 0xff09,
+};
 
 function statusText(current: ViewerUi): string {
+  if (signOutFailure) return signOutFailure;
   switch (current.kind) {
     case "pairing":
-      return "needs attention";
+      return "pair this device";
     case "connecting":
-      return "reconnecting";
+      return "connecting";
     case "view-only":
       return current.ownership === "taking-control" ? "taking control…" : "view only";
     case "controlling":
       return "you have control";
+    case "needs-attention":
+      return "needs attention";
     case "reconnecting":
       return "reconnecting";
     case "connection-lost":
@@ -60,19 +89,26 @@ function statusText(current: ViewerUi): string {
   }
 }
 
+function canSendInput(): boolean {
+  return transportConnected && !signOutPending && !signOutFailure && ui.kind === "controlling";
+}
+
 function setUi(next: ViewerUi): void {
   ui = next;
+  const inputAllowed = canSendInput();
   banner.textContent = statusText(next);
   pairing.classList.toggle("hidden", next.kind !== "pairing");
   screen.classList.toggle("hidden", next.kind === "pairing");
   controls.classList.toggle("hidden", next.kind === "pairing");
   pairingError.textContent = next.kind === "pairing" ? next.error ?? "" : "";
 
-  // Input remains blocked unless the server has explicitly identified this session as owner.
-  if (rfb) rfb.viewOnly = next.kind !== "controlling";
-  takeControl.disabled = next.kind === "controlling" || next.kind === "reconnecting";
-  returnToAgent.disabled = next.kind !== "controlling";
-  reclaimControl.disabled = next.kind === "controlling" || next.kind === "reconnecting";
+  if (rfb) rfb.viewOnly = !inputAllowed;
+  const canRequestOwnership = transportConnected && !ownershipActionPending && !signOutPending && !signOutFailure;
+  takeControl.disabled = !canRequestOwnership || inputAllowed;
+  returnToAgent.disabled = !inputAllowed;
+  reclaimControl.disabled = !canRequestOwnership || inputAllowed;
+  signOut.disabled = !csrfToken || signOutPending || signOutAttempts >= MAX_SIGN_OUT_ATTEMPTS;
+  signOut.textContent = signOutFailure ? "Retry sign out" : "Sign out";
 }
 
 function websocketUrl(): string {
@@ -81,16 +117,11 @@ function websocketUrl(): string {
   return url.href;
 }
 
-function applyScale(): void {
-  const canvas = screen.querySelector("canvas");
-  if (canvas instanceof HTMLCanvasElement && canvas.width > 0 && canvas.height > 0) {
-    remoteSize = { width: canvas.width, height: canvas.height };
-  }
-  const fit = scaleToFit(remoteSize, { width: viewer.clientWidth, height: viewer.clientHeight });
-  const scale = fit.scale * pinchScale;
-  screen.style.transform = `translate(${fit.offsetX}px, ${fit.offsetY}px) scale(${scale})`;
-  screen.style.width = `${remoteSize.width}px`;
-  screen.style.height = `${remoteSize.height}px`;
+function applyViewportScaling(): void {
+  if (!rfb) return;
+  // noVNC owns both its display scale and inverse pointer coordinate mapping.
+  rfb.clipViewport = false;
+  rfb.scaleViewport = true;
 }
 
 function clearReconnectTimer(): void {
@@ -98,36 +129,54 @@ function clearReconnectTimer(): void {
   reconnectTimer = null;
 }
 
+function invalidateStatusRequests(): void {
+  statusSequence += 1;
+  statusAbort?.abort();
+  statusAbort = null;
+}
+
+function scheduleReconnect(): void {
+  if (!csrfToken || reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    setUi({ kind: "connection-lost" });
+    return;
+  }
+  const delay = RECONNECT_DELAY_MS * 2 ** reconnectAttempts;
+  reconnectAttempts += 1;
+  reconnectTimer = window.setTimeout(() => {
+    reconnectTimer = null;
+    if (!csrfToken || transportConnected) return;
+    connectVnc();
+  }, delay);
+}
+
 function connectVnc(): void {
   clearReconnectTimer();
+  const connectionEpoch = ++transportEpoch;
+  transportConnected = false;
+  controlExplicitlyRequested = false;
+  invalidateStatusRequests();
   rfb?.disconnect();
   rfb = new RFB(screen, websocketUrl());
   rfb.viewOnly = true;
+  applyViewportScaling();
   rfb.addEventListener("connect", () => {
-    clearReconnectTimer();
+    if (connectionEpoch !== transportEpoch || !csrfToken) return;
+    transportConnected = true;
+    reconnectAttempts = 0;
     setUi(nextUi(ui, { type: "socket-open" }));
-    applyScale();
+    applyViewportScaling();
+    startPolling();
     void refreshStatus();
   });
   rfb.addEventListener("disconnect", () => {
+    if (connectionEpoch !== transportEpoch || !csrfToken) return;
+    transportConnected = false;
+    controlExplicitlyRequested = false;
+    pressedKeys.clear();
+    invalidateStatusRequests();
     setUi(nextUi(ui, { type: "socket-closed" }));
-    clearReconnectTimer();
-    reconnectTimer = window.setTimeout(() => {
-      if (ui.kind === "reconnecting") setUi({ kind: "connection-lost" });
-    }, RECONNECT_GRACE_MS);
+    scheduleReconnect();
   });
-}
-
-function ownershipEvent(payload: unknown): { state: OwnershipState; isOwner: boolean } | null {
-  if (typeof payload !== "object" || payload === null) return null;
-  const ownership = (payload as { ownership?: unknown }).ownership;
-  if (typeof ownership !== "object" || ownership === null) return null;
-  const { state, isOwner } = ownership as { state?: unknown; isOwner?: unknown };
-  if (typeof state !== "string" || !OWNERSHIP_STATES.includes(state as OwnershipState)) return null;
-
-  // `owner: "viewer"` is deliberately insufficient: another paired device may own input.
-  // The gateway must provide this session-specific boolean, otherwise this UI stays view-only.
-  return { state: state as OwnershipState, isOwner: isOwner === true };
 }
 
 async function request(path: string, body?: unknown): Promise<Response> {
@@ -144,24 +193,39 @@ async function request(path: string, body?: unknown): Promise<Response> {
 }
 
 async function refreshStatus(): Promise<void> {
-  if (!csrfToken || document.visibilityState !== "visible") return;
+  if (!csrfToken || !transportConnected || document.visibilityState !== "visible") return;
+  statusAbort?.abort();
+  const controller = new AbortController();
+  statusAbort = controller;
+  const requestEpoch = transportEpoch;
+  const requestSequence = ++statusSequence;
   try {
     const response = await fetch("/api/status", {
       credentials: "same-origin",
       headers: { [CSRF_HEADER]: csrfToken },
+      signal: controller.signal,
     });
     if (!response.ok) return;
-    const ownership = ownershipEvent(await response.json());
-    if (ownership) setUi(nextUi(ui, { type: "ownership", ...ownership }));
+    const parsed = SessionStatusSchema.safeParse(await response.json());
+    if (!parsed.success || requestEpoch !== transportEpoch || requestSequence !== statusSequence || !transportConnected) {
+      return;
+    }
+    const ownership = parsed.data.ownership;
+    if (ownership.generation < lastOwnershipGeneration) return;
+    lastOwnershipGeneration = ownership.generation;
+    const canControl =
+      controlExplicitlyRequested && ownership.state === "manual" && ownership.owner === "viewer";
+    setUi(nextUi(ui, { type: "ownership", state: ownership.state, canControl }));
   } catch {
-    // A transient status failure never enables input; the VNC connection remains view-only.
+    // Request cancellation, stale responses, and temporary failures always leave the current UI fail-closed.
+  } finally {
+    if (requestSequence === statusSequence) statusAbort = null;
   }
 }
 
 function startPolling(): void {
   if (pollTimer !== null || document.visibilityState !== "visible") return;
   pollTimer = window.setInterval(() => void refreshStatus(), STATUS_POLL_MS);
-  void refreshStatus();
 }
 
 function stopPolling(): void {
@@ -187,9 +251,13 @@ async function pair(): Promise<void> {
     const paired = PairResponseSchema.parse(await response.json());
     csrfToken = paired.csrfToken;
     pairingCode.value = "";
+    lastOwnershipGeneration = -1;
+    reconnectAttempts = 0;
+    signOutAttempts = 0;
+    signOutFailure = null;
+    controlExplicitlyRequested = false;
     setUi(nextUi(ui, { type: "paired" }));
     connectVnc();
-    startPolling();
   } catch {
     setUi(nextUi(ui, { type: "pair-failed", message: "Pairing failed. Check the code and try again." }));
   } finally {
@@ -197,104 +265,156 @@ async function pair(): Promise<void> {
   }
 }
 
-async function postAndRefresh(path: string, body?: unknown): Promise<void> {
+async function requestOwnership(path: "/api/take-control" | "/api/reclaim", body?: unknown): Promise<void> {
+  if (!transportConnected || ownershipActionPending || signOutFailure) return;
+  ownershipActionPending = true;
+  setUi(ui);
   try {
     const response = await request(path, body);
     if (!response.ok) throw new Error("request rejected");
-    // Do not optimistically grant or restore control. Polling mirrors the server decision.
+    controlExplicitlyRequested = true;
     await refreshStatus();
   } catch {
-    // Fail closed: rfb.viewOnly is set below even when a request or network operation fails.
+    controlExplicitlyRequested = false;
     if (rfb) rfb.viewOnly = true;
-    void refreshStatus();
+  } finally {
+    ownershipActionPending = false;
+    setUi(ui);
   }
 }
 
-function pointerDistance(): number | null {
-  const active = [...pointers.values()];
-  if (active.length !== 2) return null;
-  return Math.hypot(active[0].x - active[1].x, active[0].y - active[1].y);
+async function returnControl(): Promise<void> {
+  if (!canSendInput()) return;
+  controlExplicitlyRequested = false;
+  setUi({ kind: "view-only", ownership: "returning-control" });
+  try {
+    const response = await request("/api/return-to-agent");
+    if (!response.ok) throw new Error("request rejected");
+    await refreshStatus();
+  } catch {
+    if (rfb) rfb.viewOnly = true;
+  }
 }
 
-function updatePinch(event: PointerEvent): void {
-  pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-  const distance = pointerDistance();
-  if (distance !== null && pinchDistance !== null && pinchDistance > 0) {
-    pinchScale = Math.min(3, Math.max(0.5, pinchScale * (distance / pinchDistance)));
-    applyScale();
+function keysymFor(character: string): number {
+  const codePoint = character.codePointAt(0);
+  if (codePoint === undefined) return 0;
+  return codePoint <= 0xff ? codePoint : 0x01000000 | codePoint;
+}
+
+function sendCommittedText(text: string): void {
+  if (!canSendInput() || !rfb) return;
+  for (const character of text) rfb.sendKey(keysymFor(character), null);
+}
+
+function physicalKeysym(key: string): number | null {
+  if (PHYSICAL_KEYSYMS[key] !== undefined) return PHYSICAL_KEYSYMS[key];
+  const match = /^F([1-9]|1[0-2])$/.exec(key);
+  return match ? 0xffbd + Number(match[1]) : null;
+}
+
+function forwardPhysicalKey(event: KeyboardEvent): void {
+  if (!canSendInput() || composing || !rfb) return;
+  const printable = event.key.length === 1 || event.key === "Dead";
+  if (event.type === "keydown") {
+    if (printable || event.repeat) return;
+    const keysym = physicalKeysym(event.key);
+    if (keysym === null) return;
+    pressedKeys.set(event.code, keysym);
+    rfb.sendKey(keysym, event.code, true);
+    event.preventDefault();
+  } else {
+    const keysym = pressedKeys.get(event.code);
+    if (keysym === undefined) return;
+    pressedKeys.delete(event.code);
+    rfb.sendKey(keysym, event.code, false);
+    event.preventDefault();
   }
-  pinchDistance = distance;
+}
+
+function handleBeforeInput(event: InputEvent): void {
+  if (!canSendInput() || event.inputType === "insertCompositionText") return;
+  if (!event.inputType.startsWith("insert") || !event.data) return;
+  sendCommittedText(event.data);
+  suppressInputText = event.data;
+  event.preventDefault();
+}
+
+function handleInput(event: InputEvent): void {
+  const text = event.data ?? keyboardInput.value;
+  keyboardInput.value = "";
+  if (!canSendInput() || !text) {
+    suppressInputText = null;
+    return;
+  }
+  if (text !== suppressInputText) sendCommittedText(text);
+  suppressInputText = null;
+}
+
+async function signOutViewer(): Promise<void> {
+  if (!csrfToken || signOutPending || signOutAttempts >= MAX_SIGN_OUT_ATTEMPTS) return;
+  signOutPending = true;
+  controlExplicitlyRequested = false;
+  if (rfb) rfb.viewOnly = true;
+  setUi(ui);
+  try {
+    const response = await request("/api/sign-out");
+    if (!response.ok) throw new Error("sign-out not confirmed");
+    stopPolling();
+    clearReconnectTimer();
+    invalidateStatusRequests();
+    transportEpoch += 1;
+    transportConnected = false;
+    rfb?.disconnect();
+    rfb = null;
+    csrfToken = null;
+    signOutFailure = null;
+    setUi({ kind: "pairing", error: null });
+  } catch {
+    signOutAttempts += 1;
+    signOutFailure =
+      signOutAttempts >= MAX_SIGN_OUT_ATTEMPTS
+        ? "Sign-out was not confirmed. Retry limit reached; close this viewer and contact an operator."
+        : "Sign-out was not confirmed. Retry to revoke this viewer session.";
+    if (rfb) rfb.viewOnly = true;
+    setUi(ui);
+  } finally {
+    signOutPending = false;
+    setUi(ui);
+  }
 }
 
 pairButton.addEventListener("click", () => void pair());
 pairingCode.addEventListener("keydown", (event) => {
   if (event.key === "Enter") void pair();
 });
-takeControl.addEventListener("click", () => void postAndRefresh("/api/take-control"));
-returnToAgent.addEventListener("click", () => {
-  if (rfb) rfb.viewOnly = true;
-  void postAndRefresh("/api/return-to-agent");
-});
+takeControl.addEventListener("click", () => void requestOwnership("/api/take-control"));
+returnToAgent.addEventListener("click", () => void returnControl());
 reclaimControl.addEventListener("click", () => {
   if (window.confirm("Reclaiming control revokes control from the other device. Continue?")) {
-    void postAndRefresh("/api/reclaim", { confirm: true });
+    void requestOwnership("/api/reclaim", { confirm: true });
   }
 });
 keyboardToggle.addEventListener("click", () => keyboardInput.focus());
-function forwardMobileKey(event: KeyboardEvent): void {
-  if (ui.kind !== "controlling") return;
-  const canvas = screen.querySelector("canvas");
-  if (!(canvas instanceof HTMLCanvasElement)) return;
-  canvas.dispatchEvent(
-    new KeyboardEvent(event.type, {
-      bubbles: true,
-      cancelable: true,
-      key: event.key,
-      code: event.code,
-      location: event.location,
-      repeat: event.repeat,
-      altKey: event.altKey,
-      ctrlKey: event.ctrlKey,
-      metaKey: event.metaKey,
-      shiftKey: event.shiftKey,
-    }),
-  );
-  event.preventDefault();
-}
-keyboardInput.addEventListener("keydown", forwardMobileKey);
-keyboardInput.addEventListener("keyup", forwardMobileKey);
-keyboardInput.addEventListener("input", () => {
-  // Do not retain typed remote input in this page's DOM after invoking the mobile keyboard.
-  keyboardInput.value = "";
+keyboardInput.addEventListener("compositionstart", () => {
+  composing = true;
 });
-signOut.addEventListener("click", () => void (async () => {
-  try {
-    await request("/api/sign-out");
-  } catch {
-    // Local cleanup still removes the in-memory CSRF token and blocks input.
-  }
-  stopPolling();
-  clearReconnectTimer();
-  rfb?.disconnect();
-  rfb = null;
-  csrfToken = null;
-  setUi({ kind: "pairing", error: null });
-})());
-
-viewer.addEventListener("pointerdown", updatePinch);
-viewer.addEventListener("pointermove", updatePinch);
-viewer.addEventListener("pointerup", (event) => {
-  pointers.delete(event.pointerId);
-  pinchDistance = pointerDistance();
+keyboardInput.addEventListener("compositionend", () => {
+  composing = false;
 });
-viewer.addEventListener("pointercancel", (event) => {
-  pointers.delete(event.pointerId);
-  pinchDistance = pointerDistance();
-});
-window.addEventListener("resize", applyScale);
+keyboardInput.addEventListener("keydown", forwardPhysicalKey);
+keyboardInput.addEventListener("keyup", forwardPhysicalKey);
+keyboardInput.addEventListener("beforeinput", handleBeforeInput);
+keyboardInput.addEventListener("input", (event) => handleInput(event as InputEvent));
+signOut.addEventListener("click", () => void signOutViewer());
+window.addEventListener("resize", applyViewportScaling);
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") startPolling();
-  else stopPolling();
+  if (document.visibilityState === "visible") {
+    startPolling();
+    void refreshStatus();
+  } else {
+    stopPolling();
+  }
 });
 window.addEventListener("pagehide", stopPolling);
 

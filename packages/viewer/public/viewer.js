@@ -34068,17 +34068,6 @@ var ViewerSessionSchema = external_exports.object({
 }).strict();
 
 // src/ui-state.ts
-function scaleToFit(remote, viewport) {
-  if (!Number.isFinite(remote.width) || !Number.isFinite(remote.height) || !Number.isFinite(viewport.width) || !Number.isFinite(viewport.height) || remote.width <= 0 || remote.height <= 0 || viewport.width < 0 || viewport.height < 0) {
-    throw new RangeError("dimensions must be finite, with a positive remote size");
-  }
-  const scale = Math.min(1, viewport.width / remote.width, viewport.height / remote.height);
-  return {
-    scale,
-    offsetX: (viewport.width - remote.width * scale) / 2,
-    offsetY: (viewport.height - remote.height * scale) / 2
-  };
-}
 function nextUi(current, event) {
   switch (event.type) {
     case "pair-failed":
@@ -34090,20 +34079,17 @@ function nextUi(current, event) {
     case "socket-closed":
       return current.kind === "pairing" ? current : { kind: "reconnecting" };
     case "ownership":
-      return event.isOwner ? { kind: "controlling" } : { kind: "view-only", ownership: event.state };
+      if (event.state === "needs-attention") return { kind: "needs-attention" };
+      if (event.canControl) return { kind: "controlling" };
+      return { kind: "view-only", ownership: event.state };
   }
 }
 
 // src/viewer.ts
-var OWNERSHIP_STATES2 = [
-  "agent-ready",
-  "taking-control",
-  "manual",
-  "returning-control",
-  "needs-attention"
-];
 var STATUS_POLL_MS = 3e3;
-var RECONNECT_GRACE_MS = 5e3;
+var MAX_RECONNECT_ATTEMPTS = 3;
+var RECONNECT_DELAY_MS = 500;
+var MAX_SIGN_OUT_ATTEMPTS = 3;
 function requiredElement(id) {
   const element = document.getElementById(id);
   if (!(element instanceof HTMLElement)) throw new Error(`Missing #${id}`);
@@ -34128,84 +34114,139 @@ var rfb = null;
 var ui = { kind: "pairing", error: null };
 var pollTimer = null;
 var reconnectTimer = null;
-var remoteSize = { width: 1, height: 1 };
-var pinchScale = 1;
-var pointers = /* @__PURE__ */ new Map();
-var pinchDistance = null;
+var statusAbort = null;
+var transportEpoch = 0;
+var statusSequence = 0;
+var lastOwnershipGeneration = -1;
+var reconnectAttempts = 0;
+var transportConnected = false;
+var controlExplicitlyRequested = false;
+var ownershipActionPending = false;
+var signOutPending = false;
+var signOutAttempts = 0;
+var signOutFailure = null;
+var composing = false;
+var suppressInputText = null;
+var pressedKeys = /* @__PURE__ */ new Map();
+var PHYSICAL_KEYSYMS = {
+  Alt: 65513,
+  ArrowDown: 65364,
+  ArrowLeft: 65361,
+  ArrowRight: 65363,
+  ArrowUp: 65362,
+  Backspace: 65288,
+  CapsLock: 65509,
+  Control: 65507,
+  Delete: 65535,
+  End: 65367,
+  Enter: 65293,
+  Escape: 65307,
+  Home: 65360,
+  Insert: 65379,
+  Meta: 65511,
+  PageDown: 65366,
+  PageUp: 65365,
+  Shift: 65505,
+  Tab: 65289
+};
 function statusText(current) {
+  if (signOutFailure) return signOutFailure;
   switch (current.kind) {
     case "pairing":
-      return "needs attention";
+      return "pair this device";
     case "connecting":
-      return "reconnecting";
+      return "connecting";
     case "view-only":
       return current.ownership === "taking-control" ? "taking control\u2026" : "view only";
     case "controlling":
       return "you have control";
+    case "needs-attention":
+      return "needs attention";
     case "reconnecting":
       return "reconnecting";
     case "connection-lost":
       return "connection lost";
   }
 }
+function canSendInput() {
+  return transportConnected && !signOutPending && !signOutFailure && ui.kind === "controlling";
+}
 function setUi(next) {
   ui = next;
+  const inputAllowed = canSendInput();
   banner.textContent = statusText(next);
   pairing.classList.toggle("hidden", next.kind !== "pairing");
   screen.classList.toggle("hidden", next.kind === "pairing");
   controls.classList.toggle("hidden", next.kind === "pairing");
   pairingError.textContent = next.kind === "pairing" ? next.error ?? "" : "";
-  if (rfb) rfb.viewOnly = next.kind !== "controlling";
-  takeControl.disabled = next.kind === "controlling" || next.kind === "reconnecting";
-  returnToAgent.disabled = next.kind !== "controlling";
-  reclaimControl.disabled = next.kind === "controlling" || next.kind === "reconnecting";
+  if (rfb) rfb.viewOnly = !inputAllowed;
+  const canRequestOwnership = transportConnected && !ownershipActionPending && !signOutPending && !signOutFailure;
+  takeControl.disabled = !canRequestOwnership || inputAllowed;
+  returnToAgent.disabled = !inputAllowed;
+  reclaimControl.disabled = !canRequestOwnership || inputAllowed;
+  signOut.disabled = !csrfToken2 || signOutPending || signOutAttempts >= MAX_SIGN_OUT_ATTEMPTS;
+  signOut.textContent = signOutFailure ? "Retry sign out" : "Sign out";
 }
 function websocketUrl() {
   const url2 = new URL("/ws/vnc", window.location.href);
   url2.protocol = url2.protocol === "https:" ? "wss:" : "ws:";
   return url2.href;
 }
-function applyScale() {
-  const canvas = screen.querySelector("canvas");
-  if (canvas instanceof HTMLCanvasElement && canvas.width > 0 && canvas.height > 0) {
-    remoteSize = { width: canvas.width, height: canvas.height };
-  }
-  const fit = scaleToFit(remoteSize, { width: viewer.clientWidth, height: viewer.clientHeight });
-  const scale = fit.scale * pinchScale;
-  screen.style.transform = `translate(${fit.offsetX}px, ${fit.offsetY}px) scale(${scale})`;
-  screen.style.width = `${remoteSize.width}px`;
-  screen.style.height = `${remoteSize.height}px`;
+function applyViewportScaling() {
+  if (!rfb) return;
+  rfb.clipViewport = false;
+  rfb.scaleViewport = true;
 }
 function clearReconnectTimer() {
   if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
   reconnectTimer = null;
 }
+function invalidateStatusRequests() {
+  statusSequence += 1;
+  statusAbort?.abort();
+  statusAbort = null;
+}
+function scheduleReconnect() {
+  if (!csrfToken2 || reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    setUi({ kind: "connection-lost" });
+    return;
+  }
+  const delay = RECONNECT_DELAY_MS * 2 ** reconnectAttempts;
+  reconnectAttempts += 1;
+  reconnectTimer = window.setTimeout(() => {
+    reconnectTimer = null;
+    if (!csrfToken2 || transportConnected) return;
+    connectVnc();
+  }, delay);
+}
 function connectVnc() {
   clearReconnectTimer();
+  const connectionEpoch = ++transportEpoch;
+  transportConnected = false;
+  controlExplicitlyRequested = false;
+  invalidateStatusRequests();
   rfb?.disconnect();
   rfb = new RFB(screen, websocketUrl());
   rfb.viewOnly = true;
+  applyViewportScaling();
   rfb.addEventListener("connect", () => {
-    clearReconnectTimer();
+    if (connectionEpoch !== transportEpoch || !csrfToken2) return;
+    transportConnected = true;
+    reconnectAttempts = 0;
     setUi(nextUi(ui, { type: "socket-open" }));
-    applyScale();
+    applyViewportScaling();
+    startPolling();
     void refreshStatus();
   });
   rfb.addEventListener("disconnect", () => {
+    if (connectionEpoch !== transportEpoch || !csrfToken2) return;
+    transportConnected = false;
+    controlExplicitlyRequested = false;
+    pressedKeys.clear();
+    invalidateStatusRequests();
     setUi(nextUi(ui, { type: "socket-closed" }));
-    clearReconnectTimer();
-    reconnectTimer = window.setTimeout(() => {
-      if (ui.kind === "reconnecting") setUi({ kind: "connection-lost" });
-    }, RECONNECT_GRACE_MS);
+    scheduleReconnect();
   });
-}
-function ownershipEvent(payload) {
-  if (typeof payload !== "object" || payload === null) return null;
-  const ownership = payload.ownership;
-  if (typeof ownership !== "object" || ownership === null) return null;
-  const { state, isOwner } = ownership;
-  if (typeof state !== "string" || !OWNERSHIP_STATES2.includes(state)) return null;
-  return { state, isOwner: isOwner === true };
 }
 async function request(path, body) {
   if (!csrfToken2) throw new Error("Pair this device first");
@@ -34220,22 +34261,36 @@ async function request(path, body) {
   });
 }
 async function refreshStatus() {
-  if (!csrfToken2 || document.visibilityState !== "visible") return;
+  if (!csrfToken2 || !transportConnected || document.visibilityState !== "visible") return;
+  statusAbort?.abort();
+  const controller = new AbortController();
+  statusAbort = controller;
+  const requestEpoch = transportEpoch;
+  const requestSequence = ++statusSequence;
   try {
     const response = await fetch("/api/status", {
       credentials: "same-origin",
-      headers: { [CSRF_HEADER]: csrfToken2 }
+      headers: { [CSRF_HEADER]: csrfToken2 },
+      signal: controller.signal
     });
     if (!response.ok) return;
-    const ownership = ownershipEvent(await response.json());
-    if (ownership) setUi(nextUi(ui, { type: "ownership", ...ownership }));
+    const parsed = SessionStatusSchema.safeParse(await response.json());
+    if (!parsed.success || requestEpoch !== transportEpoch || requestSequence !== statusSequence || !transportConnected) {
+      return;
+    }
+    const ownership = parsed.data.ownership;
+    if (ownership.generation < lastOwnershipGeneration) return;
+    lastOwnershipGeneration = ownership.generation;
+    const canControl = controlExplicitlyRequested && ownership.state === "manual" && ownership.owner === "viewer";
+    setUi(nextUi(ui, { type: "ownership", state: ownership.state, canControl }));
   } catch {
+  } finally {
+    if (requestSequence === statusSequence) statusAbort = null;
   }
 }
 function startPolling() {
   if (pollTimer !== null || document.visibilityState !== "visible") return;
   pollTimer = window.setInterval(() => void refreshStatus(), STATUS_POLL_MS);
-  void refreshStatus();
 }
 function stopPolling() {
   if (pollTimer !== null) window.clearInterval(pollTimer);
@@ -34258,105 +34313,157 @@ async function pair() {
     const paired = PairResponseSchema.parse(await response.json());
     csrfToken2 = paired.csrfToken;
     pairingCode.value = "";
+    lastOwnershipGeneration = -1;
+    reconnectAttempts = 0;
+    signOutAttempts = 0;
+    signOutFailure = null;
+    controlExplicitlyRequested = false;
     setUi(nextUi(ui, { type: "paired" }));
     connectVnc();
-    startPolling();
   } catch {
     setUi(nextUi(ui, { type: "pair-failed", message: "Pairing failed. Check the code and try again." }));
   } finally {
     pairButton.disabled = false;
   }
 }
-async function postAndRefresh(path, body) {
+async function requestOwnership(path, body) {
+  if (!transportConnected || ownershipActionPending || signOutFailure) return;
+  ownershipActionPending = true;
+  setUi(ui);
   try {
     const response = await request(path, body);
+    if (!response.ok) throw new Error("request rejected");
+    controlExplicitlyRequested = true;
+    await refreshStatus();
+  } catch {
+    controlExplicitlyRequested = false;
+    if (rfb) rfb.viewOnly = true;
+  } finally {
+    ownershipActionPending = false;
+    setUi(ui);
+  }
+}
+async function returnControl() {
+  if (!canSendInput()) return;
+  controlExplicitlyRequested = false;
+  setUi({ kind: "view-only", ownership: "returning-control" });
+  try {
+    const response = await request("/api/return-to-agent");
     if (!response.ok) throw new Error("request rejected");
     await refreshStatus();
   } catch {
     if (rfb) rfb.viewOnly = true;
-    void refreshStatus();
   }
 }
-function pointerDistance() {
-  const active = [...pointers.values()];
-  if (active.length !== 2) return null;
-  return Math.hypot(active[0].x - active[1].x, active[0].y - active[1].y);
+function keysymFor(character) {
+  const codePoint = character.codePointAt(0);
+  if (codePoint === void 0) return 0;
+  return codePoint <= 255 ? codePoint : 16777216 | codePoint;
 }
-function updatePinch(event) {
-  pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-  const distance = pointerDistance();
-  if (distance !== null && pinchDistance !== null && pinchDistance > 0) {
-    pinchScale = Math.min(3, Math.max(0.5, pinchScale * (distance / pinchDistance)));
-    applyScale();
+function sendCommittedText(text) {
+  if (!canSendInput() || !rfb) return;
+  for (const character of text) rfb.sendKey(keysymFor(character), null);
+}
+function physicalKeysym(key) {
+  if (PHYSICAL_KEYSYMS[key] !== void 0) return PHYSICAL_KEYSYMS[key];
+  const match = /^F([1-9]|1[0-2])$/.exec(key);
+  return match ? 65469 + Number(match[1]) : null;
+}
+function forwardPhysicalKey(event) {
+  if (!canSendInput() || composing || !rfb) return;
+  const printable = event.key.length === 1 || event.key === "Dead";
+  if (event.type === "keydown") {
+    if (printable || event.repeat) return;
+    const keysym = physicalKeysym(event.key);
+    if (keysym === null) return;
+    pressedKeys.set(event.code, keysym);
+    rfb.sendKey(keysym, event.code, true);
+    event.preventDefault();
+  } else {
+    const keysym = pressedKeys.get(event.code);
+    if (keysym === void 0) return;
+    pressedKeys.delete(event.code);
+    rfb.sendKey(keysym, event.code, false);
+    event.preventDefault();
   }
-  pinchDistance = distance;
+}
+function handleBeforeInput(event) {
+  if (!canSendInput() || event.inputType === "insertCompositionText") return;
+  if (!event.inputType.startsWith("insert") || !event.data) return;
+  sendCommittedText(event.data);
+  suppressInputText = event.data;
+  event.preventDefault();
+}
+function handleInput(event) {
+  const text = event.data ?? keyboardInput.value;
+  keyboardInput.value = "";
+  if (!canSendInput() || !text) {
+    suppressInputText = null;
+    return;
+  }
+  if (text !== suppressInputText) sendCommittedText(text);
+  suppressInputText = null;
+}
+async function signOutViewer() {
+  if (!csrfToken2 || signOutPending || signOutAttempts >= MAX_SIGN_OUT_ATTEMPTS) return;
+  signOutPending = true;
+  controlExplicitlyRequested = false;
+  if (rfb) rfb.viewOnly = true;
+  setUi(ui);
+  try {
+    const response = await request("/api/sign-out");
+    if (!response.ok) throw new Error("sign-out not confirmed");
+    stopPolling();
+    clearReconnectTimer();
+    invalidateStatusRequests();
+    transportEpoch += 1;
+    transportConnected = false;
+    rfb?.disconnect();
+    rfb = null;
+    csrfToken2 = null;
+    signOutFailure = null;
+    setUi({ kind: "pairing", error: null });
+  } catch {
+    signOutAttempts += 1;
+    signOutFailure = signOutAttempts >= MAX_SIGN_OUT_ATTEMPTS ? "Sign-out was not confirmed. Retry limit reached; close this viewer and contact an operator." : "Sign-out was not confirmed. Retry to revoke this viewer session.";
+    if (rfb) rfb.viewOnly = true;
+    setUi(ui);
+  } finally {
+    signOutPending = false;
+    setUi(ui);
+  }
 }
 pairButton.addEventListener("click", () => void pair());
 pairingCode.addEventListener("keydown", (event) => {
   if (event.key === "Enter") void pair();
 });
-takeControl.addEventListener("click", () => void postAndRefresh("/api/take-control"));
-returnToAgent.addEventListener("click", () => {
-  if (rfb) rfb.viewOnly = true;
-  void postAndRefresh("/api/return-to-agent");
-});
+takeControl.addEventListener("click", () => void requestOwnership("/api/take-control"));
+returnToAgent.addEventListener("click", () => void returnControl());
 reclaimControl.addEventListener("click", () => {
   if (window.confirm("Reclaiming control revokes control from the other device. Continue?")) {
-    void postAndRefresh("/api/reclaim", { confirm: true });
+    void requestOwnership("/api/reclaim", { confirm: true });
   }
 });
 keyboardToggle.addEventListener("click", () => keyboardInput.focus());
-function forwardMobileKey(event) {
-  if (ui.kind !== "controlling") return;
-  const canvas = screen.querySelector("canvas");
-  if (!(canvas instanceof HTMLCanvasElement)) return;
-  canvas.dispatchEvent(
-    new KeyboardEvent(event.type, {
-      bubbles: true,
-      cancelable: true,
-      key: event.key,
-      code: event.code,
-      location: event.location,
-      repeat: event.repeat,
-      altKey: event.altKey,
-      ctrlKey: event.ctrlKey,
-      metaKey: event.metaKey,
-      shiftKey: event.shiftKey
-    })
-  );
-  event.preventDefault();
-}
-keyboardInput.addEventListener("keydown", forwardMobileKey);
-keyboardInput.addEventListener("keyup", forwardMobileKey);
-keyboardInput.addEventListener("input", () => {
-  keyboardInput.value = "";
+keyboardInput.addEventListener("compositionstart", () => {
+  composing = true;
 });
-signOut.addEventListener("click", () => void (async () => {
-  try {
-    await request("/api/sign-out");
-  } catch {
-  }
-  stopPolling();
-  clearReconnectTimer();
-  rfb?.disconnect();
-  rfb = null;
-  csrfToken2 = null;
-  setUi({ kind: "pairing", error: null });
-})());
-viewer.addEventListener("pointerdown", updatePinch);
-viewer.addEventListener("pointermove", updatePinch);
-viewer.addEventListener("pointerup", (event) => {
-  pointers.delete(event.pointerId);
-  pinchDistance = pointerDistance();
+keyboardInput.addEventListener("compositionend", () => {
+  composing = false;
 });
-viewer.addEventListener("pointercancel", (event) => {
-  pointers.delete(event.pointerId);
-  pinchDistance = pointerDistance();
-});
-window.addEventListener("resize", applyScale);
+keyboardInput.addEventListener("keydown", forwardPhysicalKey);
+keyboardInput.addEventListener("keyup", forwardPhysicalKey);
+keyboardInput.addEventListener("beforeinput", handleBeforeInput);
+keyboardInput.addEventListener("input", (event) => handleInput(event));
+signOut.addEventListener("click", () => void signOutViewer());
+window.addEventListener("resize", applyViewportScaling);
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") startPolling();
-  else stopPolling();
+  if (document.visibilityState === "visible") {
+    startPolling();
+    void refreshStatus();
+  } else {
+    stopPolling();
+  }
 });
 window.addEventListener("pagehide", stopPolling);
 setUi(ui);

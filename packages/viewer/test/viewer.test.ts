@@ -26,16 +26,16 @@ describe("nextUi", () => {
     expect(ui.kind).toBe("view-only");
   });
 
-  it("only shows controlling when the server says this session owns input", () => {
+  it("only shows controlling after an explicit server-confirmed ownership request", () => {
     const notOwner = nextUi(
       { kind: "view-only", ownership: "agent-ready" },
-      { type: "ownership", state: "manual", isOwner: false },
+      { type: "ownership", state: "manual", canControl: false },
     );
     expect(notOwner.kind).toBe("view-only");
 
     const owner = nextUi(
       { kind: "view-only", ownership: "agent-ready" },
-      { type: "ownership", state: "manual", isOwner: true },
+      { type: "ownership", state: "manual", canControl: true },
     );
     expect(owner.kind).toBe("controlling");
   });

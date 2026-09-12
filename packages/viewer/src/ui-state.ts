@@ -3,8 +3,9 @@ import type { OwnershipState } from "@tab-goblin/protocol";
 export type ViewerUi =
   | { kind: "pairing"; error: string | null }
   | { kind: "connecting" }
-  | { kind: "view-only"; ownership: OwnershipState }
+  | { kind: "view-only"; ownership: Exclude<OwnershipState, "needs-attention"> }
   | { kind: "controlling" }
+  | { kind: "needs-attention" }
   | { kind: "reconnecting" }
   | { kind: "connection-lost" };
 
@@ -12,7 +13,7 @@ export type ViewerUiEvent =
   | { type: "paired" }
   | { type: "socket-open" }
   | { type: "socket-closed" }
-  | { type: "ownership"; state: OwnershipState; isOwner: boolean }
+  | { type: "ownership"; state: OwnershipState; canControl: boolean }
   | { type: "pair-failed"; message: string };
 
 export function scaleToFit(
@@ -51,8 +52,8 @@ export function nextUi(current: ViewerUi, event: ViewerUiEvent): ViewerUi {
     case "socket-closed":
       return current.kind === "pairing" ? current : { kind: "reconnecting" };
     case "ownership":
-      return event.isOwner
-        ? { kind: "controlling" }
-        : { kind: "view-only", ownership: event.state };
+      if (event.state === "needs-attention") return { kind: "needs-attention" };
+      if (event.canControl) return { kind: "controlling" };
+      return { kind: "view-only", ownership: event.state };
   }
 }

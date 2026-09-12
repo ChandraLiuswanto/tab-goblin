@@ -264,6 +264,28 @@ describe("start", () => {
     expect(probeSignal?.aborted).toBe(true);
     expect(runtime.state(workspaceId)).toBe("failed");
   }, 1_000);
+
+  it("does not extend the startup deadline when the wall clock rolls backward", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const wallClock = vi.spyOn(Date, "now")
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValue(-100);
+    const exec: PodmanExec = vi.fn(() => new Promise(() => {}));
+    const runtime = supervisor(exec, { startTimeoutMs: 20 });
+    let failure: unknown;
+
+    try {
+      void runtime.start("clock-rollback").catch((error: unknown) => {
+        failure = error;
+      });
+      await vi.advanceTimersByTimeAsync(25);
+      expect(failure).toMatchObject({ code: "runtime_unavailable" });
+    } finally {
+      wallClock.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("stop", () => {
@@ -311,24 +333,41 @@ describe("stop", () => {
     expect(runtime.state("owned-workspace")).toBe("failed");
   });
 
-  it("bounds a never-settling stop command and passes it an abort signal", async () => {
+  it("keeps a 30-second graceful-stop budget when the general operation timeout is short", async () => {
+    vi.useFakeTimers();
     const workspaceId = "stop-timeout";
     const podman = fakePodman({ state: "running", workspaceId });
     let stopSignal: AbortSignal | undefined;
     const exec: PodmanExec = vi.fn((args, signal) => {
       if (args[0] === "stop") {
         stopSignal = signal;
-        return new Promise(() => {});
+        return new Promise((_resolve, reject) => {
+          const onAbort = () => reject(signal?.reason ?? new Error("Stop aborted"));
+          if (signal?.aborted) onAbort();
+          else signal?.addEventListener("abort", onAbort, { once: true });
+        });
       }
       return podman.exec(args, signal);
     });
     const runtime = supervisor(exec, { operationTimeoutMs: 15 });
 
-    await expect(runtime.stop(workspaceId)).rejects.toMatchObject({ code: "runtime_unavailable" });
+    try {
+      const stopping = runtime.stop(workspaceId).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(stopSignal).toBeDefined();
+      expect(exec.mock.calls.find(([args]) => args[0] === "stop")?.[0]).toContain("20");
 
-    expect(stopSignal?.aborted).toBe(true);
-    expect(runtime.state(workspaceId)).toBe("failed");
-    expect(podman.calls.some((args) => args[0] === "rm")).toBe(false);
+      await vi.advanceTimersByTimeAsync(15);
+      expect(stopSignal?.aborted).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(29_985);
+      await expect(stopping).resolves.toMatchObject({ code: "runtime_unavailable" });
+      expect(stopSignal?.aborted).toBe(true);
+      expect(runtime.state(workspaceId)).toBe("failed");
+      expect(podman.calls.some((args) => args[0] === "rm")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   }, 1_000);
 });
 

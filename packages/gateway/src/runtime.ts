@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { tabGoblinError, type SessionState, type TabGoblinError } from "@tab-goblin/protocol";
 
 /**
@@ -24,7 +25,15 @@ export interface RuntimeSupervisorOptions {
   /** T9 production probes MUST cancel their request when this signal aborts. */
   probe: (cdpUrl: string, signal?: AbortSignal) => Promise<boolean>;
   startTimeoutMs?: number;
+  /**
+   * Overall staging-operation budget. Stop and startup cleanup use at least 30 seconds
+   * for discovery, then give a live container a fresh 30-second removal window so
+   * Podman's 20-second graceful stop always has bounded command overhead.
+   */
   operationTimeoutMs?: number;
+  /** Monotonic millisecond clock used for deadline accounting; defaults to performance.now. */
+  monotonicNow?: () => number;
+  /** @deprecated Use monotonicNow. Legacy clocks are guarded against backward jumps. */
   now?: () => number;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
@@ -45,6 +54,7 @@ interface PodmanResult {
 
 const DEFAULT_START_TIMEOUT_MS = 60_000;
 const DEFAULT_OPERATION_TIMEOUT_MS = 30_000;
+const MIN_STOP_OPERATION_TIMEOUT_MS = 30_000;
 const MAX_TIMER_MS = 2_147_483_647;
 const GRACEFUL_STOP_SECONDS = 20;
 const POLL_INTERVAL_MS = 500;
@@ -86,11 +96,29 @@ function duration(value: number | undefined, fallback: number, option: string): 
   return selected;
 }
 
+function guardLegacyClock(clock: () => number): () => number {
+  let highWater = clock();
+  let value = highWater;
+  let performanceMark = performance.now();
+
+  return () => {
+    const next = clock();
+    const nextPerformanceMark = performance.now();
+    const clockElapsed = Number.isFinite(next) && next > highWater ? next - highWater : 0;
+    const realElapsed = Math.max(0, nextPerformanceMark - performanceMark);
+    value += Math.max(clockElapsed, realElapsed);
+    if (Number.isFinite(next)) highWater = Math.max(highWater, next);
+    performanceMark = nextPerformanceMark;
+    return value;
+  };
+}
+
 export class RuntimeSupervisor {
   private readonly entries = new Map<string, Entry>();
   private readonly timeout: number;
   private readonly operationTimeout: number;
-  private readonly now: () => number;
+  private readonly stopOperationTimeout: number;
+  private readonly monotonicNow: () => number;
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
 
   constructor(private readonly options: RuntimeSupervisorOptions) {
@@ -100,7 +128,12 @@ export class RuntimeSupervisor {
       DEFAULT_OPERATION_TIMEOUT_MS,
       "operationTimeoutMs",
     );
-    this.now = options.now ?? Date.now;
+    this.stopOperationTimeout = Math.max(
+      this.operationTimeout,
+      MIN_STOP_OPERATION_TIMEOUT_MS,
+    );
+    this.monotonicNow = options.monotonicNow
+      ?? (options.now ? guardLegacyClock(options.now) : () => performance.now());
     this.sleep = options.sleep ?? ((ms, signal) => new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         signal?.removeEventListener("abort", onAbort);
@@ -177,7 +210,7 @@ export class RuntimeSupervisor {
     if (entry.stopping) return entry.stopping;
 
     const containerName = containerNameFor(workspaceId);
-    const deadline = this.deadline(this.operationTimeout);
+    const deadline = this.deadline(this.stopOperationTimeout);
     entry.stopping = this.withLifecycleLock(containerName, deadline, async () => {
       const state = await this.existingContainerState(containerName, workspaceId, deadline);
       if (state === null) return;
@@ -366,7 +399,7 @@ export class RuntimeSupervisor {
         }
         if (ready) return runtimeEndpoints;
 
-        const pause = Math.min(POLL_INTERVAL_MS, Math.max(1, deadline - this.now()));
+        const pause = Math.min(POLL_INTERVAL_MS, Math.max(1, deadline - this.monotonicNow()));
         await this.withDeadline(deadline, "wait to retry the browser runtime probe", (signal) =>
           this.sleep(pause, signal),
         );
@@ -405,7 +438,7 @@ export class RuntimeSupervisor {
   }
 
   private async cleanupOwned(workspaceId: string, containerName: string): Promise<void> {
-    const deadline = this.deadline(this.operationTimeout);
+    const deadline = this.deadline(this.stopOperationTimeout);
     const state = await this.existingContainerState(containerName, workspaceId, deadline);
     if (state !== null) await this.removeOwnedContainer(containerName, state, deadline);
   }
@@ -434,17 +467,22 @@ export class RuntimeSupervisor {
     state: string,
     deadline: number,
   ): Promise<void> {
+    let removalDeadline = deadline;
     if (!this.isStaleState(state)) {
+      removalDeadline = Math.max(
+        deadline,
+        this.deadline(MIN_STOP_OPERATION_TIMEOUT_MS),
+      );
       await this.requireSuccess(
         ["stop", "--ignore", "--time", String(GRACEFUL_STOP_SECONDS), containerName],
         "stop the browser runtime gracefully",
-        deadline,
+        removalDeadline,
       );
     }
     await this.requireSuccess(
       ["rm", "--ignore", containerName],
       "remove the stopped browser runtime",
-      deadline,
+      removalDeadline,
     );
   }
 
@@ -468,7 +506,7 @@ export class RuntimeSupervisor {
   }
 
   private deadline(timeout: number): number {
-    return this.now() + timeout;
+    return this.monotonicNow() + timeout;
   }
 
   private async withDeadline<T>(
@@ -476,7 +514,7 @@ export class RuntimeSupervisor {
     action: string,
     operation: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
-    const remaining = deadline - this.now();
+    const remaining = deadline - this.monotonicNow();
     if (remaining <= 0) {
       throw new DeadlineExceeded(unavailable(`Timed out while trying to ${action}`), Promise.resolve());
     }

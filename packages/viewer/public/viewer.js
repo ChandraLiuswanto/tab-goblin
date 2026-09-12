@@ -34005,6 +34005,7 @@ var workspaceId = external_exports.string().min(1).max(128);
 var agentId = external_exports.string().min(1).max(128);
 var cwd = external_exports.string().min(1).max(4096);
 var enrollment = external_exports.string().uuid();
+var gatewayInstanceId = external_exports.string().uuid();
 var lifecycleGeneration = external_exports.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 var scopedOperation = (op) => external_exports.object({ op: external_exports.literal(op), workspaceId }).strict();
 var AdminRequestSchema = external_exports.discriminatedUnion("op", [
@@ -34036,6 +34037,7 @@ var AdminRequestSchema = external_exports.discriminatedUnion("op", [
   external_exports.object({ op: external_exports.literal("resolve-enrollment"), enrollment }).strict(),
   external_exports.object({
     op: external_exports.literal("bind-enrollment"),
+    enrollment,
     cwd,
     agentId,
     workspaceId: workspaceId.nullable(),
@@ -34066,6 +34068,8 @@ var AdminResponseSchema = external_exports.discriminatedUnion("ok", [
     pairingExpiresAt: external_exports.string().max(64).optional(),
     lifecycleGeneration: lifecycleGeneration.optional(),
     protocolVersion: external_exports.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
+    // New on every gateway process. Plugins reconcile only when this changes.
+    gatewayInstanceId: gatewayInstanceId.optional(),
     binding: external_exports.object({ agentId, workspaceId }).strict().optional(),
     // Tool responses are operation-specific and validated/bounded by their producers.
     result: external_exports.unknown().optional()

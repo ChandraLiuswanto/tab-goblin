@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { EnrollmentRegistry } from "../../packages/gateway/src/enrollment.js";
 import { createConfigStore } from "../server/config-store.js";
 import { createLifecycleCoordinator } from "../server/lifecycle-coordinator.js";
 
@@ -172,7 +173,7 @@ describe("durable lifecycle coordinator", () => {
       { op: "reset-workspace", workspaceId: "live-workspace" },
       { op: "revoke-workspace", workspaceId: "revoked-workspace" },
       { op: "record-enrollment", enrollment: "11111111-1111-4111-8111-111111111111", cwd: "/live", workspaceId: "live-workspace", workspaceGeneration: 12 },
-      { op: "bind-enrollment", cwd: "/live", agentId: "live-agent", workspaceId: "live-workspace", agentGeneration: 11, workspaceGeneration: 12 },
+      { op: "bind-enrollment", enrollment: "11111111-1111-4111-8111-111111111111", cwd: "/live", agentId: "live-agent", workspaceId: "live-workspace", agentGeneration: 11, workspaceGeneration: 12 },
       { op: "session-open", agentId: "live-agent", workspaceId: "live-workspace", purpose: "interactive", agentGeneration: 11, workspaceGeneration: 12 },
     ]);
     expect(settings.read()).toMatchObject({ gatewayInstanceId: "22222222-2222-4222-8222-222222222222", revokedAgentIds: ["revoked-agent"], revokedWorkspaceIds: ["revoked-workspace"] });
@@ -186,6 +187,70 @@ describe("durable lifecycle coordinator", () => {
     await expect(coordinator.enableWorkspace("revoked-workspace", "/revoked")).resolves.toEqual({ ok: true });
     await expect(coordinator.openSession({ agentId: "new-agent", workspaceId: "revoked-workspace", cwd: "/revoked", purpose: "interactive", enrollment: "44444444-4444-4444-8444-444444444444" })).resolves.toMatchObject({ workspaceGeneration: 21 });
     expect(calls).toContainEqual({ op: "reset-workspace", workspaceId: "revoked-workspace" });
+  });
+
+  it("binds the retry nonce when an earlier recorded nonce response was lost", async () => {
+    const settings = store();
+    const gatewayInstanceId = "11111111-1111-4111-8111-111111111111";
+    const firstNonce = "22222222-2222-4222-8222-222222222222";
+    const retryNonce = "33333333-3333-4333-8333-333333333333";
+    await settings.update((current) => ({
+      ...current,
+      gatewayInstanceId,
+      enabled: true,
+      enabledWorkspaceCwds: ["/w"],
+    }));
+    const registry = new EnrollmentRegistry();
+    let loseFirstRecordResponse = true;
+    const gateway = { request: vi.fn(async (body: any) => {
+      if (body.op === "health") return { ok: true, protocolVersion: 1, gatewayInstanceId };
+      if (body.op === "record-enrollment") {
+        registry.record(body.enrollment, body.cwd, body.workspaceId, body.workspaceGeneration);
+        if (body.enrollment === firstNonce && loseFirstRecordResponse) {
+          loseFirstRecordResponse = false;
+          throw new Error("record response lost");
+        }
+        return { ok: true };
+      }
+      if (body.op === "bind-enrollment") {
+        const binding = registry.bind(body.enrollment, body.cwd, body.agentId, body.workspaceId, {
+          agentGeneration: body.agentGeneration,
+          workspaceGeneration: body.workspaceGeneration,
+        });
+        return binding
+          ? { ok: true }
+          : { ok: false, error: { code: "auth_failed", message: "no exact pending enrollment", retryable: false } };
+      }
+      if (body.op === "session-open") {
+        registry.noteSessionOpen(body.agentId, body.workspaceId, body.purpose, {
+          agentGeneration: body.agentGeneration,
+          workspaceGeneration: body.workspaceGeneration,
+        });
+        return { ok: true };
+      }
+      throw new Error(`unexpected operation: ${body.op}`);
+    }), notify: vi.fn(), close: vi.fn() } as any;
+    const coordinator = createLifecycleCoordinator(settings, gateway);
+    const session = { agentId: "agent", workspaceId: "ws", cwd: "/w", purpose: "interactive" as const };
+
+    await expect(coordinator.openSession({ ...session, enrollment: firstNonce })).resolves.toBeUndefined();
+    await expect(registry.authorize(firstNonce)).rejects.toMatchObject({ code: "not_enrolled" });
+    await expect(coordinator.openSession({ ...session, enrollment: retryNonce })).resolves.toEqual({
+      socketPath: settings.read().socketPath,
+      agentGeneration: 0,
+      workspaceGeneration: 0,
+    });
+    await expect(registry.authorize(retryNonce)).resolves.toMatchObject({
+      enrollment: retryNonce,
+      agentId: "agent",
+      workspaceId: "ws",
+      cwd: "/w",
+    });
+    await expect(registry.authorize(firstNonce)).rejects.toMatchObject({ code: "not_enrolled" });
+    expect(gateway.request.mock.calls
+      .map(([body]: any[]) => body)
+      .filter((body: any) => body.op === "bind-enrollment"))
+      .toEqual([expect.objectContaining({ enrollment: retryNonce })]);
   });
 
   it("rotates cleanup credentials across reload on the same gateway without clearing archive tombstones", async () => {

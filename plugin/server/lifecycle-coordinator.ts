@@ -300,7 +300,7 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
       }
       const recorded = await request({ op: "record-enrollment", enrollment: session.enrollment, cwd: session.cwd, workspaceId: session.workspaceId, workspaceGeneration });
       if (!recorded?.ok) return undefined;
-      const bound = await request({ op: "bind-enrollment", cwd: session.cwd, agentId: session.agentId, workspaceId: session.workspaceId, agentGeneration, workspaceGeneration });
+      const bound = await request({ op: "bind-enrollment", enrollment: session.enrollment, cwd: session.cwd, agentId: session.agentId, workspaceId: session.workspaceId, agentGeneration, workspaceGeneration });
       if (!bound?.ok) return undefined;
       await settings.update((value) => ({ ...value, activeAgentIds: [...new Set([...value.activeAgentIds, session.agentId])], agentGenerations: { ...value.agentGenerations, [session.agentId]: agentGeneration } }));
       const opened = await request({ op: "session-open", agentId: session.agentId, workspaceId: session.workspaceId, purpose: session.purpose, agentGeneration, workspaceGeneration });

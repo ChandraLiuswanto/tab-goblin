@@ -78,7 +78,7 @@ function enroll(registry: EnrollmentRegistry, options: { enrollment?: string; cw
   const agentId = options.agentId ?? "agent-1";
   const workspaceId = options.workspaceId ?? "ws-1";
   registry.record(enrollment, cwd, workspaceId);
-  registry.bind(cwd, agentId, workspaceId);
+  registry.bind(enrollment, cwd, agentId, workspaceId);
   registry.noteSessionOpen(agentId, workspaceId, "interactive");
 }
 
@@ -280,7 +280,20 @@ describe("admin request handling", () => {
       cwd: "/w/one",
       workspaceId: "ws-1",
     })).resolves.toEqual({ ok: true });
-    await expect(server.handle({ op: "bind-enrollment", cwd: "/w/one", agentId: "agent-1", workspaceId: "ws-1" })).resolves.toEqual({ ok: true });
+    await expect(server.handle({
+      op: "bind-enrollment",
+      enrollment: SECOND,
+      cwd: "/w/one",
+      agentId: "agent-1",
+      workspaceId: "ws-1",
+    })).resolves.toMatchObject({ ok: false, error: { code: "auth_failed" } });
+    await expect(server.handle({
+      op: "bind-enrollment",
+      enrollment: NONCE,
+      cwd: "/w/one",
+      agentId: "agent-1",
+      workspaceId: "ws-1",
+    })).resolves.toEqual({ ok: true });
     await expect(server.handle({ op: "session-open", agentId: "agent-1", workspaceId: "ws-1", purpose: "interactive" })).resolves.toEqual({ ok: true });
     await expect(server.handle({ op: "resolve-enrollment", enrollment: NONCE })).resolves.toEqual({
       ok: true,

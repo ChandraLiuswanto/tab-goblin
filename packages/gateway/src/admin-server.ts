@@ -757,12 +757,26 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
           binding: { agentId: binding.agentId!, workspaceId: binding.workspaceId! },
         };
       }
-      case "bind-enrollment":
-        enrollment.bind(request.cwd, request.agentId, request.workspaceId, {
-          agentGeneration: request.agentGeneration,
-          workspaceGeneration: request.workspaceGeneration,
-        });
+      case "bind-enrollment": {
+        const binding = enrollment.bind(
+          request.enrollment,
+          request.cwd,
+          request.agentId,
+          request.workspaceId,
+          {
+            agentGeneration: request.agentGeneration,
+            workspaceGeneration: request.workspaceGeneration,
+          },
+        );
+        if (!binding) {
+          throw tabGoblinError(
+            "auth_failed",
+            "Enrollment credential does not match a pending lifecycle record",
+            false,
+          );
+        }
         return { ok: true };
+      }
       case "session-open":
         enrollment.noteSessionOpen(request.agentId, request.workspaceId, request.purpose, {
           agentGeneration: request.agentGeneration,

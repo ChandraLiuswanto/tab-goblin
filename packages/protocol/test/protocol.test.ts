@@ -426,12 +426,19 @@ describe("admin and viewer wire contracts", () => {
       cwd: "/w/one",
       workspaceId: "w1",
     })).toMatchObject({ workspaceId: "w1", workspaceGeneration: 0 });
-    expect(AdminRequestSchema.parse({
+    expect(AdminRequestSchema.safeParse({
       op: "bind-enrollment",
       cwd: "/w/one",
       agentId: "a1",
       workspaceId: "w1",
-    })).toMatchObject({ agentGeneration: 0, workspaceGeneration: 0 });
+    }).success).toBe(false);
+    expect(AdminRequestSchema.parse({
+      op: "bind-enrollment",
+      enrollment,
+      cwd: "/w/one",
+      agentId: "a1",
+      workspaceId: "w1",
+    })).toMatchObject({ enrollment, agentGeneration: 0, workspaceGeneration: 0 });
     expect(AdminRequestSchema.parse({
       op: "session-open",
       agentId: "a1",

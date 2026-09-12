@@ -170,7 +170,7 @@ async function completeHandshake(socket: WebSocket): Promise<void> {
 
 function bindInteractive(registry: EnrollmentRegistry, enrollment: string, cwd: string, agent: string, workspace: string): void {
   registry.record(enrollment, cwd, workspace);
-  registry.bind(cwd, agent, workspace);
+  registry.bind(enrollment, cwd, agent, workspace);
   registry.noteSessionOpen(agent, workspace, "interactive");
 }
 

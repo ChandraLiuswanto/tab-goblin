@@ -53,6 +53,7 @@ export const AdminRequestSchema = z.discriminatedUnion("op", [
   z
     .object({
       op: z.literal("bind-enrollment"),
+      enrollment,
       cwd,
       agentId,
       workspaceId: workspaceId.nullable(),

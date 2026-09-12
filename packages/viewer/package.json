@@ -9,5 +9,5 @@
     "typecheck": "tsc --noEmit --target ES2023 --module ESNext --moduleResolution Bundler --lib ES2023,DOM --strict --skipLibCheck src/*.ts"
   },
   "dependencies": { "@novnc/novnc": "^1.6.0", "@tab-goblin/protocol": "*" },
-  "devDependencies": { "esbuild": "^0.28.2" }
+  "devDependencies": { "@types/novnc__novnc": "^1.6.0", "esbuild": "^0.28.2" }
 }

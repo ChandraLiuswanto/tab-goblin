@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { SessionStatusSchema } from "./session.js";
 
 export const VIEWER_COOKIE = "tg_viewer";
 export const CSRF_HEADER = "x-tabgoblin-csrf";
@@ -13,6 +14,12 @@ export const PairRequestSchema = z.object({ code: z.string().min(8).max(64) }).s
 export const PairResponseSchema = z
   .object({ workspaceId, csrfToken, viewOnly: z.boolean() })
   .strict();
+
+// Viewer status is session-specific: generic ownership alone never authorizes a viewer.
+export const ViewerStatusSchema = SessionStatusSchema.extend({
+  isOwner: z.boolean().default(false),
+});
+export type ViewerStatus = z.infer<typeof ViewerStatusSchema>;
 
 export const ViewerSessionSchema = z
   .object({

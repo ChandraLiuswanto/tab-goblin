@@ -30,6 +30,7 @@ import {
   VIEWER_COOKIE,
   VIEWER_SESSION_TTL_MS,
   ViewerSessionSchema,
+  ViewerStatusSchema,
 } from "../src/index.js";
 
 const NUL = String.fromCharCode(0);
@@ -223,17 +224,22 @@ describe("session and snapshot schemas", () => {
     expect(SESSION_STATES).toEqual(["stopped", "starting", "ready", "failed"]);
   });
 
-  it("accepts a bounded status", () => {
-    expect(
-      SessionStatusSchema.parse({
-        workspaceId: "w1",
-        sessionState: "ready",
-        ownership: { state: "agent-ready", generation: 1, owner: "agent" },
-        startedAt: "2026-09-12T00:00:00.000Z",
-        viewerUrl: null,
-        lastError: null,
-      }).workspaceId,
-    ).toBe("w1");
+  it("keeps generic session status separate from viewer-session ownership", () => {
+    const genericStatus = {
+      workspaceId: "w1",
+      sessionState: "ready",
+      ownership: { state: "agent-ready", generation: 1, owner: "agent" },
+      startedAt: "2026-09-12T00:00:00.000Z",
+      viewerUrl: null,
+      lastError: null,
+    };
+    expect(SessionStatusSchema.parse(genericStatus)).toMatchObject({
+      workspaceId: "w1",
+      ownership: { generation: 1 },
+    });
+    expect(ViewerStatusSchema.parse(genericStatus).isOwner).toBe(false);
+    expect(ViewerStatusSchema.parse({ ...genericStatus, isOwner: true }).isOwner).toBe(true);
+    expect(ViewerStatusSchema.safeParse({ ...genericStatus, isOwner: "true" }).success).toBe(false);
   });
 
   it("rejects a snapshot over the node cap", () => {

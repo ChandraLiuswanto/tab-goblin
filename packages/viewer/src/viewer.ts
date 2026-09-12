@@ -1,5 +1,5 @@
 import RFB from "@novnc/novnc";
-import { CSRF_HEADER, PairResponseSchema, SessionStatusSchema } from "@tab-goblin/protocol";
+import { CSRF_HEADER, PairResponseSchema, ViewerStatusSchema } from "@tab-goblin/protocol";
 import { nextUi, type ViewerUi } from "./ui-state.js";
 
 const STATUS_POLL_MS = 3_000;
@@ -39,13 +39,17 @@ let statusSequence = 0;
 let lastOwnershipGeneration = -1;
 let reconnectAttempts = 0;
 let transportConnected = false;
-let controlExplicitlyRequested = false;
 let ownershipActionPending = false;
 let signOutPending = false;
 let signOutAttempts = 0;
 let signOutFailure: string | null = null;
 let composing = false;
 let suppressInputText: string | null = null;
+let compositionText = "";
+let compositionCommitPending = false;
+let pinchStartDistance: number | null = null;
+let pinchStartScale = 1;
+let localViewportScale = 1;
 const pressedKeys = new Map<string, number>();
 const PHYSICAL_KEYSYMS: Readonly<Record<string, number>> = {
   Alt: 0xffe9,
@@ -119,9 +123,47 @@ function websocketUrl(): string {
 
 function applyViewportScaling(): void {
   if (!rfb) return;
-  // noVNC owns both its display scale and inverse pointer coordinate mapping.
+  const width = Math.max(1, Math.round(viewer.clientWidth * localViewportScale));
+  const height = Math.max(1, Math.round(viewer.clientHeight * localViewportScale));
+  // Resize noVNC's own target instead of CSS-transforming its canvas. This keeps
+  // noVNC's display scale and inverse pointer coordinate mapping in agreement.
+  screen.style.width = `${width}px`;
+  screen.style.height = `${height}px`;
   rfb.clipViewport = false;
+  rfb.scaleViewport = false;
   rfb.scaleViewport = true;
+}
+
+function touchDistance(touches: TouchList): number | null {
+  if (touches.length < 2) return null;
+  const [first, second] = [touches[0], touches[1]];
+  return Math.hypot(second.clientX - first.clientX, second.clientY - first.clientY);
+}
+
+function suppressNoVncPinch(event: TouchEvent): void {
+  const distance = touchDistance(event.touches);
+  if (event.type === "touchstart" && distance !== null) {
+    pinchStartDistance = distance;
+    pinchStartScale = localViewportScale;
+  }
+  if (pinchStartDistance !== null && distance !== null && event.type === "touchmove") {
+    localViewportScale = Math.min(3, Math.max(0.5, pinchStartScale * (distance / pinchStartDistance)));
+    applyViewportScaling();
+  }
+  if (pinchStartDistance === null) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  if ((event.type === "touchend" || event.type === "touchcancel") && event.touches.length < 2) {
+    pinchStartDistance = null;
+  }
+}
+
+function installPinchSuppression(): void {
+  const canvas = screen.querySelector<HTMLCanvasElement>("canvas");
+  if (!canvas) return;
+  for (const type of ["touchstart", "touchmove", "touchend", "touchcancel"] as const) {
+    canvas.addEventListener(type, suppressNoVncPinch, { capture: true, passive: false });
+  }
 }
 
 function clearReconnectTimer(): void {
@@ -153,7 +195,6 @@ function connectVnc(): void {
   clearReconnectTimer();
   const connectionEpoch = ++transportEpoch;
   transportConnected = false;
-  controlExplicitlyRequested = false;
   invalidateStatusRequests();
   rfb?.disconnect();
   rfb = new RFB(screen, websocketUrl());
@@ -165,13 +206,13 @@ function connectVnc(): void {
     reconnectAttempts = 0;
     setUi(nextUi(ui, { type: "socket-open" }));
     applyViewportScaling();
+    installPinchSuppression();
     startPolling();
     void refreshStatus();
   });
   rfb.addEventListener("disconnect", () => {
     if (connectionEpoch !== transportEpoch || !csrfToken) return;
     transportConnected = false;
-    controlExplicitlyRequested = false;
     pressedKeys.clear();
     invalidateStatusRequests();
     setUi(nextUi(ui, { type: "socket-closed" }));
@@ -206,15 +247,14 @@ async function refreshStatus(): Promise<void> {
       signal: controller.signal,
     });
     if (!response.ok) return;
-    const parsed = SessionStatusSchema.safeParse(await response.json());
+    const parsed = ViewerStatusSchema.safeParse(await response.json());
     if (!parsed.success || requestEpoch !== transportEpoch || requestSequence !== statusSequence || !transportConnected) {
       return;
     }
     const ownership = parsed.data.ownership;
     if (ownership.generation < lastOwnershipGeneration) return;
     lastOwnershipGeneration = ownership.generation;
-    const canControl =
-      controlExplicitlyRequested && ownership.state === "manual" && ownership.owner === "viewer";
+    const canControl = parsed.data.isOwner && ownership.state === "manual" && ownership.owner === "viewer";
     setUi(nextUi(ui, { type: "ownership", state: ownership.state, canControl }));
   } catch {
     // Request cancellation, stale responses, and temporary failures always leave the current UI fail-closed.
@@ -255,7 +295,6 @@ async function pair(): Promise<void> {
     reconnectAttempts = 0;
     signOutAttempts = 0;
     signOutFailure = null;
-    controlExplicitlyRequested = false;
     setUi(nextUi(ui, { type: "paired" }));
     connectVnc();
   } catch {
@@ -272,10 +311,8 @@ async function requestOwnership(path: "/api/take-control" | "/api/reclaim", body
   try {
     const response = await request(path, body);
     if (!response.ok) throw new Error("request rejected");
-    controlExplicitlyRequested = true;
     await refreshStatus();
   } catch {
-    controlExplicitlyRequested = false;
     if (rfb) rfb.viewOnly = true;
   } finally {
     ownershipActionPending = false;
@@ -285,7 +322,6 @@ async function requestOwnership(path: "/api/take-control" | "/api/reclaim", body
 
 async function returnControl(): Promise<void> {
   if (!canSendInput()) return;
-  controlExplicitlyRequested = false;
   setUi({ kind: "view-only", ownership: "returning-control" });
   try {
     const response = await request("/api/return-to-agent");
@@ -332,19 +368,43 @@ function forwardPhysicalKey(event: KeyboardEvent): void {
   }
 }
 
+function finishComposition(text: string): void {
+  compositionCommitPending = false;
+  compositionText = "";
+  if (!text) return;
+  sendCommittedText(text);
+  suppressInputText = text;
+  keyboardInput.value = "";
+}
+
 function handleBeforeInput(event: InputEvent): void {
-  if (!canSendInput() || event.inputType === "insertCompositionText") return;
-  if (!event.inputType.startsWith("insert") || !event.data) return;
-  sendCommittedText(event.data);
-  suppressInputText = event.data;
+  if (composing || event.inputType === "insertCompositionText") {
+    if (event.data) compositionText = event.data;
+    return;
+  }
+  if (!canSendInput() || !event.inputType.startsWith("insert") || !event.data) return;
+  if (event.inputType === "insertFromComposition") {
+    finishComposition(event.data);
+  } else {
+    sendCommittedText(event.data);
+    suppressInputText = event.data;
+  }
   event.preventDefault();
 }
 
 function handleInput(event: InputEvent): void {
+  if (composing || event.inputType === "insertCompositionText") {
+    if (event.data) compositionText = event.data;
+    return;
+  }
   const text = event.data ?? keyboardInput.value;
   keyboardInput.value = "";
   if (!canSendInput() || !text) {
     suppressInputText = null;
+    return;
+  }
+  if (event.inputType === "insertFromComposition" && compositionCommitPending) {
+    finishComposition(text);
     return;
   }
   if (text !== suppressInputText) sendCommittedText(text);
@@ -354,7 +414,6 @@ function handleInput(event: InputEvent): void {
 async function signOutViewer(): Promise<void> {
   if (!csrfToken || signOutPending || signOutAttempts >= MAX_SIGN_OUT_ATTEMPTS) return;
   signOutPending = true;
-  controlExplicitlyRequested = false;
   if (rfb) rfb.viewOnly = true;
   setUi(ui);
   try {
@@ -398,9 +457,16 @@ reclaimControl.addEventListener("click", () => {
 keyboardToggle.addEventListener("click", () => keyboardInput.focus());
 keyboardInput.addEventListener("compositionstart", () => {
   composing = true;
+  compositionCommitPending = false;
+  compositionText = "";
 });
-keyboardInput.addEventListener("compositionend", () => {
+keyboardInput.addEventListener("compositionend", (event) => {
   composing = false;
+  if (event.data) compositionText = event.data;
+  compositionCommitPending = true;
+  queueMicrotask(() => {
+    if (compositionCommitPending) finishComposition(compositionText);
+  });
 });
 keyboardInput.addEventListener("keydown", forwardPhysicalKey);
 keyboardInput.addEventListener("keyup", forwardPhysicalKey);

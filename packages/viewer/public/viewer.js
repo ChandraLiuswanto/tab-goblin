@@ -34060,6 +34060,9 @@ var workspaceId2 = external_exports.string().min(1).max(128);
 var csrfToken = external_exports.string().min(1).max(256);
 var PairRequestSchema = external_exports.object({ code: external_exports.string().min(8).max(64) }).strict();
 var PairResponseSchema = external_exports.object({ workspaceId: workspaceId2, csrfToken, viewOnly: external_exports.boolean() }).strict();
+var ViewerStatusSchema = SessionStatusSchema.extend({
+  isOwner: external_exports.boolean().default(false)
+});
 var ViewerSessionSchema = external_exports.object({
   sessionId: external_exports.string().min(1).max(128),
   workspaceId: workspaceId2,
@@ -34120,13 +34123,17 @@ var statusSequence = 0;
 var lastOwnershipGeneration = -1;
 var reconnectAttempts = 0;
 var transportConnected = false;
-var controlExplicitlyRequested = false;
 var ownershipActionPending = false;
 var signOutPending = false;
 var signOutAttempts = 0;
 var signOutFailure = null;
 var composing = false;
 var suppressInputText = null;
+var compositionText = "";
+var compositionCommitPending = false;
+var pinchStartDistance = null;
+var pinchStartScale = 1;
+var localViewportScale = 1;
 var pressedKeys = /* @__PURE__ */ new Map();
 var PHYSICAL_KEYSYMS = {
   Alt: 65513,
@@ -34194,8 +34201,42 @@ function websocketUrl() {
 }
 function applyViewportScaling() {
   if (!rfb) return;
+  const width = Math.max(1, Math.round(viewer.clientWidth * localViewportScale));
+  const height = Math.max(1, Math.round(viewer.clientHeight * localViewportScale));
+  screen.style.width = `${width}px`;
+  screen.style.height = `${height}px`;
   rfb.clipViewport = false;
+  rfb.scaleViewport = false;
   rfb.scaleViewport = true;
+}
+function touchDistance(touches) {
+  if (touches.length < 2) return null;
+  const [first, second] = [touches[0], touches[1]];
+  return Math.hypot(second.clientX - first.clientX, second.clientY - first.clientY);
+}
+function suppressNoVncPinch(event) {
+  const distance = touchDistance(event.touches);
+  if (event.type === "touchstart" && distance !== null) {
+    pinchStartDistance = distance;
+    pinchStartScale = localViewportScale;
+  }
+  if (pinchStartDistance !== null && distance !== null && event.type === "touchmove") {
+    localViewportScale = Math.min(3, Math.max(0.5, pinchStartScale * (distance / pinchStartDistance)));
+    applyViewportScaling();
+  }
+  if (pinchStartDistance === null) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  if ((event.type === "touchend" || event.type === "touchcancel") && event.touches.length < 2) {
+    pinchStartDistance = null;
+  }
+}
+function installPinchSuppression() {
+  const canvas = screen.querySelector("canvas");
+  if (!canvas) return;
+  for (const type of ["touchstart", "touchmove", "touchend", "touchcancel"]) {
+    canvas.addEventListener(type, suppressNoVncPinch, { capture: true, passive: false });
+  }
 }
 function clearReconnectTimer() {
   if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
@@ -34223,7 +34264,6 @@ function connectVnc() {
   clearReconnectTimer();
   const connectionEpoch = ++transportEpoch;
   transportConnected = false;
-  controlExplicitlyRequested = false;
   invalidateStatusRequests();
   rfb?.disconnect();
   rfb = new RFB(screen, websocketUrl());
@@ -34235,13 +34275,13 @@ function connectVnc() {
     reconnectAttempts = 0;
     setUi(nextUi(ui, { type: "socket-open" }));
     applyViewportScaling();
+    installPinchSuppression();
     startPolling();
     void refreshStatus();
   });
   rfb.addEventListener("disconnect", () => {
     if (connectionEpoch !== transportEpoch || !csrfToken2) return;
     transportConnected = false;
-    controlExplicitlyRequested = false;
     pressedKeys.clear();
     invalidateStatusRequests();
     setUi(nextUi(ui, { type: "socket-closed" }));
@@ -34274,14 +34314,14 @@ async function refreshStatus() {
       signal: controller.signal
     });
     if (!response.ok) return;
-    const parsed = SessionStatusSchema.safeParse(await response.json());
+    const parsed = ViewerStatusSchema.safeParse(await response.json());
     if (!parsed.success || requestEpoch !== transportEpoch || requestSequence !== statusSequence || !transportConnected) {
       return;
     }
     const ownership = parsed.data.ownership;
     if (ownership.generation < lastOwnershipGeneration) return;
     lastOwnershipGeneration = ownership.generation;
-    const canControl = controlExplicitlyRequested && ownership.state === "manual" && ownership.owner === "viewer";
+    const canControl = parsed.data.isOwner && ownership.state === "manual" && ownership.owner === "viewer";
     setUi(nextUi(ui, { type: "ownership", state: ownership.state, canControl }));
   } catch {
   } finally {
@@ -34317,7 +34357,6 @@ async function pair() {
     reconnectAttempts = 0;
     signOutAttempts = 0;
     signOutFailure = null;
-    controlExplicitlyRequested = false;
     setUi(nextUi(ui, { type: "paired" }));
     connectVnc();
   } catch {
@@ -34333,10 +34372,8 @@ async function requestOwnership(path, body) {
   try {
     const response = await request(path, body);
     if (!response.ok) throw new Error("request rejected");
-    controlExplicitlyRequested = true;
     await refreshStatus();
   } catch {
-    controlExplicitlyRequested = false;
     if (rfb) rfb.viewOnly = true;
   } finally {
     ownershipActionPending = false;
@@ -34345,7 +34382,6 @@ async function requestOwnership(path, body) {
 }
 async function returnControl() {
   if (!canSendInput()) return;
-  controlExplicitlyRequested = false;
   setUi({ kind: "view-only", ownership: "returning-control" });
   try {
     const response = await request("/api/return-to-agent");
@@ -34387,18 +34423,41 @@ function forwardPhysicalKey(event) {
     event.preventDefault();
   }
 }
+function finishComposition(text) {
+  compositionCommitPending = false;
+  compositionText = "";
+  if (!text) return;
+  sendCommittedText(text);
+  suppressInputText = text;
+  keyboardInput.value = "";
+}
 function handleBeforeInput(event) {
-  if (!canSendInput() || event.inputType === "insertCompositionText") return;
-  if (!event.inputType.startsWith("insert") || !event.data) return;
-  sendCommittedText(event.data);
-  suppressInputText = event.data;
+  if (composing || event.inputType === "insertCompositionText") {
+    if (event.data) compositionText = event.data;
+    return;
+  }
+  if (!canSendInput() || !event.inputType.startsWith("insert") || !event.data) return;
+  if (event.inputType === "insertFromComposition") {
+    finishComposition(event.data);
+  } else {
+    sendCommittedText(event.data);
+    suppressInputText = event.data;
+  }
   event.preventDefault();
 }
 function handleInput(event) {
+  if (composing || event.inputType === "insertCompositionText") {
+    if (event.data) compositionText = event.data;
+    return;
+  }
   const text = event.data ?? keyboardInput.value;
   keyboardInput.value = "";
   if (!canSendInput() || !text) {
     suppressInputText = null;
+    return;
+  }
+  if (event.inputType === "insertFromComposition" && compositionCommitPending) {
+    finishComposition(text);
     return;
   }
   if (text !== suppressInputText) sendCommittedText(text);
@@ -34407,7 +34466,6 @@ function handleInput(event) {
 async function signOutViewer() {
   if (!csrfToken2 || signOutPending || signOutAttempts >= MAX_SIGN_OUT_ATTEMPTS) return;
   signOutPending = true;
-  controlExplicitlyRequested = false;
   if (rfb) rfb.viewOnly = true;
   setUi(ui);
   try {
@@ -34447,9 +34505,16 @@ reclaimControl.addEventListener("click", () => {
 keyboardToggle.addEventListener("click", () => keyboardInput.focus());
 keyboardInput.addEventListener("compositionstart", () => {
   composing = true;
+  compositionCommitPending = false;
+  compositionText = "";
 });
-keyboardInput.addEventListener("compositionend", () => {
+keyboardInput.addEventListener("compositionend", (event) => {
   composing = false;
+  if (event.data) compositionText = event.data;
+  compositionCommitPending = true;
+  queueMicrotask(() => {
+    if (compositionCommitPending) finishComposition(compositionText);
+  });
 });
 keyboardInput.addEventListener("keydown", forwardPhysicalKey);
 keyboardInput.addEventListener("keyup", forwardPhysicalKey);

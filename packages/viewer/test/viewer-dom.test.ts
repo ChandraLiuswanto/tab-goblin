@@ -84,6 +84,7 @@ function status(
   generation: number,
   state: "agent-ready" | "taking-control" | "manual" | "returning-control" | "needs-attention" = "agent-ready",
   owner: "agent" | "viewer" | null = "agent",
+  isOwner?: boolean,
 ): object {
   return {
     workspaceId: "workspace-a",
@@ -92,6 +93,7 @@ function status(
     startedAt: null,
     viewerUrl: null,
     lastError: null,
+    ...(isOwner === undefined ? {} : { isOwner }),
   };
 }
 
@@ -185,7 +187,7 @@ describe("viewer DOM and transport behavior", () => {
     vi.resetModules();
   });
 
-  it("uses noVNC viewport scaling and never forwards Ctrl-wheel/pinch helpers as remote input", async () => {
+  it("gives the noVNC target real viewport dimensions before enabling coordinate-aware scaling", async () => {
     const fetchMock = vi.fn(async (path: string) => {
       if (path === "/api/pair") return response({ workspaceId: "workspace-a", csrfToken: "csrf-token", viewOnly: true });
       return response(status(1));
@@ -195,9 +197,38 @@ describe("viewer DOM and transport behavior", () => {
 
     expect(rfb.scaleViewport).toBe(true);
     expect(rfb.clipViewport).toBe(false);
+    expect(elements.get("screen")!.style.width).toBe("390px");
+    expect(elements.get("screen")!.style.height).toBe("844px");
     expect(elements.get("screen")!.style.transform).toBeUndefined();
-    elements.get("viewer")!.dispatchEvent(eventWithData("wheel", { ctrlKey: true }));
+  });
+
+  it("captures multi-touch on the real noVNC canvas, locally scales its target, and suppresses the remote Ctrl-wheel gesture path", async () => {
+    const fetchMock = vi.fn(async (path: string) => {
+      if (path === "/api/pair") return response({ workspaceId: "workspace-a", csrfToken: "csrf-token", viewOnly: true });
+      return response(status(1));
+    });
+    const { elements } = await boot(fetchMock);
+    const rfb = await pairAndConnect(elements);
+    const canvas = elements.get("screen")!.canvas!;
+    let noVncGestureEvents = 0;
+    canvas.addEventListener("touchmove", () => {
+      noVncGestureEvents += 1;
+      rfb.sentKeys.push([0xffe3, "ControlLeft", true]);
+    });
+
+    canvas.dispatchEvent(eventWithData("touchstart", {
+      touches: [{ clientX: 20, clientY: 20 }, { clientX: 80, clientY: 20 }],
+    }));
+    const move = eventWithData("touchmove", {
+      touches: [{ clientX: 10, clientY: 20 }, { clientX: 110, clientY: 20 }],
+    });
+    canvas.dispatchEvent(move);
+    canvas.dispatchEvent(eventWithData("touchend", { touches: [] }));
+
+    expect(move.defaultPrevented).toBe(true);
+    expect(noVncGestureEvents).toBe(0);
     expect(rfb.sentKeys).toEqual([]);
+    expect(elements.get("screen")!.style.width).toBe("650px");
   });
 
   it("sends committed IME, emoji, dictation, and physical-key events once after server-authorized control", async () => {
@@ -208,7 +239,7 @@ describe("viewer DOM and transport behavior", () => {
         controlsRequested = true;
         return response({});
       }
-      return response(controlsRequested ? status(2, "manual", "viewer") : status(1));
+      return response(controlsRequested ? status(2, "manual", "viewer", true) : status(1));
     });
     const { elements } = await boot(fetchMock);
     const rfb = await pairAndConnect(elements);
@@ -218,9 +249,22 @@ describe("viewer DOM and transport behavior", () => {
 
     const input = elements.get("keyboard-input")!;
     input.dispatchEvent(new Event("compositionstart"));
-    input.dispatchEvent(eventWithData("beforeinput", { inputType: "insertCompositionText", data: "🙂" }));
-    input.dispatchEvent(new Event("compositionend"));
-    input.dispatchEvent(eventWithData("beforeinput", { inputType: "insertFromComposition", data: "🙂" }));
+    input.value = "n";
+    input.dispatchEvent(eventWithData("beforeinput", { inputType: "insertCompositionText", data: "n" }));
+    input.dispatchEvent(eventWithData("input", { inputType: "insertCompositionText", data: "n" }));
+    expect(input.value).toBe("n");
+    input.value = "ni";
+    input.dispatchEvent(eventWithData("beforeinput", { inputType: "insertCompositionText", data: "ni" }));
+    input.dispatchEvent(eventWithData("input", { inputType: "insertCompositionText", data: "ni" }));
+    input.dispatchEvent(eventWithData("compositionend", { data: "你" }));
+    input.dispatchEvent(eventWithData("beforeinput", { inputType: "insertFromComposition", data: "你" }));
+    input.dispatchEvent(eventWithData("input", { inputType: "insertFromComposition", data: "你" }));
+    input.dispatchEvent(new Event("compositionstart"));
+    input.dispatchEvent(eventWithData("input", { inputType: "insertCompositionText", data: "z" }));
+    input.dispatchEvent(eventWithData("compositionend", { data: "字" }));
+    input.dispatchEvent(eventWithData("input", { inputType: "insertCompositionText", data: "字" }));
+    await flush();
+    input.dispatchEvent(eventWithData("beforeinput", { inputType: "insertText", data: "🙂" }));
     input.dispatchEvent(eventWithData("input", { data: "🙂" }));
     input.dispatchEvent(eventWithData("beforeinput", { inputType: "insertText", data: "ok" }));
     input.dispatchEvent(eventWithData("input", { data: "ok" }));
@@ -228,6 +272,8 @@ describe("viewer DOM and transport behavior", () => {
     input.dispatchEvent(eventWithData("keyup", { key: "Enter", code: "Enter", isComposing: false }));
 
     expect(rfb.sentKeys).toEqual([
+      [0x01000000 | 0x4f60, null, undefined],
+      [0x01000000 | 0x5b57, null, undefined],
       [0x01000000 | 0x1f642, null, undefined],
       [0x6f, null, undefined],
       [0x6b, null, undefined],
@@ -263,6 +309,25 @@ describe("viewer DOM and transport behavior", () => {
     expect(elements.get("banner")!.textContent).toBe("connection lost");
   });
 
+  it("requires the session-specific isOwner status flag, not generic viewer ownership, before enabling input", async () => {
+    let controlsRequested = false;
+    const fetchMock = vi.fn(async (path: string) => {
+      if (path === "/api/pair") return response({ workspaceId: "workspace-a", csrfToken: "csrf-token", viewOnly: true });
+      if (path === "/api/take-control") {
+        controlsRequested = true;
+        return response({});
+      }
+      return response(controlsRequested ? status(2, "manual", "viewer") : status(1));
+    });
+    const { elements } = await boot(fetchMock);
+    const rfb = await pairAndConnect(elements);
+    elements.get("take-control")!.dispatchEvent(new Event("click"));
+    await flush();
+
+    expect(rfb.viewOnly).toBe(true);
+    expect(elements.get("banner")!.textContent).toBe("view only");
+  });
+
   it("rejects stale and invalidated status results so they cannot restore control", async () => {
     let resolveOld!: (value: Response) => void;
     const oldStatus = new Promise<Response>((resolve) => {
@@ -276,7 +341,7 @@ describe("viewer DOM and transport behavior", () => {
         return Promise.resolve(response({}));
       }
       if (!controlsRequested) return oldStatus;
-      return Promise.resolve(response(status(6, "manual", "viewer")));
+      return Promise.resolve(response(status(6, "manual", "viewer", true)));
     });
     const { elements } = await boot(fetchMock);
     const rfb = await pairAndConnect(elements);
@@ -284,7 +349,7 @@ describe("viewer DOM and transport behavior", () => {
     await flush();
     expect(rfb.viewOnly).toBe(false);
 
-    resolveOld(response(status(5, "manual", "viewer")));
+    resolveOld(response(status(5, "manual", "viewer", true)));
     await flush();
     expect(rfb.viewOnly).toBe(false);
   });

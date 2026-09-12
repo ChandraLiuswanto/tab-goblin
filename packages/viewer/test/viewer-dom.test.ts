@@ -7,12 +7,30 @@ const noVnc = vi.hoisted(() => {
     clipViewport = false;
     disconnected = false;
     readonly sentKeys: Array<[number, string | null | undefined, boolean | undefined]> = [];
+    readonly rawTouchEvents: string[] = [];
+    readonly activeTouchIds = new Set<number>();
+    unknownTouchEnds = 0;
 
     constructor(
       readonly target: unknown,
       readonly url: string,
     ) {
       super();
+      const canvas = (target as { querySelector?: (selector: string) => FakeElement | null }).querySelector?.("canvas");
+      canvas?.addEventListener("touchstart", (event) => {
+        const touch = (event as TouchEvent).changedTouches[0];
+        this.rawTouchEvents.push(`start-${touch.identifier}`);
+        this.activeTouchIds.add(touch.identifier);
+      });
+      canvas?.addEventListener("touchmove", (event) => {
+        const touch = (event as TouchEvent).changedTouches[0];
+        this.rawTouchEvents.push(`move-${touch.identifier}`);
+      });
+      canvas?.addEventListener("touchend", (event) => {
+        const touch = (event as TouchEvent).changedTouches[0];
+        this.rawTouchEvents.push(`end-${touch.identifier}`);
+        if (!this.activeTouchIds.delete(touch.identifier)) this.unknownTouchEnds += 1;
+      });
       instances.push(this);
     }
 
@@ -40,8 +58,9 @@ class FakeClassList {
   }
 }
 
-class FakeElement extends EventTarget {
+class FakeElement {
   readonly classList = new FakeClassList();
+  private readonly listeners = new Map<string, Array<{ listener: EventListenerOrEventListenerObject; capture: boolean }>>();
   readonly style: Record<string, string> = {};
   textContent = "";
   value = "";
@@ -51,8 +70,40 @@ class FakeElement extends EventTarget {
   focused = false;
   canvas: FakeElement | null = null;
 
-  constructor(readonly id = "") {
-    super();
+  constructor(readonly id = "") {}
+
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | AddEventListenerOptions): void {
+    if (!listener) return;
+    const capture = typeof options === "boolean" ? options : options?.capture === true;
+    const listeners = this.listeners.get(type) ?? [];
+    listeners.push({ listener, capture });
+    this.listeners.set(type, listeners);
+  }
+
+  removeEventListener(type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | EventListenerOptions): void {
+    const capture = typeof options === "boolean" ? options : options?.capture === true;
+    const listeners = this.listeners.get(type);
+    if (!listeners || !listener) return;
+    this.listeners.set(type, listeners.filter((entry) => entry.listener !== listener || entry.capture !== capture));
+  }
+
+  dispatchEvent(event: Event): boolean {
+    const listeners = [...(this.listeners.get(event.type) ?? [])].sort((a, b) => Number(b.capture) - Number(a.capture));
+    let stopped = false;
+    const stopImmediately = event.stopImmediatePropagation.bind(event);
+    Object.defineProperty(event, "stopImmediatePropagation", {
+      configurable: true,
+      value: () => {
+        stopped = true;
+        stopImmediately();
+      },
+    });
+    for (const { listener } of listeners) {
+      if (stopped) break;
+      if (typeof listener === "function") listener.call(this, event);
+      else listener.handleEvent(event);
+    }
+    return !event.defaultPrevented;
   }
 
   focus(): void {
@@ -202,7 +253,7 @@ describe("viewer DOM and transport behavior", () => {
     expect(elements.get("screen")!.style.transform).toBeUndefined();
   });
 
-  it("captures multi-touch on the real noVNC canvas, locally scales its target, and suppresses the remote Ctrl-wheel gesture path", async () => {
+  it("keeps staggered raw touches intact while locally handling generated pinch gestures", async () => {
     const fetchMock = vi.fn(async (path: string) => {
       if (path === "/api/pair") return response({ workspaceId: "workspace-a", csrfToken: "csrf-token", viewOnly: true });
       return response(status(1));
@@ -210,23 +261,43 @@ describe("viewer DOM and transport behavior", () => {
     const { elements } = await boot(fetchMock);
     const rfb = await pairAndConnect(elements);
     const canvas = elements.get("screen")!.canvas!;
-    let noVncGestureEvents = 0;
-    canvas.addEventListener("touchmove", () => {
-      noVncGestureEvents += 1;
-      rfb.sentKeys.push([0xffe3, "ControlLeft", true]);
+    let remotePinchConversions = 0;
+    canvas.addEventListener("gesturemove", (event) => {
+      if ((event as CustomEvent<{ type: string }>).detail.type === "pinch") {
+        remotePinchConversions += 1;
+        rfb.sentKeys.push([0xffe3, "ControlLeft", true]);
+      }
     });
+    const touch = (identifier: number, clientX: number, clientY: number) => ({ identifier, clientX, clientY });
+    const rawTouch = (type: "touchstart" | "touchmove" | "touchend", touches: object[], changedTouches: object[]) =>
+      canvas.dispatchEvent(eventWithData(type, { touches, changedTouches }));
 
-    canvas.dispatchEvent(eventWithData("touchstart", {
-      touches: [{ clientX: 20, clientY: 20 }, { clientX: 80, clientY: 20 }],
-    }));
-    const move = eventWithData("touchmove", {
-      touches: [{ clientX: 10, clientY: 20 }, { clientX: 110, clientY: 20 }],
-    });
+    // This is the real GestureHandler ordering: finger A, then B, lift A, then B.
+    const fingerA = touch(1, 20, 20);
+    const fingerB = touch(2, 80, 20);
+    rawTouch("touchstart", [fingerA], [fingerA]);
+    rawTouch("touchstart", [fingerA, fingerB], [fingerB]);
+    const movedA = touch(1, 10, 20);
+    const movedB = touch(2, 110, 20);
+    rawTouch("touchmove", [movedA, fingerB], [movedA]);
+    rawTouch("touchmove", [movedA, movedB], [movedB]);
+    canvas.dispatchEvent(eventWithData("gesturestart", { detail: { type: "pinch", magnitudeX: 60, magnitudeY: 0 } }));
+    const move = eventWithData("gesturemove", { detail: { type: "pinch", magnitudeX: 100, magnitudeY: 0 } });
     canvas.dispatchEvent(move);
-    canvas.dispatchEvent(eventWithData("touchend", { touches: [] }));
+    rawTouch("touchend", [fingerB], [fingerA]);
+    canvas.dispatchEvent(eventWithData("gestureend", { detail: { type: "pinch", magnitudeX: 100, magnitudeY: 0 } }));
+    rawTouch("touchend", [], [fingerB]);
 
+    // A later single touch must still reach noVNC after the completed pinch sequence.
+    const fingerC = touch(3, 40, 40);
+    rawTouch("touchstart", [fingerC], [fingerC]);
+    rawTouch("touchend", [], [fingerC]);
+
+    expect(rfb.rawTouchEvents).toEqual(["start-1", "start-2", "move-1", "move-2", "end-1", "end-2", "start-3", "end-3"]);
+    expect(rfb.unknownTouchEnds).toBe(0);
+    expect(rfb.activeTouchIds).toEqual(new Set());
     expect(move.defaultPrevented).toBe(true);
-    expect(noVncGestureEvents).toBe(0);
+    expect(remotePinchConversions).toBe(0);
     expect(rfb.sentKeys).toEqual([]);
     expect(elements.get("screen")!.style.width).toBe("650px");
   });

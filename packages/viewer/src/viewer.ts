@@ -47,7 +47,7 @@ let composing = false;
 let suppressInputText: string | null = null;
 let compositionText = "";
 let compositionCommitPending = false;
-let pinchStartDistance: number | null = null;
+let pinchStartMagnitude: number | null = null;
 let pinchStartScale = 1;
 let localViewportScale = 1;
 const pressedKeys = new Map<string, number>();
@@ -134,35 +134,38 @@ function applyViewportScaling(): void {
   rfb.scaleViewport = true;
 }
 
-function touchDistance(touches: TouchList): number | null {
-  if (touches.length < 2) return null;
-  const [first, second] = [touches[0], touches[1]];
-  return Math.hypot(second.clientX - first.clientX, second.clientY - first.clientY);
-}
+type NoVncGestureDetail = {
+  type?: string;
+  magnitudeX?: number;
+  magnitudeY?: number;
+};
 
-function suppressNoVncPinch(event: TouchEvent): void {
-  const distance = touchDistance(event.touches);
-  if (event.type === "touchstart" && distance !== null) {
-    pinchStartDistance = distance;
+function suppressGeneratedPinch(event: Event): void {
+  const detail = (event as CustomEvent<NoVncGestureDetail>).detail;
+  if (detail?.type !== "pinch") return;
+
+  const magnitude = Math.hypot(detail.magnitudeX ?? 0, detail.magnitudeY ?? 0);
+  if (event.type === "gesturestart") {
+    pinchStartMagnitude = magnitude > 0 ? magnitude : null;
     pinchStartScale = localViewportScale;
-  }
-  if (pinchStartDistance !== null && distance !== null && event.type === "touchmove") {
-    localViewportScale = Math.min(3, Math.max(0.5, pinchStartScale * (distance / pinchStartDistance)));
+  } else if (event.type === "gesturemove" && pinchStartMagnitude !== null) {
+    localViewportScale = Math.min(3, Math.max(0.5, pinchStartScale * (magnitude / pinchStartMagnitude)));
     applyViewportScaling();
+  } else if (event.type === "gestureend") {
+    pinchStartMagnitude = null;
   }
-  if (pinchStartDistance === null) return;
+
+  // Raw touch events must always reach GestureHandler. Stop only its generated
+  // pinch event before RFB turns it into remote Control+wheel input.
   event.preventDefault();
   event.stopImmediatePropagation();
-  if ((event.type === "touchend" || event.type === "touchcancel") && event.touches.length < 2) {
-    pinchStartDistance = null;
-  }
 }
 
 function installPinchSuppression(): void {
   const canvas = screen.querySelector<HTMLCanvasElement>("canvas");
   if (!canvas) return;
-  for (const type of ["touchstart", "touchmove", "touchend", "touchcancel"] as const) {
-    canvas.addEventListener(type, suppressNoVncPinch, { capture: true, passive: false });
+  for (const type of ["gesturestart", "gesturemove", "gestureend"] as const) {
+    canvas.addEventListener(type, suppressGeneratedPinch, { capture: true });
   }
 }
 

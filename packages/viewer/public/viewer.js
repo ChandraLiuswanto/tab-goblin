@@ -34131,7 +34131,7 @@ var composing = false;
 var suppressInputText = null;
 var compositionText = "";
 var compositionCommitPending = false;
-var pinchStartDistance = null;
+var pinchStartMagnitude = null;
 var pinchStartScale = 1;
 var localViewportScale = 1;
 var pressedKeys = /* @__PURE__ */ new Map();
@@ -34209,33 +34209,27 @@ function applyViewportScaling() {
   rfb.scaleViewport = false;
   rfb.scaleViewport = true;
 }
-function touchDistance(touches) {
-  if (touches.length < 2) return null;
-  const [first, second] = [touches[0], touches[1]];
-  return Math.hypot(second.clientX - first.clientX, second.clientY - first.clientY);
-}
-function suppressNoVncPinch(event) {
-  const distance = touchDistance(event.touches);
-  if (event.type === "touchstart" && distance !== null) {
-    pinchStartDistance = distance;
+function suppressGeneratedPinch(event) {
+  const detail = event.detail;
+  if (detail?.type !== "pinch") return;
+  const magnitude = Math.hypot(detail.magnitudeX ?? 0, detail.magnitudeY ?? 0);
+  if (event.type === "gesturestart") {
+    pinchStartMagnitude = magnitude > 0 ? magnitude : null;
     pinchStartScale = localViewportScale;
-  }
-  if (pinchStartDistance !== null && distance !== null && event.type === "touchmove") {
-    localViewportScale = Math.min(3, Math.max(0.5, pinchStartScale * (distance / pinchStartDistance)));
+  } else if (event.type === "gesturemove" && pinchStartMagnitude !== null) {
+    localViewportScale = Math.min(3, Math.max(0.5, pinchStartScale * (magnitude / pinchStartMagnitude)));
     applyViewportScaling();
+  } else if (event.type === "gestureend") {
+    pinchStartMagnitude = null;
   }
-  if (pinchStartDistance === null) return;
   event.preventDefault();
   event.stopImmediatePropagation();
-  if ((event.type === "touchend" || event.type === "touchcancel") && event.touches.length < 2) {
-    pinchStartDistance = null;
-  }
 }
 function installPinchSuppression() {
   const canvas = screen.querySelector("canvas");
   if (!canvas) return;
-  for (const type of ["touchstart", "touchmove", "touchend", "touchcancel"]) {
-    canvas.addEventListener(type, suppressNoVncPinch, { capture: true, passive: false });
+  for (const type of ["gesturestart", "gesturemove", "gestureend"]) {
+    canvas.addEventListener(type, suppressGeneratedPinch, { capture: true });
   }
 }
 function clearReconnectTimer() {

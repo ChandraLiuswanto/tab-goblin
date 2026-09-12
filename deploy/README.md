@@ -2,13 +2,27 @@
 
 ## Build and verify
 
-The runtime is a rootless Podman image for Fedora hosts with SELinux enforcing. From
-this directory, build the local image and run its loopback-only smoke test:
+Use one stable checkout at `~/paseo-plugins/tab-goblin` for both the gateway user
+service and the Paseo plugin. The service starts
+`packages/gateway/dist/main.js`, and the plugin derives its MCP bridge from that
+same checkout's `packages/mcp-bridge/dist/index.js`. Do not install the plugin as an
+independent copy without its sibling `packages/` directory.
+
+From a fresh checkout, install dependencies and build every generated artifact before
+loading the plugin or enabling the service. `dist/` is intentionally not committed.
 
 ```bash
+cd ~/paseo-plugins/tab-goblin
+npm ci
+npm run build
 ./deploy/build-image.sh
 ./deploy/test-image.sh
 ```
+
+Configure Paseo to load `~/paseo-plugins/tab-goblin/plugin` from this checkout. If
+that checkout moves, rebuild it and update both the Paseo plugin location and the
+service `WorkingDirectory` together. The plugin fails with an actionable build error
+rather than launching an unusable MCP command when the bridge artifact is absent.
 
 The smoke test uses a dedicated temporary Podman volume and publishes CDP and RFB only
 on `127.0.0.1`; it removes its test container and volume when it exits. It does not
@@ -37,10 +51,12 @@ bounded interval for its profile flush, and only then tears down the display.
 
 ## Gateway user service
 
-Copy `tabgoblin-gateway.service` to `~/.config/systemd/user/`, then an operator may
-install and start it with:
+Copy `tabgoblin-gateway.service` to `~/.config/systemd/user/`, reload user units,
+then an operator may install and start it with:
 
 ```bash
+install -Dm0644 deploy/tabgoblin-gateway.service ~/.config/systemd/user/tabgoblin-gateway.service
+systemctl --user daemon-reload
 systemctl --user enable --now tabgoblin-gateway.service
 ```
 
@@ -56,8 +72,23 @@ Before changing Tailscale Serve, record the existing configuration:
 tailscale serve status
 ```
 
-Only with explicit operator consent, publish the loopback gateway privately to the
-tailnet:
+**Before enabling Serve**, set the gateway's allowed and advertised viewer origin to
+the exact HTTPS MagicDNS URL that Tailscale will provide (replace the placeholder;
+do not include a trailing slash). This is required for the viewer's origin checks and
+must match the URL configured in the TabGoblin plugin connection settings.
+
+```bash
+systemctl --user edit tabgoblin-gateway.service
+# Add this drop-in content:
+# [Service]
+# Environment=TABGOBLIN_VIEWER_ORIGIN=https://your-host.your-tailnet.ts.net
+systemctl --user daemon-reload
+systemctl --user restart tabgoblin-gateway.service
+```
+
+In the TabGoblin plugin panel, set **Viewer URL** to that same
+`https://your-host.your-tailnet.ts.net` origin. Only with explicit operator consent,
+publish the loopback gateway privately to the tailnet:
 
 ```bash
 tailscale serve --bg --https=443 http://127.0.0.1:8931

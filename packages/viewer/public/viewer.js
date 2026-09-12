@@ -33917,6 +33917,7 @@ var NetworkDiagnosticSchema = external_exports.object({
 }).strict();
 
 // ../protocol/dist/tools.js
+var MAX_UPLOAD_BYTES = 32 * 1024 * 1024;
 var TOOL_NAMES = [
   "tabgoblin_status",
   "tabgoblin_start",

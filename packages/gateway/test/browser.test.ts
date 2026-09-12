@@ -383,13 +383,7 @@ const MAX_PODMAN_OUTPUT = 1024 * 1024;
 
 const realPodman: PodmanExec = (args, signal) =>
   new Promise<PodmanResult>((resolve, reject) => {
-    // Podman spells a random loopback host port as an omitted port. RuntimeSupervisor's
-    // injected executor boundary uses `0`; normalize only that spelling while preserving
-    // loopback-only publication and the requested container port.
-    const podmanArgs = args.map((argument) =>
-      argument.replace(/^127\.0\.0\.1:0:(\d+)$/, "127.0.0.1::$1"),
-    );
-    const child = spawn("podman", podmanArgs, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn("podman", args, { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     let spawnError: Error | null = null;

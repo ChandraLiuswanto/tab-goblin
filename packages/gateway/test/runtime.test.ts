@@ -80,8 +80,8 @@ describe("start", () => {
     const endpoints = await runtime.start("w1");
 
     const run = podman.calls.find((args) => args[0] === "run")!;
-    expect(run.join(" ")).toContain("-p 127.0.0.1:0:9222");
-    expect(run.join(" ")).toContain("-p 127.0.0.1:0:5900");
+    expect(run.join(" ")).toContain("-p 127.0.0.1::9222");
+    expect(run.join(" ")).toContain("-p 127.0.0.1::5900");
     expect(run.join(" ")).toContain(`${volumeNameFor("w1")}:/profile:Z`);
     expect(run.join(" ")).toContain(`${volumeNameFor("w1")}-staging:/staging:Z`);
     expect(run).not.toContain("--privileged");

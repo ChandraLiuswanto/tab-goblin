@@ -140,6 +140,9 @@ describe("workspace manifest wiring", () => {
     );
 
     try {
+      // The prior clean-dist regression deliberately removes these declarations.
+      // Standalone viewer typechecking consumes the real generated protocol types.
+      run("npm run build -w @tab-goblin/protocol");
       const typecheckCommand = viewer.scripts?.typecheck;
       if (!typecheckCommand) throw new Error("viewer typecheck command is missing");
       run(typecheckCommand, viewerDir);

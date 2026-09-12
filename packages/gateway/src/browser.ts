@@ -298,6 +298,9 @@ export class BrowserSession {
         `(${SNAPSHOT_SCRIPT})(${JSON.stringify(revision)})`,
       )) as RawSnapshot;
       if (!raw || raw.revision !== revision) throw invalid("The page returned the wrong revision");
+      if (revision !== this.revision) {
+        throw tabGoblinError("stale_ref", "The browser snapshot is stale", false);
+      }
       const snapshot = buildSnapshot(raw, tabId);
       this.refTabId = tabId;
       this.currentRefs = new Set(snapshot.nodes.map((node) => node.ref));

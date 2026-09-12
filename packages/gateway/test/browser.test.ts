@@ -198,6 +198,37 @@ describe("BrowserSession at the Playwright boundary", () => {
     expect(first.locator).not.toHaveBeenCalled();
   });
 
+  it("preserves newer refs when an older snapshot finishes out of order", async () => {
+    const first = new FakePage();
+    const second = new FakePage();
+    let resolveFirst!: (snapshot: RawSnapshot) => void;
+    const delayedFirst = new Promise<RawSnapshot>((resolve) => {
+      resolveFirst = resolve;
+    });
+    first.evaluate.mockImplementationOnce(async () => delayedFirst);
+    second.evaluateResults.push(raw(2, "Second"));
+    const { session } = sessionWith(first, second);
+    const [firstTab, secondTab] = (await session.listTabs()).map(({ tabId }) => tabId);
+
+    const firstSnapshot = session.snapshot(firstTab);
+    const secondSnapshot = await session.snapshot(secondTab);
+    resolveFirst(raw(1, "First"));
+
+    await expect(firstSnapshot).rejects.toMatchObject({ code: "stale_ref" });
+    await expect(
+      session.act(secondTab, {
+        kind: "click",
+        ref: secondSnapshot.nodes[0].ref,
+        timeoutMs: 1000,
+      }),
+    ).resolves.toBeUndefined();
+    await expect(
+      session.act(firstTab, { kind: "click", ref: "r1-e0", timeoutMs: 1000 }),
+    ).rejects.toMatchObject({ code: "stale_ref" });
+    expect(second.locator).toHaveBeenCalledWith('[data-tg-ref="r2-e0"]');
+    expect(first.locator).not.toHaveBeenCalled();
+  });
+
   it("executes guarded actions with opaque, revision-scoped selectors", async () => {
     const page = new FakePage();
     page.evaluateResults.push(raw(1));

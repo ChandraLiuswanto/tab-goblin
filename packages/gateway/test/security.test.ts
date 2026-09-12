@@ -191,7 +191,16 @@ async function postUnix(socketPath: string, body: string): Promise<{ status: num
 }
 
 afterEach(async () => {
-  await Promise.allSettled(cleanups.splice(0).reverse().map((cleanup) => cleanup()));
+  const failures: unknown[] = [];
+  while (cleanups.length > 0) {
+    const cleanup = cleanups.pop()!;
+    try {
+      await cleanup();
+    } catch (error: unknown) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) throw new AggregateError(failures, "security fixture cleanup failed");
 });
 
 describe("viewer authentication and transport input gating", () => {
@@ -230,13 +239,20 @@ describe("viewer authentication and transport input gating", () => {
     const first = await pairedSession(h, base, "ws-a");
     const second = await pairedSession(h, base, "ws-a");
     const foreign = await pairedSession(h, base, "ws-b");
-    for (const headers of [{}, { cookie: foreign.cookie }, { cookie: first.cookie, origin: "https://evil.invalid" }]) {
+    const wsBase = base.replace("http", "ws");
+    for (const { url, headers } of [
+      { url: `${wsBase}/ws/vnc?workspaceId=ws-a`, headers: { origin: base } },
+      { url: `${wsBase}/ws/vnc?workspaceId=ws-a`, headers: { cookie: foreign.cookie, origin: base } },
+      { url: `${wsBase}/ws/vnc?workspaceId=ws-a`, headers: { cookie: first.cookie, origin: "https://evil.invalid" } },
+    ]) {
       await expect(new Promise<WebSocket>((resolve, reject) => {
-        const socket = new WebSocket(`${base.replace("http", "ws")}/ws/vnc`, { headers });
+        const socket = new WebSocket(url, { headers });
         socket.once("open", () => resolve(socket));
         socket.once("error", reject);
       })).rejects.toBeDefined();
     }
+    const accepted = await openSocket(`${wsBase}/ws/vnc?workspaceId=ws-a`, first.cookie, base);
+    cleanups.push(async () => accepted.close());
     const takeHeaders = { cookie: first.cookie, [CSRF_HEADER]: first.csrf, origin: base, "content-type": "application/json" };
     expect((await fetch(`${base}/api/take-control`, { method: "POST", headers: takeHeaders, body: "{}" })).status).toBe(200);
     const secondStatus = await fetch(`${base}/api/status`, { headers: { cookie: second.cookie, [CSRF_HEADER]: second.csrf, origin: base } });
@@ -336,14 +352,15 @@ describe("agent scope and bounded local control plane", () => {
 
   it("uses a Unix-domain admin listener (not TCP) and bounds request bytes/deadlines without reflecting sensitive malformed input", async () => {
     const directory = await mkdtemp(join(tmpdir(), "tabgoblin-security-admin-"));
+    cleanups.push(() => rm(directory, { recursive: true, force: true }));
     const socketPath = join(directory, "admin.sock");
     const before = new Set((process as typeof process & { _getActiveHandles(): unknown[] })._getActiveHandles().filter((handle): handle is NetServer => handle instanceof NetServer));
     const server = createAdminServer({ services: {} as never, enrollment: new EnrollmentRegistry(), socketPath, handlerTimeoutMs: 25 });
     await server.listen();
+    cleanups.push(() => server.close());
     const newListeners = (process as typeof process & { _getActiveHandles(): unknown[] })._getActiveHandles()
       .filter((handle): handle is NetServer => handle instanceof NetServer && !before.has(handle));
     expect(newListeners.map((listener) => listener.address())).toEqual([socketPath]);
-    cleanups.push(async () => { await server.close(); await rm(directory, { recursive: true, force: true }); });
     expect((await stat(socketPath)).mode & 0o777).toBe(0o600);
     const tooLarge = await postUnix(socketPath, JSON.stringify({ padding: "x".repeat(65_536), secret: SECRET }));
     expect(tooLarge.status).toBe(413);
@@ -366,6 +383,21 @@ describe("agent scope and bounded local control plane", () => {
       socket.once("error", () => { clearTimeout(timer); if (drip) clearInterval(drip); resolve(chunks.length > 0); });
     });
     expect(timedOut).toBe(true);
+  });
+
+  it("reclaims a Unix socket deterministically across repeated listener lifecycles", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "tabgoblin-security-relisten-"));
+    cleanups.push(() => rm(directory, { recursive: true, force: true }));
+    const socketPath = join(directory, "admin.sock");
+    const first = createAdminServer({ services: {} as never, enrollment: new EnrollmentRegistry(), socketPath });
+    await first.listen();
+    cleanups.push(() => first.close());
+    await first.close();
+    await expect(stat(socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+    const second = createAdminServer({ services: {} as never, enrollment: new EnrollmentRegistry(), socketPath });
+    await second.listen();
+    cleanups.push(() => second.close());
+    expect((await stat(socketPath)).mode & 0o777).toBe(0o600);
   });
 });
 

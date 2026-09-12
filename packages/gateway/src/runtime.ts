@@ -33,9 +33,8 @@ export interface RuntimeSupervisorOptions {
   probe: (cdpUrl: string, signal?: AbortSignal) => Promise<boolean>;
   startTimeoutMs?: number;
   /**
-   * Overall staging-operation budget. Stop and startup cleanup use at least 30 seconds
-   * for discovery, then give a live container a fresh 30-second removal window so
-   * Podman's 20-second graceful stop always has bounded command overhead.
+   * Overall staging-operation budget. Stop and each startup cleanup use one absolute
+   * deadline of at least 30 seconds across discovery, graceful stop, and removal.
    */
   operationTimeoutMs?: number;
   /** Monotonic millisecond clock used for deadline accounting; defaults to performance.now. */
@@ -229,7 +228,10 @@ export class RuntimeSupervisor {
         entry.endpoints = null;
         if (error instanceof DeadlineExceeded) {
           this.blockEntry(entry, error.quiesced);
-          throw error.failure;
+          throw tabGoblinError(
+            "timeout_uncertain",
+            "The browser runtime stop could not be proven complete; inspect state before continuing",
+          );
         }
         throw error;
       })
@@ -471,22 +473,17 @@ export class RuntimeSupervisor {
     state: string,
     deadline: number,
   ): Promise<void> {
-    let removalDeadline = deadline;
     if (!this.isStaleState(state)) {
-      removalDeadline = Math.max(
-        deadline,
-        this.deadline(RUNTIME_STOP_TIMEOUT_MS),
-      );
       await this.requireSuccess(
         ["stop", "--ignore", "--time", String(GRACEFUL_STOP_SECONDS), containerName],
         "stop the browser runtime gracefully",
-        removalDeadline,
+        deadline,
       );
     }
     await this.requireSuccess(
       ["rm", "--ignore", containerName],
       "remove the stopped browser runtime",
-      removalDeadline,
+      deadline,
     );
   }
 

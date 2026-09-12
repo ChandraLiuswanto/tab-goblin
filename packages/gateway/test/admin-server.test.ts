@@ -171,24 +171,26 @@ describe("admin request handling", () => {
     expect(services.runtime.state).not.toHaveBeenCalled();
   });
 
-  it("allows a validated thirty-second navigation timeout plus bounded handler overhead", async () => {
+  it("allows near-deadline cold attachment before a thirty-second navigation", async () => {
     vi.useFakeTimers();
-    const { server, enrollment, session } = harness();
-    enroll(enrollment);
+    const session = browser();
     session.navigate.mockImplementation(async (tabId: string, url: string) =>
       new Promise((resolve) => setTimeout(
         () => resolve({ tabId, title: "delayed", url, active: true }),
-        20_001,
+        29_999,
       )),
     );
+    const { server, enrollment } = harness({
+      browser: vi.fn(async () => new Promise((resolve) => setTimeout(() => resolve(session), 9_999))),
+    });
+    enroll(enrollment);
 
     const pending = server.handle(tool("tabgoblin_navigate", {
       tabId: "t1",
       url: "https://example.com/delayed",
       timeoutMs: 30_000,
     }));
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.advanceTimersByTimeAsync(20_001);
+    await vi.advanceTimersByTimeAsync(39_998);
 
     await expect(pending).resolves.toMatchObject({ ok: true });
   });

@@ -59,8 +59,22 @@ describe("operation budgets", () => {
       },
     ] as const;
 
-    expect(requests.map(gatewayOperationTimeoutMs)).toEqual([20_000, 75_000, 50_000, 35_000]);
-    expect(requests.map(gatewayTransportTimeoutMs)).toEqual([25_000, 80_000, 55_000, 40_000]);
+    expect(requests.map(gatewayOperationTimeoutMs)).toEqual([20_000, 75_000, 50_000, 45_000]);
+    expect(requests.map(gatewayTransportTimeoutMs)).toEqual([25_000, 80_000, 55_000, 50_000]);
+  });
+
+  it("includes cold browser attachment and local overhead around default actions", () => {
+    const request = {
+      op: "tool",
+      enrollment: "11111111-1111-4111-8111-111111111111",
+      workspaceId: "ws-1",
+      name: "tabgoblin_list_tabs",
+      input: {},
+      source: "test",
+    } as const;
+
+    expect(gatewayOperationTimeoutMs(request)).toBe(25_000);
+    expect(gatewayTransportTimeoutMs(request)).toBe(30_000);
   });
 });
 

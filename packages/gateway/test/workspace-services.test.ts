@@ -124,7 +124,7 @@ describe("workspace runtime lifecycle", () => {
       expect(runtime.stop).toHaveBeenCalledWith("ws-1");
       expect(services.ownership("ws-1").snapshot().state).toBe("needs-attention");
 
-      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(10_000);
       await expect(mutation).resolves.toMatchObject({
         ok: false,
         error: { code: "timeout_uncertain", retryable: false },

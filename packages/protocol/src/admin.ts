@@ -130,16 +130,14 @@ export function gatewayOperationTimeoutMs(request: AdminRequest): number {
     return OWNERSHIP_DRAIN_TIMEOUT_MS + RUNTIME_STOP_TIMEOUT_MS + GATEWAY_OPERATION_OVERHEAD_MS;
   }
   if (request.op === "tool" && request.name === "tabgoblin_upload") {
-    return RUNTIME_OPERATION_TIMEOUT_MS + DEFAULT_GATEWAY_OPERATION_TIMEOUT_MS + GATEWAY_OPERATION_OVERHEAD_MS;
+    return BROWSER_OPERATION_TIMEOUT_MS
+      + RUNTIME_OPERATION_TIMEOUT_MS
+      + BROWSER_OPERATION_TIMEOUT_MS
+      + GATEWAY_OPERATION_OVERHEAD_MS;
   }
   if (request.op === "tool") {
-    const requested = toolTimeoutMs(request);
-    if (requested !== null) {
-      return Math.max(
-        DEFAULT_GATEWAY_OPERATION_TIMEOUT_MS,
-        requested + GATEWAY_OPERATION_OVERHEAD_MS,
-      );
-    }
+    const actionTimeout = toolTimeoutMs(request) ?? BROWSER_OPERATION_TIMEOUT_MS;
+    return BROWSER_OPERATION_TIMEOUT_MS + actionTimeout + GATEWAY_OPERATION_OVERHEAD_MS;
   }
   return DEFAULT_GATEWAY_OPERATION_TIMEOUT_MS;
 }

@@ -41,6 +41,7 @@ export const AdminRequestSchema = z.discriminatedUnion("op", [
       op: z.literal("record-enrollment"),
       enrollment,
       cwd,
+      workspaceId,
       workspaceGeneration: lifecycleGeneration.default(0),
     })
     .strict(),

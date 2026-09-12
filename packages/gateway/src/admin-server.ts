@@ -718,7 +718,12 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
         await services.ownership(request.workspaceId).returnToAgent();
         return { ok: true, status: statusFor(request.workspaceId) };
       case "record-enrollment":
-        enrollment.record(request.enrollment, request.cwd, request.workspaceGeneration);
+        enrollment.record(
+          request.enrollment,
+          request.cwd,
+          request.workspaceId,
+          request.workspaceGeneration,
+        );
         return { ok: true };
       case "resolve-enrollment": {
         const binding = await enrollment.resolve(

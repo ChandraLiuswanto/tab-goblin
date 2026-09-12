@@ -132,15 +132,26 @@ export class EnrollmentRegistry {
     }
   }
 
-  record(enrollment: string, cwd: string, workspaceGeneration = 0): void {
+  record(
+    enrollment: string,
+    cwd: string,
+    workspaceId: string,
+    workspaceGeneration = 0,
+  ): void {
     validateGeneration(workspaceGeneration);
+    this.requireLifecycleGeneration(
+      this.workspaceLifecycles,
+      workspaceId,
+      workspaceGeneration,
+    );
     this.sweep();
     const existing = this.records.get(enrollment);
     if (existing) {
       // Hook delivery can be retried. It must never be able to move a credential,
-      // change its generation, or reset an already-running credential's expiry.
+      // change its workspace or generation, or reset its expiry.
       if (
         existing.binding.cwd === cwd &&
+        existing.binding.workspaceId === workspaceId &&
         existing.binding.workspaceGeneration === workspaceGeneration
       ) {
         return;
@@ -158,15 +169,19 @@ export class EnrollmentRegistry {
     ) {
       throw capacityExceeded();
     }
+    this.ensureLifecycleCapacity(this.workspaceLifecycles, workspaceId);
 
     const createdAt = this.now();
+    if (!this.workspaceLifecycles.has(workspaceId)) {
+      this.workspaceLifecycles.set(workspaceId, { generation: 0, enabled: true });
+    }
     this.seenEnrollments.add(enrollment);
     this.records.set(enrollment, {
       binding: {
         enrollment,
         cwd,
         agentId: null,
-        workspaceId: null,
+        workspaceId,
         purpose: "interactive",
         createdAt,
         agentGeneration: 0,
@@ -189,6 +204,7 @@ export class EnrollmentRegistry {
       if (
         stored.binding.cwd !== cwd ||
         stored.binding.agentId !== null ||
+        stored.binding.workspaceId !== workspaceId ||
         stored.binding.workspaceGeneration !== generations.workspaceGeneration
       ) {
         continue;
@@ -200,7 +216,6 @@ export class EnrollmentRegistry {
     this.admitLifecycleTargets(agentId, workspaceId);
     const session = this.sessions.get(agentId);
     selected.binding.agentId = agentId;
-    selected.binding.workspaceId = workspaceId;
     selected.binding.purpose = session?.purpose ?? "interactive";
     selected.binding.agentGeneration = generations.agentGeneration;
     selected.expiresAt = this.now() + this.bindingTtlMs;

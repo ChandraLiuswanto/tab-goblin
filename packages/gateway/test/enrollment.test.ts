@@ -12,7 +12,7 @@ function bindInteractive(
   agentId = "agent-1",
   workspaceId = "ws-1",
 ) {
-  registry.record(enrollment, cwd);
+  registry.record(enrollment, cwd, workspaceId);
   const binding = registry.bind(cwd, agentId, workspaceId);
   registry.noteSessionOpen(agentId, workspaceId, "interactive");
   return binding;
@@ -38,7 +38,7 @@ describe("EnrollmentRegistry", () => {
 
   it("waits for an in-flight agent.created binding, but fails closed for unknown or unbound nonces", async () => {
     const registry = new EnrollmentRegistry();
-    registry.record(NONCE, "/w/one");
+    registry.record(NONCE, "/w/one", "ws-1");
     const resolving = registry.resolve(NONCE, 100);
     setTimeout(() => {
       registry.bind("/w/one", "agent-1", "ws-1");
@@ -49,19 +49,19 @@ describe("EnrollmentRegistry", () => {
     await expect(registry.resolve(SECOND, 1)).rejects.toMatchObject({ code: "not_enrolled" });
 
     const unbound = new EnrollmentRegistry();
-    unbound.record(NONCE, "/w/one");
+    unbound.record(NONCE, "/w/one", "ws-1");
     await expect(unbound.resolve(NONCE, 1)).rejects.toMatchObject({ code: "not_enrolled" });
   });
 
   it("refuses history sessions and workspace-mismatched session notifications", async () => {
     const history = new EnrollmentRegistry();
-    history.record(NONCE, "/w/one");
+    history.record(NONCE, "/w/one", "ws-1");
     history.bind("/w/one", "agent-1", "ws-1");
     history.noteSessionOpen("agent-1", "ws-1", "history");
     await expect(history.resolve(NONCE, 1)).rejects.toMatchObject({ code: "not_enrolled" });
 
     const mismatch = new EnrollmentRegistry();
-    mismatch.record(NONCE, "/w/one");
+    mismatch.record(NONCE, "/w/one", "ws-1");
     mismatch.bind("/w/one", "agent-1", "ws-1");
     mismatch.noteSessionOpen("agent-1", "ws-2", "interactive");
     await expect(mismatch.resolve(NONCE, 1)).rejects.toMatchObject({ code: "not_enrolled" });
@@ -69,9 +69,9 @@ describe("EnrollmentRegistry", () => {
 
   it("binds the oldest unbound nonce for the exact cwd", () => {
     const registry = new EnrollmentRegistry();
-    registry.record(NONCE, "/w/one");
-    registry.record(SECOND, "/w/one");
-    registry.record(THIRD, "/w/two");
+    registry.record(NONCE, "/w/one", "ws-1");
+    registry.record(SECOND, "/w/one", "ws-1");
+    registry.record(THIRD, "/w/two", "ws-1");
 
     expect(registry.bind("/w/one", "agent-1", "ws-1")?.enrollment).toBe(NONCE);
     expect(registry.bind("/w/one", "agent-2", "ws-1")?.enrollment).toBe(SECOND);
@@ -81,7 +81,7 @@ describe("EnrollmentRegistry", () => {
   it("expires pending enrollments and inactive bound credentials", async () => {
     let clock = 0;
     const pending = new EnrollmentRegistry({ ttlMs: 1_000, now: () => clock });
-    pending.record(NONCE, "/w/one");
+    pending.record(NONCE, "/w/one", "ws-1");
     clock = 1_001;
     pending.sweep();
     expect(pending.bind("/w/one", "agent-1", "ws-1")).toBeNull();
@@ -106,21 +106,29 @@ describe("EnrollmentRegistry", () => {
       now: () => clock,
     });
     const enrollments = [NONCE, SECOND, THIRD];
-    for (const enrollment of enrollments) registry.record(enrollment, "/w/one");
+    for (const enrollment of enrollments) registry.record(enrollment, "/w/one", "ws-1");
 
-    expect(() => registry.record(NONCE, "/w/one")).not.toThrow();
-    expect(() => registry.record("44444444-4444-4444-8444-444444444444", "/w/one")).toThrow(
+    expect(() => registry.record(NONCE, "/w/one", "ws-1")).not.toThrow();
+    expect(() => registry.record(
+      "44444444-4444-4444-8444-444444444444",
+      "/w/one",
+      "ws-1",
+    )).toThrow(
       expect.objectContaining({ code: "busy" }),
     );
 
     clock = 2;
     registry.sweep();
     for (const enrollment of enrollments) {
-      expect(() => registry.record(enrollment, "/w/one")).toThrow(
+      expect(() => registry.record(enrollment, "/w/one", "ws-1")).toThrow(
         expect.objectContaining({ code: "auth_failed" }),
       );
     }
-    expect(() => registry.record("55555555-5555-4555-8555-555555555555", "/w/one")).toThrow(
+    expect(() => registry.record(
+      "55555555-5555-4555-8555-555555555555",
+      "/w/one",
+      "ws-1",
+    )).toThrow(
       expect.objectContaining({ code: "busy" }),
     );
   });
@@ -156,14 +164,35 @@ describe("EnrollmentRegistry", () => {
     });
   });
 
+  it("never migrates a pending nonce between workspaces sharing cwd and generation", async () => {
+    const registry = new EnrollmentRegistry();
+    registry.record(NONCE, "/w/shared", "ws-a", 0);
+
+    registry.revokeWorkspace("ws-a");
+    expect(registry.bind(
+      "/w/shared",
+      "agent-b",
+      "ws-b",
+      { agentGeneration: 0, workspaceGeneration: 0 },
+    )).toBeNull();
+    registry.noteSessionOpen(
+      "agent-b",
+      "ws-b",
+      "interactive",
+      { agentGeneration: 0, workspaceGeneration: 0 },
+    );
+
+    await expect(registry.authorize(NONCE)).rejects.toMatchObject({ code: "not_enrolled" });
+  });
+
   it("rejects delayed workspace lifecycle events until an explicit reset generation", async () => {
     const registry = new EnrollmentRegistry();
-    registry.record(NONCE, "/w/one", 0);
+    registry.record(NONCE, "/w/one", "ws-1", 0);
 
     expect(registry.revokeWorkspace("ws-1")).toBe(1);
-    // A delayed record does not yet know its workspace ID. It may be retained,
-    // but its stale generation can never bind or authorize after revocation.
-    registry.record(SECOND, "/w/one", 0);
+    expect(() => registry.record(SECOND, "/w/one", "ws-1", 0)).toThrow(
+      expect.objectContaining({ code: "auth_failed" }),
+    );
     expect(() => registry.bind(
       "/w/one",
       "agent-1",
@@ -180,7 +209,7 @@ describe("EnrollmentRegistry", () => {
 
     const workspaceGeneration = registry.resetWorkspace("ws-1");
     expect(workspaceGeneration).toBe(2);
-    registry.record(THIRD, "/w/one", workspaceGeneration);
+    registry.record(THIRD, "/w/one", "ws-1", workspaceGeneration);
     expect(() => registry.bind(
       "/w/one",
       "agent-1",
@@ -205,7 +234,7 @@ describe("EnrollmentRegistry", () => {
 
   it("rejects delayed agent lifecycle events and bounds lifecycle tombstones", async () => {
     const registry = new EnrollmentRegistry({ maxLifecycleIdentities: 3 });
-    registry.record(NONCE, "/w/one", 0);
+    registry.record(NONCE, "/w/one", "ws-1", 0);
     expect(registry.revokeAgent("agent-1")).toBe(1);
     expect(() => registry.bind(
       "/w/one",
@@ -257,7 +286,7 @@ describe("EnrollmentRegistry", () => {
 
     await expect(registry.authorize(NONCE)).rejects.toMatchObject({ code: "not_enrolled" });
     await expect(registry.resolve(NONCE, 1)).rejects.toMatchObject({ code: "not_enrolled" });
-    expect(() => registry.record(NONCE, "/w/one")).toThrow(
+    expect(() => registry.record(NONCE, "/w/one", "ws-1")).toThrow(
       expect.objectContaining({ code: "auth_failed" }),
     );
     await expect(registry.authorize(SECOND)).resolves.toMatchObject({ agentId: "agent-2" });

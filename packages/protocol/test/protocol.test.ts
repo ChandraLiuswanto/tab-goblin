@@ -410,11 +410,17 @@ describe("admin and viewer wire contracts", () => {
       op: "revoke-workspace",
       workspaceId: "w1",
     });
+    expect(AdminRequestSchema.safeParse({
+      op: "record-enrollment",
+      enrollment,
+      cwd: "/w/one",
+    }).success).toBe(false);
     expect(AdminRequestSchema.parse({
       op: "record-enrollment",
       enrollment,
       cwd: "/w/one",
-    })).toMatchObject({ workspaceGeneration: 0 });
+      workspaceId: "w1",
+    })).toMatchObject({ workspaceId: "w1", workspaceGeneration: 0 });
     expect(AdminRequestSchema.parse({
       op: "bind-enrollment",
       cwd: "/w/one",

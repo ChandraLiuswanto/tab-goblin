@@ -17,6 +17,7 @@ import {
   refreshPanelQueries,
   sanitizeTabs,
   statusResponseIssue,
+  tabSectionMode,
   viewerAddress,
 } from "./panel-model.js";
 import { openExternal } from "./web.js";
@@ -208,6 +209,13 @@ export function TabGoblinPanel({ theme, host, layout, workspaceId }: PluginWorks
   const statusResponse = statusQuery.data;
   const status = statusResponse?.ok ? statusResponse.status ?? null : null;
   const tabs = sanitizeTabs(tabsQuery.data?.ok ? tabsQuery.data.tabs : undefined);
+  const tabsMode = tabSectionMode({
+    statusQueryIsSuccess: statusQuery.isSuccess,
+    statusQueryIsError: statusQuery.isError,
+    sessionState: status?.sessionState ?? null,
+    tabsQueryState: tabsQuery.isError ? "error" : tabsQuery.isSuccess ? "success" : "loading",
+    tabCount: tabs.length,
+  });
   const state = describeState({ rpcFailed: statusQuery.isError, status });
   const viewerSource = status?.viewerUrl || config?.viewerUrl;
   const viewer = viewerAddress(viewerSource);
@@ -497,11 +505,12 @@ export function TabGoblinPanel({ theme, host, layout, workspaceId }: PluginWorks
 
           <View style={styles.card}>
             <Text style={styles.sectionTitle}>Tabs</Text>
-            {status?.sessionState !== "ready" ? <Text style={styles.detail}>Tabs are available after the browser is ready.</Text> : null}
-            {status?.sessionState === "ready" && tabsQuery.isLoading ? <Text style={styles.detail}>Loading tabs…</Text> : null}
-            {status?.sessionState === "ready" && tabsQuery.isError ? <Text style={styles.warning}>Tabs unavailable. Refresh browser status before trying again.</Text> : null}
-            {status?.sessionState === "ready" && tabsQuery.isSuccess && tabs.length === 0 ? <Text style={styles.detail}>No open tabs reported.</Text> : null}
-            {status?.sessionState === "ready" && tabsQuery.isSuccess ? tabs.map((tab) => (
+            {tabsMode === "status-unconfirmed" ? <Text style={styles.warning}>Tabs are hidden until Refresh all confirms the current browser status.</Text> : null}
+            {tabsMode === "not-ready" ? <Text style={styles.detail}>Tabs are available after the browser is ready.</Text> : null}
+            {tabsMode === "loading" ? <Text style={styles.detail}>Loading tabs…</Text> : null}
+            {tabsMode === "error" ? <Text style={styles.warning}>Tabs unavailable. Refresh browser status before trying again.</Text> : null}
+            {tabsMode === "empty" ? <Text style={styles.detail}>No open tabs reported.</Text> : null}
+            {tabsMode === "tabs" ? tabs.map((tab) => (
               <View key={tab.tabId} style={styles.tabRow}>
                 <Text style={styles.tabTitle} numberOfLines={1}>{tab.active ? "Active · " : ""}{tab.title}</Text>
                 <Text style={styles.tabUrl} numberOfLines={1}>{tab.url}</Text>

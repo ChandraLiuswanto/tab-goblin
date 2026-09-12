@@ -7,6 +7,7 @@ import {
   panelEphemeralReducer,
   sanitizeTabs,
   statusResponseIssue,
+  tabSectionMode,
   viewerAddress,
 } from "../client/panel-model.js";
 import { filterActivity, sanitizeActivity } from "../client/activity-model.js";
@@ -137,6 +138,23 @@ describe("panel request safety", () => {
     const manual = { ...ready, ownership: { state: "manual" as const, generation: 4, owner: "viewer" as const } };
     expect(actionAvailability(manual, false, true).returnToAgent).toBe(true);
     expect(actionAvailability(ready, false, true).returnToAgent).toBe(false);
+  });
+});
+
+describe("tab rendering", () => {
+  it("hides retained tabs when a status refetch fails with stale ready data", () => {
+    expect(tabSectionMode({
+      statusQueryIsSuccess: false,
+      statusQueryIsError: true,
+      sessionState: "ready",
+      tabsQueryState: "success",
+      tabCount: 2,
+    })).toBe("status-unconfirmed");
+  });
+
+  it("shows tabs only when current status and tab queries both succeed", () => {
+    expect(tabSectionMode({ statusQueryIsSuccess: true, statusQueryIsError: false, sessionState: "ready", tabsQueryState: "success", tabCount: 2 })).toBe("tabs");
+    expect(tabSectionMode({ statusQueryIsSuccess: true, statusQueryIsError: false, sessionState: "ready", tabsQueryState: "success", tabCount: 0 })).toBe("empty");
   });
 });
 

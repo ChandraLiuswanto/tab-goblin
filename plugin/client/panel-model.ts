@@ -107,6 +107,22 @@ export async function refreshAfterSuccessfulAction(response: { ok: boolean }, re
   return true;
 }
 
+export type TabSectionMode = "status-unconfirmed" | "not-ready" | "loading" | "error" | "empty" | "tabs";
+
+export function tabSectionMode(input: {
+  statusQueryIsSuccess: boolean;
+  statusQueryIsError: boolean;
+  sessionState: SessionStatus["sessionState"] | null;
+  tabsQueryState: "loading" | "error" | "success";
+  tabCount: number;
+}): TabSectionMode {
+  if (input.statusQueryIsError || !input.statusQueryIsSuccess) return "status-unconfirmed";
+  if (input.sessionState !== "ready") return "not-ready";
+  if (input.tabsQueryState === "loading") return "loading";
+  if (input.tabsQueryState === "error") return "error";
+  return input.tabCount === 0 ? "empty" : "tabs";
+}
+
 export function actionAvailability(status: SessionStatus | null, rpcFailed: boolean, hasSafeViewerAddress: boolean) {
   if (rpcFailed || !status) return { start: false, stop: false, viewer: false, pair: false, returnToAgent: false };
   const ready = status.sessionState === "ready";

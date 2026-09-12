@@ -55,6 +55,12 @@ function harness(options: {
     }
     return value;
   };
+  const activities = new Map<string, ActivityFeed>();
+  const activity = (workspaceId: string) => {
+    let value = activities.get(workspaceId);
+    if (!value) { value = new ActivityFeed(); activities.set(workspaceId, value); }
+    return value;
+  };
   const services = {
     runtime: {
       state: vi.fn(() => "ready" as const),
@@ -67,7 +73,7 @@ function harness(options: {
       })),
     },
     ownership,
-    activity: vi.fn(() => new ActivityFeed()),
+    activity: vi.fn(activity),
     browser: vi.fn(),
     issuePairingCode: vi.fn(),
     viewerUrlFor: vi.fn((workspaceId: string) => `https://viewer.example/${workspaceId}`),
@@ -83,7 +89,7 @@ function harness(options: {
     maxViewerSocketsPerWorkspace: options.maxViewerSocketsPerWorkspace,
   });
   cleanups.push(() => server.close());
-  return { server, pairing, ownership, services };
+  return { server, pairing, ownership, activity, services };
 }
 
 async function start(h: ReturnType<typeof harness>): Promise<{ base: string; origin: string; port: number }> {
@@ -290,6 +296,43 @@ describe("viewer HTTP authentication", () => {
     }));
     expect(statuses.map((status) => status.isOwner)).toEqual([true, false]);
     expect(statuses[0]!.ownership.owner).toBe("viewer");
+  });
+
+  it("records only actual successful manual transitions without pairing material or duplicate events", async () => {
+    const h = harness();
+    const address = await start(h);
+    const first = await pair(h, address);
+    const second = await pair(h, address);
+    expect(h.activity("ws-1").list()).toEqual([]);
+
+    const take = await fetch(`${address.base}/api/take-control`, { method: "POST", headers: authenticatedHeaders(first, address.origin), body: "{}" });
+    const reclaim = await fetch(`${address.base}/api/reclaim`, { method: "POST", headers: authenticatedHeaders(second, address.origin), body: JSON.stringify({ confirm: true }) });
+    const returned = await fetch(`${address.base}/api/return-to-agent`, { method: "POST", headers: authenticatedHeaders(second, address.origin), body: "{}" });
+    expect([take.status, reclaim.status, returned.status]).toEqual([200, 200, 200]);
+
+    const activity = h.activity("ws-1").list();
+    expect(activity.map(({ action, status, source }) => ({ action, status, source }))).toEqual([
+      { action: "manual-return-to-agent", status: "ok", source: "viewer" },
+      { action: "manual-reclaim", status: "ok", source: "viewer" },
+      { action: "manual-take-control", status: "ok", source: "viewer" },
+    ]);
+    expect(activity.every((record) => record.tabId === null && record.url === null && record.title === null && record.code === null)).toBe(true);
+    const serialized = JSON.stringify(activity);
+    expect(serialized).not.toContain(first.csrfToken);
+    expect(serialized).not.toContain(second.csrfToken);
+    expect(serialized).not.toContain(first.cookie.split("=", 2)[1]);
+  });
+
+  it("records a failed authenticated transition as an error rather than a success", async () => {
+    const h = harness();
+    const address = await start(h);
+    const first = await pair(h, address);
+    const second = await pair(h, address);
+    await fetch(`${address.base}/api/take-control`, { method: "POST", headers: authenticatedHeaders(first, address.origin), body: "{}" });
+
+    const denied = await fetch(`${address.base}/api/take-control`, { method: "POST", headers: authenticatedHeaders(second, address.origin), body: "{}" });
+    expect(denied.status).toBe(503);
+    expect(h.activity("ws-1").list()[0]).toMatchObject({ action: "manual-take-control", source: "viewer", status: "error", code: "manual_control" });
   });
 
   it("requires explicit reclaim confirmation and invalidates a signed-out session", async () => {

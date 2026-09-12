@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActivityFeed } from "../src/activity-feed.js";
 import { createAdminServer } from "../src/admin-server.js";
 import { EnrollmentRegistry } from "../src/enrollment.js";
+import { OwnershipController } from "../src/ownership.js";
 
 const NONCE = "11111111-1111-4111-8111-111111111111";
 const SECOND = "22222222-2222-4222-8222-222222222222";
@@ -217,6 +218,20 @@ describe("admin request handling", () => {
       error: { code: "session_not_ready" },
     });
     expect(services.browser).not.toHaveBeenCalled();
+  });
+
+  it("records successful and failed panel return transitions exactly once", async () => {
+    const controller = new OwnershipController();
+    await controller.requestTakeControl("viewer-session");
+    const activity = new ActivityFeed();
+    const { server } = harness({ ownership: () => controller, activity: () => activity });
+
+    await expect(server.handle({ op: "return-to-agent", workspaceId: "ws-1" })).resolves.toMatchObject({ ok: true });
+    await expect(server.handle({ op: "return-to-agent", workspaceId: "ws-1" })).resolves.toMatchObject({ ok: false, error: { code: "manual_control" } });
+    expect(activity.list().map(({ action, source, status, code }) => ({ action, source, status, code }))).toEqual([
+      { action: "manual-return-to-agent", source: "paseo-panel", status: "error", code: "manual_control" },
+      { action: "manual-return-to-agent", source: "paseo-panel", status: "ok", code: null },
+    ]);
   });
 
   it("dispatches admin lifecycle, pairing, and explicit revocation operations", async () => {

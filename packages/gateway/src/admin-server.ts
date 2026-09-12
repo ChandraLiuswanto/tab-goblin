@@ -28,6 +28,7 @@ import type { BrowserAction, BrowserSession } from "./browser.js";
 import type { EnrollmentRegistry, Binding } from "./enrollment.js";
 import type { Lease, OwnershipController } from "./ownership.js";
 import type { RuntimeSupervisor } from "./runtime.js";
+import { recordManualTransition } from "./manual-activity.js";
 
 export interface WorkspaceServices {
   runtime: RuntimeSupervisor;
@@ -728,7 +729,12 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
         return { ok: true, pairingCode: pair.code, pairingExpiresAt: pair.expiresAt };
       }
       case "return-to-agent":
-        await services.ownership(request.workspaceId).returnToAgent();
+        await recordManualTransition(
+          services.activity(request.workspaceId),
+          "manual-return-to-agent",
+          "paseo-panel",
+          () => services.ownership(request.workspaceId).returnToAgent(),
+        );
         return { ok: true, status: statusFor(request.workspaceId) };
       case "record-enrollment":
         enrollment.record(

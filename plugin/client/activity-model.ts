@@ -3,7 +3,7 @@ import { ACTIVITY_LIMIT, boundedText, redactUrl, type ActivityRecord } from "@ta
 export type ActivityFilter = "all" | "errors" | "manual";
 export type SanitizedActivity = ActivityRecord;
 
-const MANUAL_ACTIONS = new Set(["pair", "take-control", "manual-control", "return-to-agent"]);
+const MANUAL_ACTIONS = new Set(["manual-take-control", "manual-reclaim", "manual-return-to-agent"]);
 
 export function sanitizeActivity(records: readonly ActivityRecord[] | undefined): SanitizedActivity[] {
   return (records ?? [])

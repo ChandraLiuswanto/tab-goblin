@@ -17,6 +17,7 @@ import {
 import { WebSocket, WebSocketServer } from "ws";
 import type { WorkspaceServices } from "./admin-server.js";
 import type { PairingCodes } from "./pairing.js";
+import { recordManualTransition } from "./manual-activity.js";
 import { RfbClientStreamGate, RfbProtocolError } from "./rfb-framing.js";
 
 export interface ViewerServerOptions {
@@ -362,15 +363,17 @@ export function createViewerServer(options: ViewerServerOptions): ViewerServer {
     const body = await readJson(request);
 
     if (path === "/api/take-control") {
-      await transition(session.workspaceId, () =>
-        options.services.ownership(session.workspaceId).requestTakeControl(session.sessionId));
+      await recordManualTransition(options.services.activity(session.workspaceId), "manual-take-control", "viewer", () =>
+        transition(session.workspaceId, () =>
+          options.services.ownership(session.workspaceId).requestTakeControl(session.sessionId)));
     } else if (path === "/api/return-to-agent") {
-      await transition(session.workspaceId, async () => {
-        const ownership = options.services.ownership(session.workspaceId);
-        if (!ownership.mayViewerSendInput(session.sessionId)) throw new HttpFailure(409);
-        await releaseSessionInput(session.workspaceId, session.sessionId);
-        await ownership.returnToAgent();
-      });
+      await recordManualTransition(options.services.activity(session.workspaceId), "manual-return-to-agent", "viewer", () =>
+        transition(session.workspaceId, async () => {
+          const ownership = options.services.ownership(session.workspaceId);
+          if (!ownership.mayViewerSendInput(session.sessionId)) throw new HttpFailure(409);
+          await releaseSessionInput(session.workspaceId, session.sessionId);
+          await ownership.returnToAgent();
+        }));
     } else if (path === "/api/reclaim") {
       if (
         typeof body !== "object"
@@ -379,12 +382,13 @@ export function createViewerServer(options: ViewerServerOptions): ViewerServer {
         || !("confirm" in body)
         || body.confirm !== true
       ) throw new HttpFailure(400);
-      await transition(session.workspaceId, async () => {
-        const ownership = options.services.ownership(session.workspaceId);
-        const priorOwner = ownership.snapshot().ownerViewerSessionId;
-        if (priorOwner) await releaseSessionInput(session.workspaceId, priorOwner);
-        ownership.reclaim(session.sessionId);
-      });
+      await recordManualTransition(options.services.activity(session.workspaceId), "manual-reclaim", "viewer", () =>
+        transition(session.workspaceId, async () => {
+          const ownership = options.services.ownership(session.workspaceId);
+          const priorOwner = ownership.snapshot().ownerViewerSessionId;
+          if (priorOwner) await releaseSessionInput(session.workspaceId, priorOwner);
+          ownership.reclaim(session.sessionId);
+        }));
     } else if (path === "/api/sign-out") {
       await transition(session.workspaceId, async () => {
         await releaseSessionInput(session.workspaceId, session.sessionId);

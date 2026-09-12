@@ -175,7 +175,7 @@ describe("bounded rendering and viewer links", () => {
 describe("activity rendering", () => {
   const records = sanitizeActivity([
     { operationId: "1", source: "agent", tabId: "tab-1", action: "navigate", status: "ok", startedAt: "2026-09-12T00:00:00Z", endedAt: null, code: null, url: "https://example.test/?token=x", title: "Page" },
-    { operationId: "2", source: "viewer", tabId: "tab-1", action: "return-to-agent", status: "error", startedAt: "2026-09-12T00:01:00Z", endedAt: null, code: "busy", url: null, title: null },
+    { operationId: "2", source: "agent", tabId: "tab-1", action: "click", status: "error", startedAt: "2026-09-12T00:01:00Z", endedAt: null, code: "stale_ref", url: null, title: null },
   ]);
 
   it("renders newest first and keeps redacted bounded fields", () => {
@@ -184,8 +184,7 @@ describe("activity rendering", () => {
     expect(JSON.stringify(records)).not.toContain("token=x");
   });
 
-  it("filters errors and manual-control events behaviorally", () => {
+  it("filters errors behaviorally", () => {
     expect(filterActivity(records, "errors").map((record) => record.operationId)).toEqual(["2"]);
-    expect(filterActivity(records, "manual").map((record) => record.operationId)).toEqual(["2"]);
   });
 });

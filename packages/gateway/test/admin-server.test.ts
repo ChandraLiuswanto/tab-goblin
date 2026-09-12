@@ -14,6 +14,7 @@ const SECOND = "22222222-2222-4222-8222-222222222222";
 const openServers: Array<{ close(): Promise<void> }> = [];
 
 afterEach(async () => {
+  vi.useRealTimers();
   await Promise.all(openServers.splice(0).map((server) => server.close()));
 });
 
@@ -60,6 +61,8 @@ function harness(overrides: Record<string, unknown> = {}) {
   const session = browser();
   const services = {
     runtime,
+    start: vi.fn(async () => undefined),
+    stop: vi.fn(async () => undefined),
     ownership: vi.fn(() => ownership),
     activity: vi.fn(() => activity),
     browser: vi.fn(async () => session),
@@ -168,6 +171,28 @@ describe("admin request handling", () => {
     expect(services.runtime.state).not.toHaveBeenCalled();
   });
 
+  it("allows a validated thirty-second navigation timeout plus bounded handler overhead", async () => {
+    vi.useFakeTimers();
+    const { server, enrollment, session } = harness();
+    enroll(enrollment);
+    session.navigate.mockImplementation(async (tabId: string, url: string) =>
+      new Promise((resolve) => setTimeout(
+        () => resolve({ tabId, title: "delayed", url, active: true }),
+        20_001,
+      )),
+    );
+
+    const pending = server.handle(tool("tabgoblin_navigate", {
+      tabId: "t1",
+      url: "https://example.com/delayed",
+      timeoutMs: 30_000,
+    }));
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(20_001);
+
+    await expect(pending).resolves.toMatchObject({ ok: true });
+  });
+
   it("returns bounded status without exposing runtime endpoints or profile paths", async () => {
     const { server } = harness();
     const response = await server.handle({ op: "status", workspaceId: "ws-1" });
@@ -237,7 +262,7 @@ describe("admin request handling", () => {
   });
 
   it("dispatches admin lifecycle, pairing, and explicit revocation operations", async () => {
-    const { server, runtime, ownership, enrollment } = harness();
+    const { server, services, runtime, ownership, enrollment } = harness();
     enroll(enrollment);
     enroll(enrollment, { enrollment: SECOND, agentId: "agent-2" });
 
@@ -262,9 +287,21 @@ describe("admin request handling", () => {
       lifecycleGeneration: 2,
     });
 
-    expect(runtime.start).toHaveBeenCalledWith("ws-1");
-    expect(runtime.stop).toHaveBeenCalledWith("ws-1");
+    expect(services.start).toHaveBeenCalledWith("ws-1");
+    expect(services.stop).toHaveBeenCalledWith("ws-1");
+    expect(runtime.start).not.toHaveBeenCalled();
+    expect(runtime.stop).not.toHaveBeenCalled();
     expect(ownership.returnToAgent).toHaveBeenCalledOnce();
+  });
+
+  it("starts through workspace lifecycle coordination without acquiring a stale browser lease", async () => {
+    const { server, services, enrollment, ownership } = harness();
+    enroll(enrollment);
+
+    await expect(server.handle(tool("tabgoblin_start"))).resolves.toMatchObject({ ok: true });
+
+    expect(services.start).toHaveBeenCalledWith("ws-1");
+    expect(ownership.acquireAgentLease).not.toHaveBeenCalled();
   });
 
   it("handles plugin enrollment notifications without starting a runtime", async () => {
@@ -521,6 +558,20 @@ describe("authenticated tool dispatch", () => {
     const response = await server.handle(tool("tabgoblin_list_tabs"));
     expect(response).toMatchObject({ ok: false, error: { code: "runtime_unavailable" } });
     expect(JSON.stringify(response)).not.toMatch(/9222|\/profile|secret endpoint/);
+  });
+
+  it("marks a mutation uncertain when lifecycle generation changes after dispatch", async () => {
+    const { server, enrollment, session, abandonUncertain, setGeneration } = harness();
+    enroll(enrollment);
+    session.act.mockImplementationOnce(async () => { setGeneration(3); });
+
+    const response = await server.handle(tool("tabgoblin_click", { tabId: "t1", ref: "r1-e0" }));
+
+    expect(response).toMatchObject({
+      ok: false,
+      error: { code: "timeout_uncertain", retryable: false },
+    });
+    expect(abandonUncertain).toHaveBeenCalledOnce();
   });
 
   it("fails closed on handler timeout and abandons an uncertain lease", async () => {

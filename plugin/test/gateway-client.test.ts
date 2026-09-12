@@ -2,11 +2,12 @@ import { createServer } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createGatewayClient, createGatewayManager } from "../server/gateway-client.js";
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => {
+  vi.useRealTimers();
   await Promise.all(cleanup.splice(0).map((remove) => remove()));
 });
 
@@ -33,6 +34,59 @@ describe("gateway client", () => {
     await expect(client.request({ op: "start", workspaceId: "ws-1" })).resolves.toEqual({ ok: true });
     expect(received).toEqual([{ op: "start", workspaceId: "ws-1" }]);
     expect(client.notify({ op: "stop", workspaceId: "ws-1" })).toBeUndefined();
+  });
+
+  it("allows a bounded runtime lifecycle response to outlive the old ten-second default", async () => {
+    vi.useFakeTimers();
+    const directory = await mkdtemp(join(tmpdir(), "tabgoblin-plugin-"));
+    const socketPath = join(directory, "gateway.sock");
+    let received!: () => void;
+    const requestReceived = new Promise<void>((resolve) => { received = resolve; });
+    const server = createServer((request, response) => {
+      request.resume();
+      request.once("end", () => {
+        received();
+        setTimeout(() => response.end(JSON.stringify({ ok: true })), 10_001);
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+    cleanup.push(() => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))).then(() => rm(directory, { recursive: true })));
+
+    const client = createGatewayClient(socketPath);
+    const pending = client.request({ op: "start", workspaceId: "ws-1" });
+    await requestReceived;
+    await vi.advanceTimersByTimeAsync(10_001);
+
+    await expect(pending).resolves.toEqual({ ok: true });
+    client.close();
+  });
+
+  it("preserves an explicit short deadline and marks a dispatched timeout uncertain", async () => {
+    vi.useFakeTimers();
+    const directory = await mkdtemp(join(tmpdir(), "tabgoblin-plugin-"));
+    const socketPath = join(directory, "gateway.sock");
+    let received!: () => void;
+    const requestReceived = new Promise<void>((resolve) => { received = resolve; });
+    const server = createServer((request, response) => {
+      request.resume();
+      request.once("end", () => {
+        received();
+        setTimeout(() => response.end(JSON.stringify({ ok: true })), 50);
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+    cleanup.push(() => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))).then(() => rm(directory, { recursive: true })));
+
+    const client = createGatewayClient(socketPath);
+    const pending = client.request({ op: "stop", workspaceId: "ws-1" }, 10);
+    await requestReceived;
+    await vi.advanceTimersByTimeAsync(10);
+
+    await expect(pending).resolves.toMatchObject({
+      ok: false,
+      error: { code: "timeout_uncertain", retryable: false },
+    });
+    client.close();
   });
 
   it("rejects an oversized byte response", async () => {

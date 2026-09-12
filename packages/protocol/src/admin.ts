@@ -103,3 +103,48 @@ export const AdminResponseSchema = z.discriminatedUnion("ok", [
   z.object({ ok: z.literal(false), error: TabGoblinErrorSchema }).strict(),
 ]);
 export type AdminResponse = z.infer<typeof AdminResponseSchema>;
+
+/** Shared wall-clock budgets keep each transport outside the operation it carries. */
+export const DEFAULT_GATEWAY_OPERATION_TIMEOUT_MS = 20_000;
+export const RUNTIME_START_TIMEOUT_MS = 60_000;
+export const RUNTIME_OPERATION_TIMEOUT_MS = 30_000;
+export const RUNTIME_STOP_TIMEOUT_MS = 30_000;
+export const OWNERSHIP_DRAIN_TIMEOUT_MS = 15_000;
+export const BROWSER_OPERATION_TIMEOUT_MS = 10_000;
+export const GATEWAY_OPERATION_OVERHEAD_MS = 5_000;
+export const GATEWAY_TRANSPORT_OVERHEAD_MS = 5_000;
+
+function toolTimeoutMs(request: Extract<AdminRequest, { op: "tool" }>): number | null {
+  const value = request.input.timeoutMs;
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+/** Maximum gateway handling time for a validated operation, including bounded local overhead. */
+export function gatewayOperationTimeoutMs(request: AdminRequest): number {
+  if (request.op === "start" || (request.op === "tool" && request.name === "tabgoblin_start")) {
+    return RUNTIME_START_TIMEOUT_MS
+      + BROWSER_OPERATION_TIMEOUT_MS
+      + GATEWAY_OPERATION_OVERHEAD_MS;
+  }
+  if (request.op === "stop") {
+    return OWNERSHIP_DRAIN_TIMEOUT_MS + RUNTIME_STOP_TIMEOUT_MS + GATEWAY_OPERATION_OVERHEAD_MS;
+  }
+  if (request.op === "tool" && request.name === "tabgoblin_upload") {
+    return RUNTIME_OPERATION_TIMEOUT_MS + DEFAULT_GATEWAY_OPERATION_TIMEOUT_MS + GATEWAY_OPERATION_OVERHEAD_MS;
+  }
+  if (request.op === "tool") {
+    const requested = toolTimeoutMs(request);
+    if (requested !== null) {
+      return Math.max(
+        DEFAULT_GATEWAY_OPERATION_TIMEOUT_MS,
+        requested + GATEWAY_OPERATION_OVERHEAD_MS,
+      );
+    }
+  }
+  return DEFAULT_GATEWAY_OPERATION_TIMEOUT_MS;
+}
+
+/** Default client-side deadline. Explicit caller deadlines may still select a shorter bound. */
+export function gatewayTransportTimeoutMs(request: AdminRequest): number {
+  return gatewayOperationTimeoutMs(request) + GATEWAY_TRANSPORT_OVERHEAD_MS;
+}

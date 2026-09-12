@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
-import { tabGoblinError, type SessionState, type TabGoblinError } from "@tab-goblin/protocol";
+import {
+  RUNTIME_OPERATION_TIMEOUT_MS,
+  RUNTIME_START_TIMEOUT_MS,
+  RUNTIME_STOP_TIMEOUT_MS,
+  tabGoblinError,
+  type SessionState,
+  type TabGoblinError,
+} from "@tab-goblin/protocol";
 
 /**
  * T9 production executors MUST terminate the child process when this signal aborts.
@@ -52,9 +59,6 @@ interface PodmanResult {
   stderr: string;
 }
 
-const DEFAULT_START_TIMEOUT_MS = 60_000;
-const DEFAULT_OPERATION_TIMEOUT_MS = 30_000;
-const MIN_STOP_OPERATION_TIMEOUT_MS = 30_000;
 const MAX_TIMER_MS = 2_147_483_647;
 const GRACEFUL_STOP_SECONDS = 20;
 const POLL_INTERVAL_MS = 500;
@@ -122,15 +126,15 @@ export class RuntimeSupervisor {
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
 
   constructor(private readonly options: RuntimeSupervisorOptions) {
-    this.timeout = duration(options.startTimeoutMs, DEFAULT_START_TIMEOUT_MS, "startTimeoutMs");
+    this.timeout = duration(options.startTimeoutMs, RUNTIME_START_TIMEOUT_MS, "startTimeoutMs");
     this.operationTimeout = duration(
       options.operationTimeoutMs,
-      DEFAULT_OPERATION_TIMEOUT_MS,
+      RUNTIME_OPERATION_TIMEOUT_MS,
       "operationTimeoutMs",
     );
     this.stopOperationTimeout = Math.max(
       this.operationTimeout,
-      MIN_STOP_OPERATION_TIMEOUT_MS,
+      RUNTIME_STOP_TIMEOUT_MS,
     );
     this.monotonicNow = options.monotonicNow
       ?? (options.now ? guardLegacyClock(options.now) : () => performance.now());
@@ -471,7 +475,7 @@ export class RuntimeSupervisor {
     if (!this.isStaleState(state)) {
       removalDeadline = Math.max(
         deadline,
-        this.deadline(MIN_STOP_OPERATION_TIMEOUT_MS),
+        this.deadline(RUNTIME_STOP_TIMEOUT_MS),
       );
       await this.requireSuccess(
         ["stop", "--ignore", "--time", String(GRACEFUL_STOP_SECONDS), containerName],

@@ -10,6 +10,8 @@ import {
   ENROLLMENT_ENV,
   ERROR_CODES,
   formatRef,
+  gatewayOperationTimeoutMs,
+  gatewayTransportTimeoutMs,
   isNavigableUrl,
   MCP_SERVER_NAME,
   NetworkDiagnosticSchema,
@@ -40,6 +42,27 @@ const HIGH_SURROGATE = String.fromCharCode(0xd83d);
 const LOW_SURROGATE = String.fromCharCode(0xde00);
 const REPLACEMENT = String.fromCharCode(0xfffd);
 const ELLIPSIS = String.fromCharCode(8230);
+
+describe("operation budgets", () => {
+  it("keeps each outer transport budget above its bounded gateway operation", () => {
+    const requests = [
+      { op: "status", workspaceId: "ws-1" },
+      { op: "start", workspaceId: "ws-1" },
+      { op: "stop", workspaceId: "ws-1" },
+      {
+        op: "tool",
+        enrollment: "11111111-1111-4111-8111-111111111111",
+        workspaceId: "ws-1",
+        name: "tabgoblin_navigate",
+        input: { tabId: "t1", url: "https://example.com", timeoutMs: 30_000 },
+        source: "test",
+      },
+    ] as const;
+
+    expect(requests.map(gatewayOperationTimeoutMs)).toEqual([20_000, 75_000, 50_000, 35_000]);
+    expect(requests.map(gatewayTransportTimeoutMs)).toEqual([25_000, 80_000, 55_000, 40_000]);
+  });
+});
 
 describe("redactUrl", () => {
   it("strips userinfo, query and fragment", () => {

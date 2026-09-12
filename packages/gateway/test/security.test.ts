@@ -328,6 +328,7 @@ describe("agent scope and bounded local control plane", () => {
       socketPath: join(tmpdir(), "tabgoblin-security-bridge.sock"),
       services: {
         runtime,
+        start: async () => { await runtime.start(); },
         ownership: () => new OwnershipController(),
         activity: () => new ActivityFeed(),
         viewerUrlFor: () => "https://viewer.example/ws-a",

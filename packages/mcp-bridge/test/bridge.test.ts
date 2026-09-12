@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TOOL_NAMES, type AdminResponse } from "@tab-goblin/protocol";
-import { buildToolDefinitions, createBridge } from "../src/index.js";
+import { buildToolDefinitions, createBridge, createSocketCaller } from "../src/index.js";
 import {
   createIsolatedWorkspace,
   workspaceEnvironment,
@@ -52,6 +52,54 @@ describe("tool definitions", () => {
     expect(network.description).toMatch(/redact/i);
     expect(network.description).toMatch(/no.*bodies/i);
     expect(JSON.stringify(network.inputSchema)).not.toMatch(/requestBody|responseBody|cookie|header/i);
+  });
+});
+
+describe("socket deadlines", () => {
+  it("allows a thirty-second navigation budget plus bounded gateway overhead", async () => {
+    vi.useFakeTimers();
+    const directory = await mkdtemp(join(tmpdir(), "tabgoblin-bridge-deadline-"));
+    const socketPath = join(directory, "gateway.sock");
+    let received!: () => void;
+    const requestReceived = new Promise<void>((resolve) => { received = resolve; });
+    const server = createServer((request, response) => {
+      request.resume();
+      request.once("end", () => {
+        received();
+        setTimeout(() => response.end(JSON.stringify({ ok: true })), 20_001);
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+
+    try {
+      const call = createSocketCaller(socketPath);
+      const pending = call({
+        op: "tool",
+        enrollment: "11111111-1111-4111-8111-111111111111",
+        workspaceId: "ws-1",
+        name: "tabgoblin_navigate",
+        input: { tabId: "t1", url: "https://example.com", timeoutMs: 30_000 },
+        source: "test",
+      });
+      await requestReceived;
+      await vi.advanceTimersByTimeAsync(20_001);
+      await expect(pending).resolves.toEqual({ ok: true });
+    } finally {
+      vi.useRealTimers();
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies an already-aborted call as known pre-dispatch failure", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("caller cancelled"));
+    const call = createSocketCaller(join(tmpdir(), "missing-tabgoblin.sock"));
+
+    await expect(call({ op: "health" }, controller.signal)).rejects.toMatchObject({
+      code: "runtime_unavailable",
+      retryable: true,
+    });
   });
 });
 

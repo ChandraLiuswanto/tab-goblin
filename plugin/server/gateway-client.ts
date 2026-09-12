@@ -1,14 +1,30 @@
 import { request as httpRequest } from "node:http";
 import { performance } from "node:perf_hooks";
-import { AdminResponseSchema, PROTOCOL_VERSION, tabGoblinError, type AdminRequest, type AdminResponse } from "@tab-goblin/protocol";
-
-const DEFAULT_TIMEOUT_MS = 10_000;
+import {
+  AdminResponseSchema,
+  PROTOCOL_VERSION,
+  gatewayTransportTimeoutMs,
+  tabGoblinError,
+  type AdminRequest,
+  type AdminResponse,
+} from "@tab-goblin/protocol";
 const NOTIFY_TIMEOUT_MS = 2_000;
 const CANDIDATE_PROBE_TIMEOUT_MS = 2_000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 
 function unavailable(): AdminResponse {
   return { ok: false, error: tabGoblinError("runtime_unavailable", "TabGoblin runtime is unavailable") };
+}
+
+function uncertain(): AdminResponse {
+  return {
+    ok: false,
+    error: tabGoblinError(
+      "timeout_uncertain",
+      "The gateway request timed out after dispatch; inspect state before continuing",
+      false,
+    ),
+  };
 }
 
 function isRevokeAcknowledged(response: AdminResponse): response is AdminResponse & { ok: true; lifecycleGeneration: number } {
@@ -41,7 +57,7 @@ export interface GatewayManager extends GatewayClient {
 
 export function createGatewayClient(socketPath: string): GatewayClient {
   const pending = new Set<{ destroy(error?: Error): void }>();
-  function request(body: AdminRequest, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<AdminResponse> {
+  function request(body: AdminRequest, timeoutMs = gatewayTransportTimeoutMs(body)): Promise<AdminResponse> {
     return new Promise((resolve) => {
       const payload = JSON.stringify(body);
       const deadlineAt = performance.now() + timeoutMs;
@@ -54,7 +70,10 @@ export function createGatewayClient(socketPath: string): GatewayClient {
         pending.delete(req);
         resolve(response);
       };
-      const timer = setTimeout(() => req.destroy(new Error("gateway request timed out")), Math.max(1, deadlineAt - performance.now()));
+      const timer = setTimeout(() => {
+        req.destroy(new Error("gateway request timed out"));
+        finish(uncertain());
+      }, Math.max(1, deadlineAt - performance.now()));
       req = httpRequest({ socketPath, method: "POST", path: "/", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) } }, (response) => {
         const chunks: Buffer[] = [];
         let bytes = 0;

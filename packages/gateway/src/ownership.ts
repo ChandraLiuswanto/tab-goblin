@@ -1,4 +1,5 @@
 import {
+  OWNERSHIP_DRAIN_TIMEOUT_MS,
   tabGoblinError,
   type OwnershipState,
   type TabGoblinError,
@@ -31,7 +32,10 @@ interface DrainWaiter {
   settle(outcome: DrainOutcome): void;
 }
 
-const DEFAULT_DRAIN_TIMEOUT_MS = 15_000;
+interface LifecycleIntent {
+  state: "agent-ready" | "manual";
+  ownerViewerSessionId: string | null;
+}
 
 export class OwnershipController {
   private state: OwnershipState = "agent-ready";
@@ -40,11 +44,13 @@ export class OwnershipController {
   private ownerViewerSessionId: string | null = null;
   private activeLease: ActiveLease | null = null;
   private drainWaiter: DrainWaiter | null = null;
+  private lifecycleFenced = false;
+  private lifecycleIntent: LifecycleIntent | null = null;
   private readonly generationListeners = new Set<(generation: number) => void>();
   private readonly drainTimeoutMs: number;
 
   constructor(options: { now?: () => number; drainTimeoutMs?: number } = {}) {
-    const drainTimeoutMs = options.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS;
+    const drainTimeoutMs = options.drainTimeoutMs ?? OWNERSHIP_DRAIN_TIMEOUT_MS;
     if (!Number.isSafeInteger(drainTimeoutMs) || drainTimeoutMs < 0) {
       throw new RangeError("drainTimeoutMs must be a non-negative safe integer");
     }
@@ -64,6 +70,9 @@ export class OwnershipController {
   acquireAgentLease(operationId: string): Lease {
     if (this.state !== "agent-ready") {
       throw this.manualControlError();
+    }
+    if (this.lifecycleFenced) {
+      throw tabGoblinError("busy", "The browser runtime is changing lifecycle state.");
     }
     if (this.activeLease) {
       throw tabGoblinError("busy", "Another browser operation is already in progress.");
@@ -95,6 +104,9 @@ export class OwnershipController {
   }
 
   async requestTakeControl(viewerSessionId: string): Promise<OwnershipSnapshot> {
+    if (this.lifecycleFenced) {
+      throw this.manualControlError();
+    }
     if (this.state !== "agent-ready") {
       throw this.manualControlError();
     }
@@ -131,6 +143,9 @@ export class OwnershipController {
   }
 
   async returnToAgent(): Promise<OwnershipSnapshot> {
+    if (this.lifecycleFenced) {
+      throw this.manualControlError();
+    }
     if (this.state !== "manual") {
       throw this.manualControlError();
     }
@@ -145,6 +160,9 @@ export class OwnershipController {
   }
 
   reclaim(viewerSessionId: string): OwnershipSnapshot {
+    if (this.lifecycleFenced) {
+      throw this.manualControlError();
+    }
     if (this.state !== "manual") {
       throw this.manualControlError();
     }
@@ -159,7 +177,56 @@ export class OwnershipController {
   }
 
   mayViewerSendInput(viewerSessionId: string): boolean {
-    return this.state === "manual" && this.ownerViewerSessionId === viewerSessionId;
+    return !this.lifecycleFenced
+      && this.state === "manual"
+      && this.ownerViewerSessionId === viewerSessionId;
+  }
+
+  async beginRuntimeTransition(): Promise<void> {
+    if (!this.lifecycleFenced) {
+      const priorState = this.state;
+      this.lifecycleIntent = priorState === "manual"
+        ? { state: "manual", ownerViewerSessionId: this.ownerViewerSessionId }
+        : { state: "agent-ready", ownerViewerSessionId: null };
+      this.lifecycleFenced = true;
+      this.advanceGeneration();
+      if (priorState !== "agent-ready" && priorState !== "manual") {
+        this.enterNeedsAttention();
+        throw tabGoblinError(
+          "timeout_uncertain",
+          "The ownership transition could not be fenced safely; restart the session before continuing.",
+        );
+      }
+    }
+
+    const lease = this.activeLease;
+    if (!lease) return;
+    const outcome = await this.waitForDrain(lease);
+    if (outcome !== "released") {
+      this.enterNeedsAttention();
+      throw tabGoblinError(
+        "timeout_uncertain",
+        "The in-flight browser operation could not be proven finished; restart the session before continuing.",
+      );
+    }
+  }
+
+  completeRuntimeTransition(): OwnershipSnapshot {
+    if (!this.lifecycleFenced || !this.lifecycleIntent || this.activeLease) {
+      this.enterNeedsAttention();
+      throw tabGoblinError(
+        "timeout_uncertain",
+        "The browser runtime transition could not be completed safely.",
+      );
+    }
+
+    const intent = this.lifecycleIntent;
+    this.state = intent.state;
+    this.owner = intent.state === "manual" ? "viewer" : null;
+    this.ownerViewerSessionId = intent.ownerViewerSessionId;
+    this.lifecycleIntent = null;
+    this.lifecycleFenced = false;
+    return this.snapshot();
   }
 
   onGenerationChange(listener: (generation: number) => void): () => void {
@@ -201,6 +268,7 @@ export class OwnershipController {
           this.drainWaiter = null;
         }
         if (outcome === "timeout") {
+          if (this.activeLease?.token === lease.token) this.activeLease = null;
           this.enterNeedsAttention();
         }
         resolve(outcome);

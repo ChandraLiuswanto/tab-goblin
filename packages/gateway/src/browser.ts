@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { posix as path } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
+  BROWSER_OPERATION_TIMEOUT_MS,
   NETWORK_DIAGNOSTIC_LIMIT,
   NetworkDiagnosticSchema,
   SnapshotSchema,
@@ -49,7 +50,7 @@ interface TabState {
   readonly network: NetworkDiagnostic[];
 }
 
-const DEFAULT_TIMEOUT_MS = 10_000;
+const DEFAULT_TIMEOUT_MS = BROWSER_OPERATION_TIMEOUT_MS;
 const RAW_FIELD_LIMIT = 4096;
 const MAX_TIMEOUT_MS = 30_000;
 const MIN_TIMEOUT_MS = 1000;

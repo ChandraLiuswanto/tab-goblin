@@ -5,6 +5,54 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe("runtime lifecycle fencing", () => {
+  it("gates agent leases and manual viewer input while preserving the intended owner", async () => {
+    const controller = new OwnershipController();
+    await controller.requestTakeControl("viewer-1");
+
+    await controller.beginRuntimeTransition();
+
+    expect(controller.snapshot()).toMatchObject({
+      state: "manual",
+      owner: "viewer",
+      ownerViewerSessionId: "viewer-1",
+      generation: 2,
+    });
+    expect(controller.mayViewerSendInput("viewer-1")).toBe(false);
+    expect(() => controller.acquireAgentLease("blocked")).toThrow();
+
+    controller.completeRuntimeTransition();
+    expect(controller.mayViewerSendInput("viewer-1")).toBe(true);
+    expect(controller.snapshot().ownerViewerSessionId).toBe("viewer-1");
+  });
+
+  it("allows only an explicit runtime transition to recover prior needs-attention state", async () => {
+    const controller = new OwnershipController();
+    controller.acquireAgentLease("mutation-1").abandonUncertain();
+    expect(controller.snapshot().state).toBe("needs-attention");
+
+    await expect(controller.beginRuntimeTransition()).rejects.toMatchObject({ code: "timeout_uncertain" });
+    expect(() => controller.acquireAgentLease("blocked")).toThrow();
+
+    expect(controller.completeRuntimeTransition()).toMatchObject({ state: "agent-ready", owner: null });
+  });
+
+  it("keeps an unknown mutation fail-closed and ignores its stale lease", async () => {
+    vi.useFakeTimers();
+    const controller = new OwnershipController({ drainTimeoutMs: 10 });
+    const lease = controller.acquireAgentLease("mutation-1");
+    const transition = controller.beginRuntimeTransition().catch((error: unknown) => error);
+
+    await vi.advanceTimersByTimeAsync(10);
+    await expect(transition).resolves.toMatchObject({ code: "timeout_uncertain" });
+    expect(controller.snapshot()).toMatchObject({ state: "needs-attention", owner: null, generation: 1 });
+    expect(() => controller.acquireAgentLease("blocked")).toThrow();
+
+    lease.release("ok");
+    expect(controller.snapshot()).toMatchObject({ state: "needs-attention", owner: null, generation: 1 });
+  });
+});
+
 describe("agent leases", () => {
   it("starts agent-ready at generation 0 with no active owner", () => {
     expect(new OwnershipController().snapshot()).toEqual({

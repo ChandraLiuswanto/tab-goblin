@@ -27,6 +27,8 @@ export interface WorkspaceServiceOptions {
 interface WorkspaceEntry {
   ownership: OwnershipController;
   activity: ActivityFeed;
+  transitioning: boolean;
+  lifecycleTail: Promise<void>;
   browser: {
     cdpUrl: string;
     promise: Promise<BrowserSession>;
@@ -177,6 +179,8 @@ export function createWorkspaceServices(options: WorkspaceServiceOptions): Works
     entry = {
       ownership: new OwnershipController(),
       activity: new ActivityFeed(),
+      transitioning: false,
+      lifecycleTail: Promise.resolve(),
       browser: null,
     };
     const ownedEntry = entry;
@@ -185,8 +189,58 @@ export function createWorkspaceServices(options: WorkspaceServiceOptions): Works
     return entry;
   };
 
+  const serializeLifecycle = <T>(entry: WorkspaceEntry, operation: () => Promise<T>): Promise<T> => {
+    const result = entry.lifecycleTail.catch(() => undefined).then(operation);
+    entry.lifecycleTail = result.then(() => undefined, () => undefined);
+    return result;
+  };
+
+  const detachBrowser = async (entry: WorkspaceEntry): Promise<void> => {
+    const record = entry.browser;
+    entry.browser = null;
+    if (!record) return;
+    if (record.session) await record.session.close().catch(() => undefined);
+  };
+
+  const beginTransition = (entry: WorkspaceEntry): Promise<void> => {
+    if (entry.transitioning) return Promise.resolve();
+    entry.transitioning = true;
+    return entry.ownership.beginRuntimeTransition();
+  };
+
+  const start = (workspaceId: string): Promise<void> => {
+    const entry = entryFor(workspaceId);
+    return serializeLifecycle(entry, async () => {
+      if (options.runtime.state(workspaceId) === "ready" && !entry.transitioning) return;
+      const fencing = beginTransition(entry);
+      await detachBrowser(entry);
+      await fencing;
+      await options.runtime.start(workspaceId);
+      entry.ownership.completeRuntimeTransition();
+      entry.transitioning = false;
+    });
+  };
+
+  const stop = (workspaceId: string): Promise<void> => {
+    const entry = entryFor(workspaceId);
+    return serializeLifecycle(entry, async () => {
+      const fencing = beginTransition(entry);
+      await detachBrowser(entry);
+      let fenceError: unknown;
+      try {
+        await fencing;
+      } catch (error: unknown) {
+        fenceError = error;
+      }
+      await options.runtime.stop(workspaceId);
+      if (fenceError) throw fenceError;
+    });
+  };
+
   return {
     runtime: options.runtime,
+    start,
+    stop,
     ownership: (workspaceId) => entryFor(workspaceId).ownership,
     activity: (workspaceId) => entryFor(workspaceId).activity,
     browser: async (workspaceId) => {
@@ -196,6 +250,7 @@ export function createWorkspaceServices(options: WorkspaceServiceOptions): Works
       const endpoints = options.runtime.endpoints(workspaceId);
       if (!endpoints) throw new Error("Browser runtime endpoints are unavailable");
       const entry = entryFor(workspaceId);
+      if (entry.transitioning) throw new Error("Browser runtime is changing lifecycle state");
       if (entry.browser?.cdpUrl === endpoints.cdpUrl) return entry.browser.promise;
 
       const generation = entry.ownership.snapshot().generation;
@@ -204,8 +259,16 @@ export function createWorkspaceServices(options: WorkspaceServiceOptions): Works
         session: null,
         promise: Promise.resolve(null as never),
       };
-      record.promise = attach(endpoints.cdpUrl).then((session) => {
+      record.promise = attach(endpoints.cdpUrl).then(async (session) => {
         record.session = session;
+        if (
+          entry.browser !== record ||
+          entry.transitioning ||
+          options.runtime.state(workspaceId) !== "ready"
+        ) {
+          await session.close().catch(() => undefined);
+          throw new Error("Browser attachment crossed a runtime lifecycle transition");
+        }
         if (entry.ownership.snapshot().generation !== generation) session.invalidateRefs();
         return session;
       }).catch((error: unknown) => {

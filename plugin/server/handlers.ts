@@ -10,14 +10,43 @@ async function validWorkspace(context: PluginHandlerContext, workspaceId: string
 }
 export function ping() { return { protocolVersion: PROTOCOL_VERSION }; }
 
+type Scope = { workspaceId: string; cwd: string };
+
 export function createHandlers(gateway: GatewayClient, lifecycle: LifecycleCoordinator) {
-  const gatewayHandler = (op: "status" | "start" | "stop" | "activity" | "pair" | "return-to-agent") =>
-    async ({ workspaceId, cwd }: { workspaceId: string; cwd: string }, context: PluginHandlerContext): Promise<AdminResponse> =>
-      await validWorkspace(context, workspaceId, cwd) ? gateway.request({ op, workspaceId } as never) : invalidWorkspace();
+  const gatewayHandler = (op: "status" | "tabs" | "start" | "stop" | "activity" | "pair" | "return-to-agent") =>
+    async ({ workspaceId, cwd }: Scope, context: PluginHandlerContext): Promise<AdminResponse> =>
+      await validWorkspace(context, workspaceId, cwd) ? gateway.request({ op, workspaceId }) : invalidWorkspace();
   return {
-    status: gatewayHandler("status"), start: gatewayHandler("start"), stop: gatewayHandler("stop"), activity: gatewayHandler("activity"), pair: gatewayHandler("pair"), returnToAgent: gatewayHandler("return-to-agent"),
-    enableWorkspace: async ({ workspaceId, cwd, enabled }: { workspaceId: string; cwd: string; enabled: boolean }, context: PluginHandlerContext) => {
-      if (!await validWorkspace(context, workspaceId, cwd)) return { ok: false };
+    status: gatewayHandler("status"),
+    tabs: gatewayHandler("tabs"),
+    start: gatewayHandler("start"),
+    stop: gatewayHandler("stop"),
+    activity: gatewayHandler("activity"),
+    pair: gatewayHandler("pair"),
+    returnToAgent: gatewayHandler("return-to-agent"),
+    config: async ({ workspaceId, cwd }: Scope, context: PluginHandlerContext) => {
+      if (!await validWorkspace(context, workspaceId, cwd)) return { ok: false as const };
+      const settings = lifecycle.settings();
+      const workspaceEnabled = settings.enabledWorkspaceCwds.includes(cwd);
+      return {
+        ok: true as const,
+        globallyEnabled: settings.enabled,
+        workspaceEnabled,
+        effectiveEnabled: settings.enabled && workspaceEnabled,
+        socketPath: settings.socketPath,
+        viewerUrl: settings.viewerUrl,
+      };
+    },
+    setGlobalEnabled: async ({ workspaceId, cwd, enabled }: Scope & { enabled: boolean }, context: PluginHandlerContext) => {
+      if (!await validWorkspace(context, workspaceId, cwd)) return { ok: false as const };
+      return lifecycle.setGlobalEnabled(enabled);
+    },
+    updateConnection: async ({ workspaceId, cwd, socketPath, viewerUrl }: Scope & { socketPath: string; viewerUrl: string }, context: PluginHandlerContext) => {
+      if (!await validWorkspace(context, workspaceId, cwd)) return { ok: false as const };
+      return lifecycle.updateConnection({ socketPath, viewerUrl });
+    },
+    enableWorkspace: async ({ workspaceId, cwd, enabled }: Scope & { enabled: boolean }, context: PluginHandlerContext) => {
+      if (!await validWorkspace(context, workspaceId, cwd)) return { ok: false as const };
       return enabled ? lifecycle.enableWorkspace(workspaceId, cwd) : lifecycle.disableWorkspace(workspaceId, cwd);
     },
   };

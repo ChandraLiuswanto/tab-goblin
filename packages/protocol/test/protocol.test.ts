@@ -369,6 +369,10 @@ describe("admin and viewer wire contracts", () => {
       op: "status",
       workspaceId: "w1",
     });
+    expect(AdminRequestSchema.parse({ op: "tabs", workspaceId: "w1" })).toEqual({
+      op: "tabs",
+      workspaceId: "w1",
+    });
     expect(
       AdminRequestSchema.safeParse({ op: "tool", workspaceId: "w1", name: "other", source: "a" })
         .success,

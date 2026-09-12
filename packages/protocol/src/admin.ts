@@ -15,11 +15,12 @@ const enrollment = z.string().uuid();
 // Generation zero is the initial lifecycle. T12 must persist generations returned
 // by explicit reset operations and attach them to every later lifecycle notification.
 const lifecycleGeneration = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
-const scopedOperation = (op: "status" | "start" | "stop" | "activity" | "pair" | "return-to-agent") =>
+const scopedOperation = (op: "status" | "tabs" | "start" | "stop" | "activity" | "pair" | "return-to-agent") =>
   z.object({ op: z.literal(op), workspaceId }).strict();
 
 export const AdminRequestSchema = z.discriminatedUnion("op", [
   scopedOperation("status"),
+  scopedOperation("tabs"),
   scopedOperation("start"),
   scopedOperation("stop"),
   scopedOperation("activity"),

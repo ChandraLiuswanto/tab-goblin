@@ -175,6 +175,43 @@ describe("admin request handling", () => {
     expect(text).not.toMatch(/9222|cdp|\/profile|user-data-dir|volumeName/i);
   });
 
+  it("lists tabs over the trusted admin socket without an agent enrollment", async () => {
+    const { server, session } = harness();
+    session.listTabs.mockResolvedValueOnce([
+      { tabId: "tab-1", title: "Fixture", url: "https://fixture.test/", active: true },
+    ]);
+
+    await expect(server.handle({ op: "tabs", workspaceId: "ws-1" })).resolves.toEqual({
+      ok: true,
+      tabs: [{ tabId: "tab-1", title: "Fixture", url: "https://fixture.test/", active: true }],
+    });
+    expect(session.listTabs).toHaveBeenCalledWith(expect.any(AbortSignal));
+  });
+
+  it("caps trusted admin tab responses", async () => {
+    const { server, session } = harness();
+    session.listTabs.mockResolvedValueOnce(Array.from({ length: 120 }, (_, index) => ({
+      tabId: `tab-${index}`,
+      title: "Fixture",
+      url: "https://fixture.test/",
+      active: index === 0,
+    })));
+
+    const response = await server.handle({ op: "tabs", workspaceId: "ws-1" });
+    expect(response.ok && response.tabs).toHaveLength(100);
+  });
+
+  it("fails closed without attaching to a browser when tabs are requested before runtime readiness", async () => {
+    const runtime = { state: vi.fn(() => "stopped" as const), start: vi.fn(), stop: vi.fn(), stageFile: vi.fn() };
+    const { server, services } = harness({ runtime });
+
+    await expect(server.handle({ op: "tabs", workspaceId: "ws-1" })).resolves.toMatchObject({
+      ok: false,
+      error: { code: "session_not_ready" },
+    });
+    expect(services.browser).not.toHaveBeenCalled();
+  });
+
   it("dispatches admin lifecycle, pairing, and explicit revocation operations", async () => {
     const { server, runtime, ownership, enrollment } = harness();
     enroll(enrollment);

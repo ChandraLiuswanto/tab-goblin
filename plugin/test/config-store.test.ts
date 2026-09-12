@@ -21,6 +21,13 @@ describe("app-owned durable config", () => {
     createConfigStore(dir);
     expect(lstatSync(first.path).mode & 0o777).toBe(0o600);
   });
+  it("rejects credential-bearing viewer URLs and non-absolute socket paths", async () => {
+    const store = createConfigStore(directory());
+    await expect(store.update((current) => ({ ...current, viewerUrl: "https://user:secret@viewer.test/?token=secret" }))).rejects.toThrow();
+    await expect(store.update((current) => ({ ...current, socketPath: "relative.sock" }))).rejects.toThrow();
+    expect(store.read()).toMatchObject({ socketPath: "/tmp/tabgoblin.sock", viewerUrl: "" });
+  });
+
   it("rejects a symlink anywhere in the XDG state-home ancestor chain", () => {
     const root = directory(); const target = join(root, "target"); mkdirSync(target); const linked = join(root, "state-link"); symlinkSync(target, linked);
     const previous = process.env.XDG_STATE_HOME; process.env.XDG_STATE_HOME = linked;

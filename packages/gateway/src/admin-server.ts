@@ -702,6 +702,16 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
     switch (request.op) {
       case "status":
         return { ok: true, status: statusFor(request.workspaceId) };
+      case "tabs": {
+        if (services.runtime.state(request.workspaceId) !== "ready") {
+          throw tabGoblinError("session_not_ready", "The browser session is not ready", false);
+        }
+        deadline.check();
+        const browser = await services.browser(request.workspaceId);
+        deadline.check();
+        const tabs = await browser.listTabs(deadline.signal);
+        return { ok: true, tabs: TabSchema.array().max(100).parse(tabs.slice(0, 100)) };
+      }
       case "start":
         await services.runtime.start(request.workspaceId);
         return { ok: true, status: statusFor(request.workspaceId) };

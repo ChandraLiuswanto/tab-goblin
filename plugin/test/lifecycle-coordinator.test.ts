@@ -11,6 +11,76 @@ function store() { const directory = mkdtempSync(join(tmpdir(), "tabgoblin-lifec
 const unavailable = { ok: false as const, error: { code: "runtime_unavailable", message: "down", retryable: true } };
 
 describe("durable lifecycle coordinator", () => {
+  it("keeps the master switch independent from workspace opt-in", async () => {
+    const settings = store();
+    const gateway = { request: vi.fn().mockResolvedValue({ ok: true, lifecycleGeneration: 1 }), notify: vi.fn(), close: vi.fn() } as any;
+    const coordinator = createLifecycleCoordinator(settings, gateway);
+
+    expect(coordinator.settings().enabled).toBe(false);
+    await expect(coordinator.enableWorkspace("ws", "/w")).resolves.toEqual({ ok: true });
+    expect(coordinator.settings()).toMatchObject({ enabled: false, enabledWorkspaceCwds: ["/w"] });
+    await expect(coordinator.setGlobalEnabled(true)).resolves.toEqual({ ok: true });
+    expect(coordinator.settings()).toMatchObject({ enabled: true, enabledWorkspaceCwds: ["/w"] });
+  });
+
+  it("does not re-enable globally while a prior authority revocation remains pending", async () => {
+    const settings = store();
+    await settings.update((current) => ({ ...current, pendingRevocations: [{ kind: "workspace", id: "ws" }], workspaceGenerations: { ws: 3 } }));
+    const gateway = { request: vi.fn().mockResolvedValue(unavailable), notify: vi.fn(), close: vi.fn() } as any;
+    const coordinator = createLifecycleCoordinator(settings, gateway);
+
+    await expect(coordinator.setGlobalEnabled(true)).resolves.toEqual({ ok: false });
+    expect(settings.read().enabled).toBe(false);
+    expect(settings.read().pendingRevocations).toEqual([{ kind: "workspace", id: "ws" }]);
+  });
+
+  it("durably disables globally before revoking current workspace and agent identities", async () => {
+    const settings = store();
+    await settings.update((current) => ({ ...current, enabled: true, enabledWorkspaceCwds: ["/w"], workspaceGenerations: { ws: 3 }, activeAgentIds: ["agent"] }));
+    const observedEnabled: boolean[] = [];
+    const observedPending: unknown[] = [];
+    const gateway = { request: vi.fn(async () => { observedEnabled.push(settings.read().enabled); observedPending.push(settings.read().pendingRevocations); return { ok: true, lifecycleGeneration: 4 }; }), notify: vi.fn(), close: vi.fn() } as any;
+    const coordinator = createLifecycleCoordinator(settings, gateway);
+
+    await expect(coordinator.setGlobalEnabled(false)).resolves.toEqual({ ok: true });
+    expect(observedEnabled).toEqual([false, false]);
+    expect(observedPending[0]).toEqual([{ kind: "workspace", id: "ws" }, { kind: "agent", id: "agent" }]);
+    expect(gateway.request.mock.calls.map(([body]: any[]) => body)).toEqual([
+      { op: "revoke-workspace", workspaceId: "ws" },
+      { op: "revoke-agent", agentId: "agent" },
+    ]);
+    expect(settings.read()).toMatchObject({ enabled: false, pendingRevocations: [], revokedWorkspaceIds: ["ws"], revokedAgentIds: ["agent"] });
+  });
+
+  it("updates connection settings through socket synchronization before acknowledging the mutation", async () => {
+    const settings = store();
+    let activeSocket = "/tmp/old.sock";
+    const gateway = {
+      socketPath: vi.fn(() => activeSocket),
+      switchSocketPath: vi.fn(async (socketPath: string) => { activeSocket = socketPath; return []; }),
+      request: vi.fn(), notify: vi.fn(), close: vi.fn(),
+    } as any;
+    const coordinator = createLifecycleCoordinator(settings, gateway);
+
+    await expect(coordinator.updateConnection({ socketPath: "/tmp/new.sock", viewerUrl: "https://viewer.test/" })).resolves.toEqual({ ok: true });
+    expect(gateway.switchSocketPath).toHaveBeenCalledWith("/tmp/new.sock", [], undefined);
+    expect(settings.read()).toMatchObject({ socketPath: "/tmp/new.sock", viewerUrl: "https://viewer.test/" });
+  });
+
+  it("does not report a socket update as active when old authority revocation blocks the switch", async () => {
+    const settings = store();
+    await settings.update((current) => ({ ...current, workspaceGenerations: { ws: 2 } }));
+    const gateway = {
+      socketPath: vi.fn(() => "/tmp/old.sock"),
+      switchSocketPath: vi.fn().mockResolvedValue([unavailable]),
+      request: vi.fn(), notify: vi.fn(), close: vi.fn(),
+    } as any;
+    const coordinator = createLifecycleCoordinator(settings, gateway);
+
+    await expect(coordinator.updateConnection({ socketPath: "/tmp/new.sock", viewerUrl: "" })).resolves.toEqual({ ok: false });
+    expect(settings.read().pendingRevocations).toEqual([{ kind: "workspace", id: "ws" }]);
+  });
+
   it("does not report opt-out success or advance state until the revoke is acknowledged, then replays it after reload", async () => {
     const settings = store(); await settings.update((current) => ({ ...current, enabled: true, enabledWorkspaceCwds: ["/w"], workspaceGenerations: { ws: 7 } }));
     const firstGateway = { request: vi.fn().mockResolvedValue(unavailable), notify: vi.fn(), close: vi.fn() } as any;

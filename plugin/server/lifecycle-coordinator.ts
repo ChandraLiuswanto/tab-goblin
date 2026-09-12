@@ -93,6 +93,57 @@ export function createLifecycleCoordinator(settings: ConfigStore, gateway: Gatew
     }),
     revokeAgent: (agentId: string) => serialize(() => revoke({ kind: "agent", id: agentId })),
     revokeWorkspace: (workspaceId: string) => serialize(() => revoke({ kind: "workspace", id: workspaceId })),
+    setGlobalEnabled: (enabled: boolean) => serialize(async () => {
+      const current = settings.read();
+      if (enabled) {
+        if (current.enabled) return { ok: true as const };
+        const deadline = Date.now() + 2_000;
+        for (const pending of current.pendingRevocations) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) return { ok: false as const };
+          try { if (!await revoke(pending, remaining)) return { ok: false as const }; }
+          catch { return { ok: false as const }; }
+        }
+        if (settings.read().pendingRevocations.length > 0) return { ok: false as const };
+        await settings.update((value) => ({ ...value, enabled: true }));
+        return { ok: true as const };
+      }
+      const candidates: Pending[] = [
+        ...current.pendingRevocations,
+        ...Object.keys(current.workspaceGenerations)
+          .filter((id) => !current.revokedWorkspaceIds.includes(id))
+          .map((id) => ({ kind: "workspace" as const, id })),
+        ...current.activeAgentIds
+          .filter((id) => !current.revokedAgentIds.includes(id))
+          .map((id) => ({ kind: "agent" as const, id })),
+      ];
+      const targets = candidates.filter((item, index) => candidates.findIndex((candidate) => candidate.kind === item.kind && candidate.id === item.id) === index);
+      if (targets.length > 512) return { ok: false as const };
+      // Persist both the closed admission gate and every cleanup intent atomically.
+      // A crash at any later point can only leave replayable revocations behind.
+      await settings.update((value) => ({ ...value, enabled: false, pendingRevocations: targets }));
+      let acknowledged = true;
+      const deadline = Date.now() + 2_000;
+      for (const target of targets) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) { acknowledged = false; break; }
+        try { if (!await revoke(target, remaining)) acknowledged = false; }
+        catch { acknowledged = false; }
+      }
+      return { ok: acknowledged };
+    }),
+    updateConnection: (connection: { socketPath: string; viewerUrl: string }) => serialize(async () => {
+      const previousSocketPath = settings.read().socketPath;
+      await settings.update((value) => ({ ...value, socketPath: connection.socketPath, viewerUrl: connection.viewerUrl }));
+      if (previousSocketPath === connection.socketPath) return { ok: true as const };
+      try {
+        await synchronizeSocket();
+        const manager = gateway as Partial<GatewayManager>;
+        return { ok: typeof manager.socketPath === "function" && manager.socketPath() === connection.socketPath };
+      } catch {
+        return { ok: false as const };
+      }
+    }),
     enableWorkspace: (workspaceId: string, cwd: string) => serialize(async () => {
       const response = await request({ op: "reset-workspace", workspaceId });
       if (!isGeneration(response)) return { ok: false as const };

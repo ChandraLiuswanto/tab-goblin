@@ -87,6 +87,14 @@ assert_discovery_websockets() {
   local endpoint discovery urls url path handshake
   for endpoint in /json /json/list /json/version; do
     discovery="$(curl -fsS "http://127.0.0.1:$cdp_port$endpoint")"
+    case "$endpoint" in
+      /json|/json/list)
+        grep -q '"devtoolsFrontendUrl"' <<<"$discovery" \
+          || { echo "FAIL: $endpoint returned no DevTools frontend URL" >&2; return 1; }
+        grep -Fq "ws=127.0.0.1:$cdp_port/" <<<"$discovery" \
+          || { echo "FAIL: $endpoint did not rewrite the DevTools frontend authority" >&2; return 1; }
+        ;;
+    esac
     urls="$(grep -oE 'ws://[^" ]+' <<<"$discovery" || true)"
     [ -n "$urls" ] || { echo "FAIL: $endpoint returned no WebSocket URL" >&2; return 1; }
     while IFS= read -r url; do
@@ -245,6 +253,15 @@ podman rm "$NAME" >/dev/null
 start_runtime
 wait_for_cdp
 assert_discovery_websockets
+
+# The cookie persisted before the hard kill must survive recreate on the same volume.
+check_nonce_recreate="check_recreate_$RANDOM"
+check_marker_recreate="/tmp/tg-cookie-check-$check_nonce_recreate"
+start_cookie_fixture "$check_nonce_recreate" "$cookie_name" "$set_marker" "$check_marker_recreate"
+open_cookie_path "check-$check_nonce_recreate"
+wait_for_check_result "$check_marker_recreate"
+[ "$fixture_check_result" = present ] \
+  || { echo "FAIL: persisted cookie was lost after crash/remove/recreate (fixture result: $fixture_check_result)" >&2; exit 1; }
 
 # A dead relay or Chromium must stop the container rather than leave it falsely healthy.
 podman exec "$NAME" pkill -f '[n]ginx: master'

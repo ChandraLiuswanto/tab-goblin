@@ -74,6 +74,8 @@ A profile volume contains cookies and other login material. Filesystem permissio
 are not encryption at rest, and backups of the volume contain authenticated session
 data. Use encrypted host storage where required, keep volumes owner-restricted, and
 never mount, import, delete, or use a personal browser profile. The runtime holds an
-exclusive file lock for its full lifetime, so a second container using the same volume
-fails instead of corrupting an active Chromium profile. After a hard kill, the next
-lock holder removes stale Chromium singleton links only after acquiring that lock.
+exclusive file lock for its full lifetime. Do not start a second Podman container with
+an active profile volume: its `:Z` mount can relabel that volume to the second
+container's private MCS label before the runtime reaches the file-lock check. The
+supervisor must prevent duplicate runs for an active volume. After a hard kill, the
+next lock holder removes stale Chromium singleton links only after acquiring that lock.

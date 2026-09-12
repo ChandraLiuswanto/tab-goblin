@@ -1,16 +1,10 @@
 import { execFileSync, execSync } from "node:child_process";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { PROTOCOL_VERSION } from "../src/index.js";
+import { createIsolatedWorkspace, workspaceEnvironment } from "./isolated-workspace.js";
 
 interface PackageManifest {
   scripts?: Record<string, string>;
@@ -24,8 +18,12 @@ function readManifest(path: string): PackageManifest {
   return JSON.parse(readFileSync(new URL(path, repoRoot), "utf8")) as PackageManifest;
 }
 
-function run(command: string, cwd = repoRootPath): void {
-  execSync(command, { cwd, stdio: "pipe" });
+function run(command: string, cwd: string, workspaceRoot: string): void {
+  execSync(command, {
+    cwd,
+    env: workspaceEnvironment(workspaceRoot),
+    stdio: "pipe",
+  });
 }
 
 describe("protocol package", () => {
@@ -83,21 +81,22 @@ describe("workspace manifest wiring", () => {
   it("emits protocol declarations before checking a representative dependent import", () => {
     const root = readManifest("package.json");
     const firstTypecheckCommand = root.scripts?.typecheck?.split(" && ")[0];
-    const protocolDist = join(repoRootPath, "packages/protocol/dist");
-    const runDir = join(repoRootPath, ".tabgoblin-run");
-    mkdirSync(runDir, { recursive: true });
-    const fixtureDir = mkdtempSync(join(runDir, "protocol-typecheck-"));
+    const workspace = createIsolatedWorkspace(["protocol"]);
+    const protocolDist = join(workspace.packagePath("protocol"), "dist");
+    const fixtureDir = join(workspace.root, "fixtures");
     const fixture = join(fixtureDir, "dependent.ts");
 
+    mkdirSync(fixtureDir);
     writeFileSync(
       fixture,
       'import { PROTOCOL_VERSION } from "@tab-goblin/protocol";\nconst version: number = PROTOCOL_VERSION;\nvoid version;\n',
     );
-    rmSync(protocolDist, { recursive: true, force: true });
 
     try {
+      expect(existsSync(protocolDist)).toBe(false);
       if (!firstTypecheckCommand) throw new Error("root typecheck command is missing");
-      run(firstTypecheckCommand);
+      run(firstTypecheckCommand, workspace.root, workspace.root);
+      expect(existsSync(join(protocolDist, "index.d.ts"))).toBe(true);
       execFileSync(
         join(repoRootPath, "node_modules/.bin/tsc"),
         [
@@ -112,22 +111,23 @@ describe("workspace manifest wiring", () => {
           "--skipLibCheck",
           fixture,
         ],
-        { cwd: repoRootPath, stdio: "pipe" },
+        {
+          cwd: workspace.root,
+          env: workspaceEnvironment(workspace.root),
+          stdio: "pipe",
+        },
       );
     } finally {
-      rmSync(fixtureDir, { recursive: true, force: true });
-      rmSync(protocolDist, { recursive: true, force: true });
+      workspace.cleanup();
     }
   });
 
   it("typechecks the planned noVNC root import through the viewer command", () => {
     const viewer = readManifest("packages/viewer/package.json");
-    const viewerDir = join(repoRootPath, "packages/viewer");
-    const sourceDir = join(viewerDir, "src");
-    const sourceDirExisted = existsSync(sourceDir);
-    const fixture = join(sourceDir, "manifest-typecheck-smoke.ts");
+    const workspace = createIsolatedWorkspace(["protocol", "viewer"]);
+    const viewerDir = workspace.packagePath("viewer");
+    const fixture = join(viewerDir, "src", "manifest-typecheck-smoke.ts");
 
-    mkdirSync(sourceDir, { recursive: true });
     expect(existsSync(fixture)).toBe(false);
     writeFileSync(
       fixture,
@@ -140,15 +140,15 @@ describe("workspace manifest wiring", () => {
     );
 
     try {
-      // The prior clean-dist regression deliberately removes these declarations.
-      // Standalone viewer typechecking consumes the real generated protocol types.
-      run("npm run build -w @tab-goblin/protocol");
+      // The isolated protocol package starts without declarations, like a clean checkout.
+      // Standalone viewer typechecking consumes the declarations built in this workspace.
+      expect(existsSync(join(workspace.packagePath("protocol"), "dist"))).toBe(false);
+      run("npm run build -w @tab-goblin/protocol", workspace.root, workspace.root);
       const typecheckCommand = viewer.scripts?.typecheck;
       if (!typecheckCommand) throw new Error("viewer typecheck command is missing");
-      run(typecheckCommand, viewerDir);
+      run(typecheckCommand, viewerDir, workspace.root);
     } finally {
-      rmSync(fixture, { force: true });
-      if (!sourceDirExisted) rmSync(sourceDir, { recursive: true, force: true });
+      workspace.cleanup();
     }
   });
 });

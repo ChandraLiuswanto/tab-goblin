@@ -1,18 +1,21 @@
 import { request as httpRequest } from "node:http";
-import { mkdtemp, mkdir, readFile, rename, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rename, stat, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createConnection } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MAX_UPLOAD_BYTES } from "@tab-goblin/protocol";
 import { ActivityFeed } from "../src/activity-feed.js";
 import { createAdminServer } from "../src/admin-server.js";
 import { EnrollmentRegistry } from "../src/enrollment.js";
+import { OwnershipController } from "../src/ownership.js";
 
 const NONCE = "11111111-1111-4111-8111-111111111111";
 const SECOND = "22222222-2222-4222-8222-222222222222";
 const openServers: Array<{ close(): Promise<void> }> = [];
 
 afterEach(async () => {
+  vi.useRealTimers();
   await Promise.all(openServers.splice(0).map((server) => server.close()));
 });
 
@@ -59,6 +62,8 @@ function harness(overrides: Record<string, unknown> = {}) {
   const session = browser();
   const services = {
     runtime,
+    start: vi.fn(async () => undefined),
+    stop: vi.fn(async () => undefined),
     ownership: vi.fn(() => ownership),
     activity: vi.fn(() => activity),
     browser: vi.fn(async () => session),
@@ -77,7 +82,7 @@ function enroll(registry: EnrollmentRegistry, options: { enrollment?: string; cw
   const agentId = options.agentId ?? "agent-1";
   const workspaceId = options.workspaceId ?? "ws-1";
   registry.record(enrollment, cwd, workspaceId);
-  registry.bind(cwd, agentId, workspaceId);
+  registry.bind(enrollment, cwd, agentId, workspaceId);
   registry.noteSessionOpen(agentId, workspaceId, "interactive");
 }
 
@@ -158,6 +163,39 @@ describe("admin request handling", () => {
     expect(JSON.stringify(response)).not.toContain("do-not-echo");
   });
 
+  it("returns a process-unique bounded identity on an unscoped health probe", async () => {
+    const { server, services } = harness();
+    const response = await server.handle({ op: "health" });
+    expect(response).toMatchObject({ ok: true, protocolVersion: 1, gatewayInstanceId: expect.any(String) });
+    expect(response.ok && response.gatewayInstanceId).toMatch(/^[-0-9a-f]{36}$/i);
+    expect(services.browser).not.toHaveBeenCalled();
+    expect(services.runtime.state).not.toHaveBeenCalled();
+  });
+
+  it("allows near-deadline cold attachment before a thirty-second navigation", async () => {
+    vi.useFakeTimers();
+    const session = browser();
+    session.navigate.mockImplementation(async (tabId: string, url: string) =>
+      new Promise((resolve) => setTimeout(
+        () => resolve({ tabId, title: "delayed", url, active: true }),
+        29_999,
+      )),
+    );
+    const { server, enrollment } = harness({
+      browser: vi.fn(async () => new Promise((resolve) => setTimeout(() => resolve(session), 9_999))),
+    });
+    enroll(enrollment);
+
+    const pending = server.handle(tool("tabgoblin_navigate", {
+      tabId: "t1",
+      url: "https://example.com/delayed",
+      timeoutMs: 30_000,
+    }));
+    await vi.advanceTimersByTimeAsync(39_998);
+
+    await expect(pending).resolves.toMatchObject({ ok: true });
+  });
+
   it("returns bounded status without exposing runtime endpoints or profile paths", async () => {
     const { server } = harness();
     const response = await server.handle({ op: "status", workspaceId: "ws-1" });
@@ -175,8 +213,59 @@ describe("admin request handling", () => {
     expect(text).not.toMatch(/9222|cdp|\/profile|user-data-dir|volumeName/i);
   });
 
+  it("lists tabs over the trusted admin socket without an agent enrollment", async () => {
+    const { server, session } = harness();
+    session.listTabs.mockResolvedValueOnce([
+      { tabId: "tab-1", title: "Fixture", url: "https://fixture.test/", active: true },
+    ]);
+
+    await expect(server.handle({ op: "tabs", workspaceId: "ws-1" })).resolves.toEqual({
+      ok: true,
+      tabs: [{ tabId: "tab-1", title: "Fixture", url: "https://fixture.test/", active: true }],
+    });
+    expect(session.listTabs).toHaveBeenCalledWith(expect.any(AbortSignal));
+  });
+
+  it("caps trusted admin tab responses", async () => {
+    const { server, session } = harness();
+    session.listTabs.mockResolvedValueOnce(Array.from({ length: 120 }, (_, index) => ({
+      tabId: `tab-${index}`,
+      title: "Fixture",
+      url: "https://fixture.test/",
+      active: index === 0,
+    })));
+
+    const response = await server.handle({ op: "tabs", workspaceId: "ws-1" });
+    expect(response.ok && response.tabs).toHaveLength(100);
+  });
+
+  it("fails closed without attaching to a browser when tabs are requested before runtime readiness", async () => {
+    const runtime = { state: vi.fn(() => "stopped" as const), start: vi.fn(), stop: vi.fn(), stageFile: vi.fn() };
+    const { server, services } = harness({ runtime });
+
+    await expect(server.handle({ op: "tabs", workspaceId: "ws-1" })).resolves.toMatchObject({
+      ok: false,
+      error: { code: "session_not_ready" },
+    });
+    expect(services.browser).not.toHaveBeenCalled();
+  });
+
+  it("records successful and failed panel return transitions exactly once", async () => {
+    const controller = new OwnershipController();
+    await controller.requestTakeControl("viewer-session");
+    const activity = new ActivityFeed();
+    const { server } = harness({ ownership: () => controller, activity: () => activity });
+
+    await expect(server.handle({ op: "return-to-agent", workspaceId: "ws-1" })).resolves.toMatchObject({ ok: true });
+    await expect(server.handle({ op: "return-to-agent", workspaceId: "ws-1" })).resolves.toMatchObject({ ok: false, error: { code: "manual_control" } });
+    expect(activity.list().map(({ action, source, status, code }) => ({ action, source, status, code }))).toEqual([
+      { action: "manual-return-to-agent", source: "paseo-panel", status: "error", code: "manual_control" },
+      { action: "manual-return-to-agent", source: "paseo-panel", status: "ok", code: null },
+    ]);
+  });
+
   it("dispatches admin lifecycle, pairing, and explicit revocation operations", async () => {
-    const { server, runtime, ownership, enrollment } = harness();
+    const { server, services, runtime, ownership, enrollment } = harness();
     enroll(enrollment);
     enroll(enrollment, { enrollment: SECOND, agentId: "agent-2" });
 
@@ -201,9 +290,21 @@ describe("admin request handling", () => {
       lifecycleGeneration: 2,
     });
 
-    expect(runtime.start).toHaveBeenCalledWith("ws-1");
-    expect(runtime.stop).toHaveBeenCalledWith("ws-1");
+    expect(services.start).toHaveBeenCalledWith("ws-1");
+    expect(services.stop).toHaveBeenCalledWith("ws-1");
+    expect(runtime.start).not.toHaveBeenCalled();
+    expect(runtime.stop).not.toHaveBeenCalled();
     expect(ownership.returnToAgent).toHaveBeenCalledOnce();
+  });
+
+  it("starts through workspace lifecycle coordination without acquiring a stale browser lease", async () => {
+    const { server, services, enrollment, ownership } = harness();
+    enroll(enrollment);
+
+    await expect(server.handle(tool("tabgoblin_start"))).resolves.toMatchObject({ ok: true });
+
+    expect(services.start).toHaveBeenCalledWith("ws-1");
+    expect(ownership.acquireAgentLease).not.toHaveBeenCalled();
   });
 
   it("handles plugin enrollment notifications without starting a runtime", async () => {
@@ -219,7 +320,20 @@ describe("admin request handling", () => {
       cwd: "/w/one",
       workspaceId: "ws-1",
     })).resolves.toEqual({ ok: true });
-    await expect(server.handle({ op: "bind-enrollment", cwd: "/w/one", agentId: "agent-1", workspaceId: "ws-1" })).resolves.toEqual({ ok: true });
+    await expect(server.handle({
+      op: "bind-enrollment",
+      enrollment: SECOND,
+      cwd: "/w/one",
+      agentId: "agent-1",
+      workspaceId: "ws-1",
+    })).resolves.toMatchObject({ ok: false, error: { code: "auth_failed" } });
+    await expect(server.handle({
+      op: "bind-enrollment",
+      enrollment: NONCE,
+      cwd: "/w/one",
+      agentId: "agent-1",
+      workspaceId: "ws-1",
+    })).resolves.toEqual({ ok: true });
     await expect(server.handle({ op: "session-open", agentId: "agent-1", workspaceId: "ws-1", purpose: "interactive" })).resolves.toEqual({ ok: true });
     await expect(server.handle({ op: "resolve-enrollment", enrollment: NONCE })).resolves.toEqual({
       ok: true,
@@ -364,6 +478,29 @@ describe("authenticated tool dispatch", () => {
     expect(runtime.stageFile).toHaveBeenCalledTimes(1);
   });
 
+  it("rejects an oversized sparse upload before runtime staging", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tg-upload-limit-"));
+    const workspace = join(root, "workspace");
+    const oversized = join(workspace, "oversized.bin");
+    await mkdir(workspace);
+    await writeFile(oversized, "");
+    await truncate(oversized, MAX_UPLOAD_BYTES + 1);
+
+    const { server, enrollment, runtime, session } = harness();
+    enroll(enrollment, { cwd: workspace });
+
+    await expect(server.handle(tool("tabgoblin_upload", {
+      tabId: "t1",
+      ref: "r1-e0",
+      path: "oversized.bin",
+    }))).resolves.toMatchObject({
+      ok: false,
+      error: { code: "invalid_input", retryable: false },
+    });
+    expect(runtime.stageFile).not.toHaveBeenCalled();
+    expect(session.upload).not.toHaveBeenCalled();
+  });
+
   it("reauthorizes after the upload staging gap before browser upload", async () => {
     const root = await mkdtemp(join(tmpdir(), "tg-upload-revoke-"));
     const workspace = join(root, "workspace");
@@ -447,6 +584,20 @@ describe("authenticated tool dispatch", () => {
     const response = await server.handle(tool("tabgoblin_list_tabs"));
     expect(response).toMatchObject({ ok: false, error: { code: "runtime_unavailable" } });
     expect(JSON.stringify(response)).not.toMatch(/9222|\/profile|secret endpoint/);
+  });
+
+  it("marks a mutation uncertain when lifecycle generation changes after dispatch", async () => {
+    const { server, enrollment, session, abandonUncertain, setGeneration } = harness();
+    enroll(enrollment);
+    session.act.mockImplementationOnce(async () => { setGeneration(3); });
+
+    const response = await server.handle(tool("tabgoblin_click", { tabId: "t1", ref: "r1-e0" }));
+
+    expect(response).toMatchObject({
+      ok: false,
+      error: { code: "timeout_uncertain", retryable: false },
+    });
+    expect(abandonUncertain).toHaveBeenCalledOnce();
   });
 
   it("fails closed on handler timeout and abandons an uncertain lease", async () => {

@@ -8,6 +8,7 @@ import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/proto
 import type { CallToolResult, ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import {
   ADMIN_SOCKET_ENV,
+  AdminRequestSchema,
   AdminResponseSchema,
   ENROLLMENT_ENV,
   MCP_SERVER_NAME,
@@ -17,6 +18,7 @@ import {
   TabSchema,
   tabGoblinError,
   ToolInputSchemas,
+  gatewayTransportTimeoutMs,
   type AdminResponse,
   type ErrorCode,
   type ToolName,
@@ -29,7 +31,6 @@ export { buildToolDefinitions } from "./tools.js";
 const SOCKET_REQUEST_MAX_BYTES = 64 * 1024;
 const SOCKET_RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
 const TOOL_RESULT_MAX_BYTES = 8 * 1024 * 1024;
-const SOCKET_DEADLINE_MS = 20_000;
 
 const BindingSchema = z.object({ agentId: z.string().min(1).max(128), workspaceId: z.string().min(1).max(128) }).strict();
 type Binding = z.infer<typeof BindingSchema>;
@@ -202,17 +203,22 @@ export function createBridge(deps: BridgeDependencies): {
 }
 
 function socketFailure(code: ErrorCode): never {
-  throw tabGoblinError(code, recovery[code], false);
+  throw tabGoblinError(code, recovery[code], code === "runtime_unavailable");
 }
 
-function createSocketCaller(socketPath: string): BridgeDependencies["call"] {
+export function createSocketCaller(socketPath: string): BridgeDependencies["call"] {
   return async (payload, signal) => {
     const body = Buffer.from(JSON.stringify(payload), "utf8");
     if (body.byteLength > SOCKET_REQUEST_MAX_BYTES) socketFailure("invalid_input");
-    if (signal?.aborted) socketFailure("timeout_uncertain");
+    // Nothing reached the transport, so an already-cancelled caller has a known outcome.
+    if (signal?.aborted) socketFailure("runtime_unavailable");
+    const request = AdminRequestSchema.safeParse(payload);
+    const socketDeadlineMs = gatewayTransportTimeoutMs(
+      request.success ? request.data : { op: "health" },
+    );
 
     return new Promise<AdminResponse>((resolve, reject) => {
-      const deadlineAt = performance.now() + SOCKET_DEADLINE_MS;
+      const deadlineAt = performance.now() + socketDeadlineMs;
       let settled = false;
       const finish = (callback: () => void): void => {
         if (settled) return;

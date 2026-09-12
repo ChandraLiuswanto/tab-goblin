@@ -53,6 +53,26 @@ function result(code = 0, stdout = "", stderr = "") {
   return { code, stdout, stderr };
 }
 
+async function afterDelay<T>(
+  ms: number,
+  signal: AbortSignal | undefined,
+  operation: () => Promise<T>,
+): Promise<T> {
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new Error("Operation aborted"));
+    };
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+  });
+  return operation();
+}
+
 function supervisor(podman: PodmanExec, overrides: Partial<ConstructorParameters<typeof RuntimeSupervisor>[0]> = {}) {
   return new RuntimeSupervisor({
     podman,
@@ -289,7 +309,7 @@ describe("start", () => {
 });
 
 describe("stop", () => {
-  it("uses a sufficient bounded graceful timeout before non-forced removal and never deletes volumes", async () => {
+  it("uses a sufficient bounded graceful timeout, resets staging, and preserves the profile", async () => {
     const podman = fakePodman({ state: "running" });
     const runtime = supervisor(podman.exec);
     await runtime.start("w1");
@@ -308,19 +328,93 @@ describe("stop", () => {
       expect(podman.calls.indexOf(stopCalls[index])).toBeLessThan(podman.calls.indexOf(removeCalls[index]));
       expect(removeCalls[index]).not.toContain("-f");
     }
-    expect(podman.calls.some((args) => args[0] === "volume" && args[1] === "rm")).toBe(false);
+    const stagingName = `${volumeNameFor("w1")}-staging`;
+    const stagingRemoveIndex = podman.calls.findIndex((args) =>
+      args[0] === "volume" && args[1] === "rm" && args.at(-1) === stagingName,
+    );
+    const stagingCreateIndex = podman.calls.findIndex((args) =>
+      args[0] === "volume" && args[1] === "create" && args.at(-1) === stagingName,
+    );
+    expect(stagingRemoveIndex).toBeGreaterThan(podman.calls.indexOf(removeCalls[0]!));
+    expect(stagingCreateIndex).toBeGreaterThan(stagingRemoveIndex);
+    expect(podman.calls.filter((args) =>
+      args[0] === "volume" && args[1] === "rm" && args.at(-1) === stagingName,
+    )).toHaveLength(1);
+    expect(podman.calls.some((args) =>
+      args[0] === "volume" && args[1] === "rm" && args.at(-1) === volumeNameFor("w1"),
+    )).toBe(false);
     expect(runtime.state("w1")).toBe("stopped");
     expect(runtime.endpoints("w1")).toBeNull();
   });
 
-  it("treats a missing container as an idempotent no-op", async () => {
-    const podman = fakePodman({ state: "missing", workspaceId: "missing-stop" });
+  it("clears potentially stale staging after confirming the container is missing", async () => {
+    const workspaceId = "missing-stop";
+    const podman = fakePodman({ state: "missing", workspaceId });
     const runtime = supervisor(podman.exec);
 
-    await runtime.stop("missing-stop");
+    await runtime.stop(workspaceId);
+    await runtime.stop(workspaceId);
 
+    const stagingName = `${volumeNameFor(workspaceId)}-staging`;
     expect(podman.calls.some((args) => args[0] === "stop" || args[0] === "rm")).toBe(false);
-    expect(runtime.state("missing-stop")).toBe("stopped");
+    expect(podman.calls.filter((args) =>
+      args[0] === "volume" && args[1] === "rm" && args.at(-1) === stagingName,
+    )).toHaveLength(1);
+    expect(podman.calls.filter((args) =>
+      args[0] === "volume" && args[1] === "create" && args.at(-1) === stagingName,
+    )).toHaveLength(1);
+    expect(runtime.state(workspaceId)).toBe("stopped");
+  });
+
+  it("retains staging cleanup intent after a reset failure and retries it before launch", async () => {
+    const workspaceId = "retry-staging-reset";
+    const stagingName = `${volumeNameFor(workspaceId)}-staging`;
+    const podman = fakePodman({ state: "running", workspaceId });
+    let stagingCreateAttempts = 0;
+    const exec: PodmanExec = vi.fn(async (args, signal) => {
+      if (args[0] === "volume" && args[1] === "create" && args.at(-1) === stagingName) {
+        stagingCreateAttempts += 1;
+        if (stagingCreateAttempts === 1) return result(125, "", "create failed");
+      }
+      return podman.exec(args, signal);
+    });
+    const runtime = supervisor(exec);
+
+    await expect(runtime.stop(workspaceId)).rejects.toMatchObject({
+      code: "runtime_unavailable",
+      retryable: true,
+    });
+    expect(podman.state()).toBe("missing");
+    await expect(runtime.start(workspaceId)).resolves.toMatchObject({
+      containerName: containerNameFor(workspaceId),
+    });
+
+    expect(stagingCreateAttempts).toBe(2);
+    expect(podman.calls.filter((args) =>
+      args[0] === "volume" && args[1] === "rm" && args.at(-1) === stagingName,
+    )).toHaveLength(2);
+    expect(podman.calls.some((args) =>
+      args[0] === "volume" && args[1] === "rm" && args.at(-1) === volumeNameFor(workspaceId),
+    )).toBe(false);
+  });
+
+  it("does not delete staging when graceful stop fails and the container remains live", async () => {
+    const workspaceId = "live-stop-failure";
+    const stagingName = `${volumeNameFor(workspaceId)}-staging`;
+    const podman = fakePodman({ state: "running", workspaceId });
+    const exec: PodmanExec = vi.fn((args, signal) => {
+      if (args[0] === "stop") return Promise.resolve(result(125, "", "stop failed"));
+      return podman.exec(args, signal);
+    });
+
+    await expect(supervisor(exec).stop(workspaceId)).rejects.toMatchObject({
+      code: "runtime_unavailable",
+    });
+
+    expect(podman.state()).toBe("running");
+    expect(podman.calls.some((args) =>
+      args[0] === "volume" && args[1] === "rm" && args.at(-1) === stagingName,
+    )).toBe(false);
   });
 
   it("rejects a foreign same-name container without stopping or removing it", async () => {
@@ -333,38 +427,95 @@ describe("stop", () => {
     expect(runtime.state("owned-workspace")).toBe("failed");
   });
 
-  it("keeps a 30-second graceful-stop budget when the general operation timeout is short", async () => {
+  it("completes discovery, graceful stop, and removal just inside one absolute deadline", async () => {
     vi.useFakeTimers();
-    const workspaceId = "stop-timeout";
+    const workspaceId = "near-stop-deadline";
     const podman = fakePodman({ state: "running", workspaceId });
-    let stopSignal: AbortSignal | undefined;
     const exec: PodmanExec = vi.fn((args, signal) => {
-      if (args[0] === "stop") {
-        stopSignal = signal;
-        return new Promise((_resolve, reject) => {
-          const onAbort = () => reject(signal?.reason ?? new Error("Stop aborted"));
-          if (signal?.aborted) onAbort();
-          else signal?.addEventListener("abort", onAbort, { once: true });
-        });
+      const discoveryDelay = args[0] === "container" || args[0] === "inspect" ? 3_000 : 0;
+      const mutationDelay = args[0] === "stop" ? 20_000 : args[0] === "rm" ? 500 : 0;
+      return afterDelay(discoveryDelay + mutationDelay, signal, () => podman.exec(args, signal));
+    });
+    const runtime = supervisor(exec, { monotonicNow: () => Date.now() });
+
+    try {
+      const stopping = runtime.stop(workspaceId);
+      await vi.advanceTimersByTimeAsync(29_750);
+
+      await expect(stopping).resolves.toBeUndefined();
+      expect(runtime.state(workspaceId)).toBe("stopped");
+      expect(podman.calls.filter((args) => args[0] === "stop")).toHaveLength(1);
+      expect(podman.calls.filter((args) => args[0] === "rm")).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 1_000);
+
+  it("fails closed when staging recreation does not finish within the stop deadline", async () => {
+    vi.useFakeTimers();
+    const workspaceId = "staging-reset-timeout";
+    const stagingName = `${volumeNameFor(workspaceId)}-staging`;
+    const podman = fakePodman({ state: "running", workspaceId });
+    let createSignal: AbortSignal | undefined;
+    const exec: PodmanExec = vi.fn((args, signal) => {
+      if (args[0] === "volume" && args[1] === "create" && args.at(-1) === stagingName) {
+        createSignal = signal;
+        return new Promise(() => {});
       }
       return podman.exec(args, signal);
     });
-    const runtime = supervisor(exec, { operationTimeoutMs: 15 });
+    const runtime = supervisor(exec, { monotonicNow: () => Date.now() });
 
     try {
       const stopping = runtime.stop(workspaceId).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(30_001);
+
+      await expect(stopping).resolves.toMatchObject({ code: "timeout_uncertain", retryable: false });
+      expect(createSignal?.aborted).toBe(true);
+      expect(podman.state()).toBe("missing");
+      expect(runtime.state(workspaceId)).toBe("failed");
+      await expect(runtime.start(workspaceId)).rejects.toMatchObject({
+        code: "runtime_unavailable",
+      });
+      expect(podman.calls.some((args) =>
+        args[0] === "volume" && args[1] === "rm" && args.at(-1) === volumeNameFor(workspaceId),
+      )).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 1_000);
+
+  it("reports uncertainty when discovery leaves too little time for graceful stop", async () => {
+    vi.useFakeTimers();
+    const workspaceId = "insufficient-graceful-time";
+    const podman = fakePodman({ state: "running", workspaceId });
+    let stopSignal: AbortSignal | undefined;
+    let inspectCalls = 0;
+    const exec: PodmanExec = vi.fn((args, signal) => {
+      let delay = 0;
+      if (args[0] === "container") delay = 4_000;
+      if (args[0] === "inspect") delay = ++inspectCalls === 1 ? 4_000 : 3_000;
+      if (args[0] === "stop") {
+        delay = 20_000;
+        stopSignal = signal;
+      }
+      return afterDelay(delay, signal, () => podman.exec(args, signal));
+    });
+    const runtime = supervisor(exec, {
+      operationTimeoutMs: 15,
+      monotonicNow: () => Date.now(),
+    });
+
+    try {
+      const stopping = runtime.stop(workspaceId).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(31_001);
       await vi.advanceTimersByTimeAsync(0);
-      expect(stopSignal).toBeDefined();
-      expect(exec.mock.calls.find(([args]) => args[0] === "stop")?.[0]).toContain("20");
 
-      await vi.advanceTimersByTimeAsync(15);
-      expect(stopSignal?.aborted).toBe(false);
-
-      await vi.advanceTimersByTimeAsync(29_985);
-      await expect(stopping).resolves.toMatchObject({ code: "runtime_unavailable" });
+      await expect(stopping).resolves.toMatchObject({ code: "timeout_uncertain", retryable: false });
       expect(stopSignal?.aborted).toBe(true);
       expect(runtime.state(workspaceId)).toBe("failed");
-      expect(podman.calls.some((args) => args[0] === "rm")).toBe(false);
+      expect(podman.calls.some((args) => args[0] === "stop" || args[0] === "rm")).toBe(false);
+      expect(podman.calls.some((args) => args[0] === "volume" && args[1] === "rm")).toBe(false);
     } finally {
       vi.useRealTimers();
     }

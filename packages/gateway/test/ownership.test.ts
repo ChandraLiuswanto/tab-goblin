@@ -5,6 +5,54 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe("runtime lifecycle fencing", () => {
+  it("gates agent leases and manual viewer input while preserving the intended owner", async () => {
+    const controller = new OwnershipController();
+    await controller.requestTakeControl("viewer-1");
+
+    await controller.beginRuntimeTransition();
+
+    expect(controller.snapshot()).toMatchObject({
+      state: "manual",
+      owner: "viewer",
+      ownerViewerSessionId: "viewer-1",
+      generation: 2,
+    });
+    expect(controller.mayViewerSendInput("viewer-1")).toBe(false);
+    expect(() => controller.acquireAgentLease("blocked")).toThrow();
+
+    controller.completeRuntimeTransition();
+    expect(controller.mayViewerSendInput("viewer-1")).toBe(true);
+    expect(controller.snapshot().ownerViewerSessionId).toBe("viewer-1");
+  });
+
+  it("allows only an explicit runtime transition to recover prior needs-attention state", async () => {
+    const controller = new OwnershipController();
+    controller.acquireAgentLease("mutation-1").abandonUncertain();
+    expect(controller.snapshot().state).toBe("needs-attention");
+
+    await expect(controller.beginRuntimeTransition()).rejects.toMatchObject({ code: "timeout_uncertain" });
+    expect(() => controller.acquireAgentLease("blocked")).toThrow();
+
+    expect(controller.completeRuntimeTransition()).toMatchObject({ state: "agent-ready", owner: null });
+  });
+
+  it("keeps an unknown mutation fail-closed and ignores its stale lease", async () => {
+    vi.useFakeTimers();
+    const controller = new OwnershipController({ drainTimeoutMs: 10 });
+    const lease = controller.acquireAgentLease("mutation-1");
+    const transition = controller.beginRuntimeTransition().catch((error: unknown) => error);
+
+    await vi.advanceTimersByTimeAsync(10);
+    await expect(transition).resolves.toMatchObject({ code: "timeout_uncertain" });
+    expect(controller.snapshot()).toMatchObject({ state: "needs-attention", owner: null, generation: 1 });
+    expect(() => controller.acquireAgentLease("blocked")).toThrow();
+
+    lease.release("ok");
+    expect(controller.snapshot()).toMatchObject({ state: "needs-attention", owner: null, generation: 1 });
+  });
+});
+
 describe("agent leases", () => {
   it("starts agent-ready at generation 0 with no active owner", () => {
     expect(new OwnershipController().snapshot()).toEqual({
@@ -62,19 +110,31 @@ describe("agent leases", () => {
 });
 
 describe("taking control", () => {
-  it("blocks new agent commands synchronously before an in-flight lease drains", async () => {
+  it("blocks new agents and preserves the active lease generation until drain completes", async () => {
     const controller = new OwnershipController();
+    const generations: number[] = [];
+    controller.onGenerationChange((generation) => generations.push(generation));
     const lease = controller.acquireAgentLease("op-1");
 
     const takeover = controller.requestTakeControl("viewer-1");
-    expect(controller.snapshot()).toMatchObject({ state: "taking-control", owner: null });
+    expect(controller.snapshot()).toMatchObject({
+      state: "taking-control",
+      generation: lease.generation,
+      owner: null,
+    });
+    expect(generations).toEqual([]);
     expect(() => controller.acquireAgentLease("op-2")).toThrow(
       expect.objectContaining({ code: "manual_control", retryable: false }),
     );
     expect(controller.mayViewerSendInput("viewer-1")).toBe(false);
 
     lease.release("ok");
-    await expect(takeover).resolves.toMatchObject({ state: "manual", owner: "viewer" });
+    await expect(takeover).resolves.toMatchObject({
+      state: "manual",
+      generation: lease.generation + 1,
+      owner: "viewer",
+    });
+    expect(generations).toEqual([lease.generation + 1]);
     expect(controller.mayViewerSendInput("viewer-1")).toBe(true);
   });
 
@@ -186,30 +246,114 @@ describe("manual control", () => {
 });
 
 describe("generation changes", () => {
-  it("revokes viewer input and notifies listeners before publishing agent-ready", async () => {
+  it("advances and notifies before publishing each takeover, reclaim, and return authority", async () => {
     const controller = new OwnershipController();
-    const observed: Array<{ generation: number; state: string; viewerMayInput: boolean }> = [];
+    const observed: Array<{
+      generation: number;
+      state: string;
+      ownerViewerSessionId: string | null;
+    }> = [];
     controller.onGenerationChange((generation) => {
+      const snapshot = controller.snapshot();
       observed.push({
         generation,
-        state: controller.snapshot().state,
-        viewerMayInput: controller.mayViewerSendInput("viewer-1"),
+        state: snapshot.state,
+        ownerViewerSessionId: snapshot.ownerViewerSessionId,
       });
     });
-    await controller.requestTakeControl("viewer-1");
-    const before = controller.snapshot().generation;
 
-    const result = await controller.returnToAgent();
+    const takeover = await controller.requestTakeControl("viewer-1");
+    const reclaim = controller.reclaim("viewer-2");
+    const returned = await controller.returnToAgent();
 
-    expect(result).toMatchObject({
+    expect([takeover.generation, reclaim.generation, returned.generation]).toEqual([1, 2, 3]);
+    expect(takeover).toMatchObject({
+      state: "manual",
+      owner: "viewer",
+      ownerViewerSessionId: "viewer-1",
+    });
+    expect(reclaim).toMatchObject({
+      state: "manual",
+      owner: "viewer",
+      ownerViewerSessionId: "viewer-2",
+    });
+    expect(returned).toMatchObject({
       state: "agent-ready",
-      generation: before + 1,
       owner: null,
       ownerViewerSessionId: null,
     });
     expect(observed).toEqual([
-      { generation: before + 1, state: "returning-control", viewerMayInput: false },
+      { generation: 1, state: "taking-control", ownerViewerSessionId: null },
+      { generation: 2, state: "manual", ownerViewerSessionId: null },
+      { generation: 3, state: "returning-control", ownerViewerSessionId: null },
     ]);
+  });
+
+  it("fails closed if a takeover generation listener fails", async () => {
+    const controller = new OwnershipController();
+    const laterListener = vi.fn();
+    controller.onGenerationChange(() => {
+      throw new Error("listener failed");
+    });
+    controller.onGenerationChange(laterListener);
+
+    await expect(controller.requestTakeControl("viewer-1")).rejects.toMatchObject({
+      code: "timeout_uncertain",
+      retryable: false,
+    });
+
+    expect(laterListener).toHaveBeenCalledWith(1);
+    expect(controller.snapshot()).toMatchObject({
+      state: "needs-attention",
+      generation: 1,
+      owner: null,
+      ownerViewerSessionId: null,
+    });
+    expect(controller.mayViewerSendInput("viewer-1")).toBe(false);
+  });
+
+  it("fails closed if a reclaim generation listener fails", async () => {
+    const controller = new OwnershipController();
+    await controller.requestTakeControl("viewer-1");
+    controller.onGenerationChange(() => {
+      throw new Error("listener failed");
+    });
+
+    expect(() => controller.reclaim("viewer-2")).toThrow(
+      expect.objectContaining({ code: "timeout_uncertain", retryable: false }),
+    );
+
+    expect(controller.snapshot()).toMatchObject({
+      state: "needs-attention",
+      generation: 2,
+      owner: null,
+      ownerViewerSessionId: null,
+    });
+    expect(controller.mayViewerSendInput("viewer-1")).toBe(false);
+    expect(controller.mayViewerSendInput("viewer-2")).toBe(false);
+  });
+
+  it("preserves fail-closed return behavior if a generation listener fails", async () => {
+    const controller = new OwnershipController();
+    await controller.requestTakeControl("viewer-1");
+    controller.onGenerationChange(() => {
+      throw new Error("listener failed");
+    });
+
+    await expect(controller.returnToAgent()).rejects.toMatchObject({
+      code: "timeout_uncertain",
+      retryable: false,
+    });
+
+    expect(controller.snapshot()).toMatchObject({
+      state: "needs-attention",
+      generation: 2,
+      owner: null,
+      ownerViewerSessionId: null,
+    });
+    expect(() => controller.acquireAgentLease("op-2")).toThrow(
+      expect.objectContaining({ code: "manual_control" }),
+    );
   });
 
   it("supports unsubscribing generation listeners", async () => {

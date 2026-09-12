@@ -192,6 +192,7 @@ export class EnrollmentRegistry {
   }
 
   bind(
+    enrollment: string,
     cwd: string,
     agentId: string,
     workspaceId: string | null,
@@ -199,19 +200,16 @@ export class EnrollmentRegistry {
   ): Binding | null {
     this.validateLifecycleEvent(agentId, workspaceId, generations);
     this.sweep();
-    let selected: StoredBinding | undefined;
-    for (const stored of this.records.values()) {
-      if (
-        stored.binding.cwd !== cwd ||
-        stored.binding.agentId !== null ||
-        stored.binding.workspaceId !== workspaceId ||
-        stored.binding.workspaceGeneration !== generations.workspaceGeneration
-      ) {
-        continue;
-      }
-      if (!selected || stored.binding.createdAt < selected.binding.createdAt) selected = stored;
+    const selected = this.records.get(enrollment);
+    if (
+      !selected ||
+      selected.binding.agentId !== null ||
+      selected.binding.cwd !== cwd ||
+      selected.binding.workspaceId !== workspaceId ||
+      selected.binding.workspaceGeneration !== generations.workspaceGeneration
+    ) {
+      return null;
     }
-    if (!selected) return null;
 
     this.admitLifecycleTargets(agentId, workspaceId);
     const session = this.sessions.get(agentId);

@@ -75,9 +75,52 @@ export function viewerAddress(raw: string | null | undefined): string | null {
   }
 }
 
-export function pollInterval(failureCount: number): number {
-  const failures = Number.isSafeInteger(failureCount) && failureCount > 0 ? failureCount : 0;
-  return Math.min(30_000, 3_000 * 2 ** Math.min(failures, 4));
+export const manualQueryPolicy = {
+  retry: false,
+  refetchOnWindowFocus: false,
+  refetchOnReconnect: false,
+  refetchInterval: false,
+} as const;
+
+type RefetchResult = { isSuccess: boolean; data?: { ok: boolean; status?: { sessionState: string } } };
+export type PanelRefetchers = {
+  config(): Promise<unknown>;
+  status(): Promise<RefetchResult>;
+  tabs(): Promise<unknown>;
+  activity(): Promise<unknown>;
+};
+
+export async function refreshPanelQueries(refetchers: PanelRefetchers, includeConfig = true): Promise<void> {
+  const [statusResult] = await Promise.all([
+    refetchers.status(),
+    refetchers.activity(),
+    includeConfig ? refetchers.config() : Promise.resolve(),
+  ]);
+  if (statusResult.isSuccess && statusResult.data?.ok && statusResult.data.status?.sessionState === "ready") {
+    await refetchers.tabs();
+  }
+}
+
+export async function refreshAfterSuccessfulAction(response: { ok: boolean }, refetchers: PanelRefetchers): Promise<boolean> {
+  if (!response.ok) return false;
+  await refreshPanelQueries(refetchers);
+  return true;
+}
+
+export type TabSectionMode = "status-unconfirmed" | "not-ready" | "loading" | "error" | "empty" | "tabs";
+
+export function tabSectionMode(input: {
+  statusQueryIsSuccess: boolean;
+  statusQueryIsError: boolean;
+  sessionState: SessionStatus["sessionState"] | null;
+  tabsQueryState: "loading" | "error" | "success";
+  tabCount: number;
+}): TabSectionMode {
+  if (input.statusQueryIsError || !input.statusQueryIsSuccess) return "status-unconfirmed";
+  if (input.sessionState !== "ready") return "not-ready";
+  if (input.tabsQueryState === "loading") return "loading";
+  if (input.tabsQueryState === "error") return "error";
+  return input.tabCount === 0 ? "empty" : "tabs";
 }
 
 export function actionAvailability(status: SessionStatus | null, rpcFailed: boolean, hasSafeViewerAddress: boolean) {

@@ -8,13 +8,16 @@ import { performance } from "node:perf_hooks";
 import {
   AdminRequestSchema,
   AdminResponseSchema,
+  MAX_UPLOAD_BYTES,
   NetworkDiagnosticSchema,
+  PROTOCOL_VERSION,
   SessionStatusSchema,
   SnapshotSchema,
   TabGoblinErrorSchema,
   TabSchema,
   ToolInputSchemas,
   boundedText,
+  gatewayOperationTimeoutMs,
   tabGoblinError,
   type AdminRequest,
   type AdminResponse,
@@ -27,9 +30,12 @@ import type { BrowserAction, BrowserSession } from "./browser.js";
 import type { EnrollmentRegistry, Binding } from "./enrollment.js";
 import type { Lease, OwnershipController } from "./ownership.js";
 import type { RuntimeSupervisor } from "./runtime.js";
+import { recordManualTransition } from "./manual-activity.js";
 
 export interface WorkspaceServices {
   runtime: RuntimeSupervisor;
+  start(workspaceId: string): Promise<void>;
+  stop(workspaceId: string): Promise<void>;
   ownership(workspaceId: string): OwnershipController;
   activity(workspaceId: string): ActivityFeed;
   browser(workspaceId: string): Promise<BrowserSession>;
@@ -41,6 +47,8 @@ export interface AdminServerOptions {
   services: WorkspaceServices;
   enrollment: EnrollmentRegistry;
   socketPath: string;
+  /** A process-unique, non-secret epoch used to fence durable plugin state. */
+  gatewayInstanceId?: string;
   /** Test seam; production callers should use the bounded default. */
   handlerTimeoutMs?: number;
 }
@@ -176,7 +184,8 @@ async function pinUpload(
       !opened.isFile() ||
       !sameInode(beforeOpen, opened) ||
       !Number.isSafeInteger(opened.size) ||
-      opened.size < 0
+      opened.size < 0 ||
+      opened.size > MAX_UPLOAD_BYTES
     ) {
       throw invalidInput();
     }
@@ -206,17 +215,19 @@ async function pinUpload(
     const buffer = Buffer.allocUnsafe(64 * 1024);
     let sourcePosition = 0;
     let destinationPosition = 0;
-    while (sourcePosition < opened.size) {
+    // Read to EOF instead of trusting the initial stat. The extra-byte probe
+    // catches a source that grows while its pinned descriptor is being copied.
+    while (sourcePosition <= MAX_UPLOAD_BYTES) {
       if (signal.aborted) throw signal.reason ?? timeoutFailure();
-      const bytesRemaining = opened.size - sourcePosition;
       const { bytesRead } = await source.read(
         buffer,
         0,
-        Math.min(buffer.length, bytesRemaining),
+        Math.min(buffer.length, MAX_UPLOAD_BYTES - sourcePosition + 1),
         sourcePosition,
       );
-      if (bytesRead === 0) throw invalidInput();
+      if (bytesRead === 0) break;
       sourcePosition += bytesRead;
+      if (sourcePosition > MAX_UPLOAD_BYTES) throw invalidInput();
       let written = 0;
       while (written < bytesRead) {
         if (signal.aborted) throw signal.reason ?? timeoutFailure();
@@ -235,6 +246,7 @@ async function pinUpload(
     const afterCopy = await source.stat();
     if (
       !sameInode(opened, afterCopy) ||
+      sourcePosition !== opened.size ||
       opened.size !== afterCopy.size ||
       opened.mtimeMs !== afterCopy.mtimeMs ||
       opened.ctimeMs !== afterCopy.ctimeMs
@@ -263,8 +275,9 @@ async function pinUpload(
 
 export function createAdminServer(options: AdminServerOptions): AdminServer {
   const { services, enrollment, socketPath } = options;
-  const handlerTimeoutMs = options.handlerTimeoutMs ?? DEFAULT_HANDLER_TIMEOUT_MS;
-  if (!Number.isSafeInteger(handlerTimeoutMs) || handlerTimeoutMs <= 0) {
+  const gatewayInstanceId = options.gatewayInstanceId ?? randomUUID();
+  const handlerTimeoutMs = options.handlerTimeoutMs;
+  if (handlerTimeoutMs !== undefined && (!Number.isSafeInteger(handlerTimeoutMs) || handlerTimeoutMs <= 0)) {
     throw new RangeError("handlerTimeoutMs must be a positive safe integer");
   }
 
@@ -288,9 +301,9 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
     });
   };
 
-  const createRequestDeadline = (): RequestDeadline => {
+  const createRequestDeadline = (timeoutMs = handlerTimeoutMs ?? DEFAULT_HANDLER_TIMEOUT_MS): RequestDeadline => {
     const controller = new AbortController();
-    const expiresAt = performance.now() + handlerTimeoutMs;
+    const expiresAt = performance.now() + timeoutMs;
     const expire = (): void => {
       if (!controller.signal.aborted) controller.abort(timeoutFailure());
     };
@@ -298,7 +311,7 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
       if (performance.now() >= expiresAt) expire();
       if (controller.signal.aborted) throw controller.signal.reason;
     };
-    const timer = setTimeout(expire, handlerTimeoutMs);
+    const timer = setTimeout(expire, timeoutMs);
 
     return {
       signal: controller.signal,
@@ -334,7 +347,7 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
   };
 
   const dispatchBrowserTool = async (
-    name: ToolName,
+    name: Exclude<ToolName, "tabgoblin_status" | "tabgoblin_start">,
     input: Record<string, unknown>,
     workspaceId: string,
     ownership: OwnershipController,
@@ -344,13 +357,6 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
     ensureAuthorized: () => Promise<void>,
   ): Promise<AdminResponse> => {
     assertGeneration(ownership, lease);
-
-    if (name === "tabgoblin_start") {
-      await ensureAuthorized();
-      await services.runtime.start(workspaceId);
-      assertGeneration(ownership, lease);
-      return { ok: true, status: statusFor(workspaceId) };
-    }
 
     if (services.runtime.state(workspaceId) !== "ready") {
       throw tabGoblinError(
@@ -588,8 +594,6 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
           ),
         };
       }
-      case "tabgoblin_status":
-        throw unexpectedFailure();
     }
   };
 
@@ -597,7 +601,8 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
     request: Extract<AdminRequest, { op: "tool" }>,
     deadline: RequestDeadline,
   ): Promise<AdminResponse> => {
-    const schema = ToolInputSchemas[request.name];
+    const toolName = request.name;
+    const schema = ToolInputSchemas[toolName];
     const parsedInput = schema.safeParse(request.input ?? {});
     if (!parsedInput.success) return failure(invalidInput());
     const input = parsedInput.data as Record<string, unknown>;
@@ -609,12 +614,44 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
       return failure(error);
     }
 
-    if (request.name === "tabgoblin_status") {
+    if (toolName === "tabgoblin_status") {
       try {
         deadline.check();
         return AdminResponseSchema.parse({ ok: true, status: statusFor(binding.workspaceId!) });
       } catch (error: unknown) {
         return failure(error);
+      }
+    }
+
+    if (toolName === "tabgoblin_start") {
+      const feed = services.activity(binding.workspaceId!);
+      const operationId = randomUUID();
+      feed.begin({
+        operationId,
+        source: boundedText(`agent:${binding.agentId ?? "unknown"}`, 80),
+        tabId: null,
+        action: toolName,
+      });
+      try {
+        await deadline.run(async () => {
+          const current = await enrollment.authorize(request.enrollment);
+          if (
+            current.cwd !== binding.cwd ||
+            current.agentId !== binding.agentId ||
+            current.workspaceId !== binding.workspaceId ||
+            current.agentGeneration !== binding.agentGeneration ||
+            current.workspaceGeneration !== binding.workspaceGeneration
+          ) {
+            throw tabGoblinError("auth_failed", "The enrollment binding changed", false);
+          }
+          await services.start(binding.workspaceId!);
+        });
+        feed.finish(operationId, { status: "ok" });
+        return AdminResponseSchema.parse({ ok: true, status: statusFor(binding.workspaceId!) });
+      } catch (error: unknown) {
+        const safe = structuredError(error);
+        feed.finish(operationId, { status: "error", code: safe.code });
+        return { ok: false, error: safe };
       }
     }
 
@@ -624,10 +661,7 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
       return failure(error);
     }
 
-    if (
-      request.name !== "tabgoblin_start" &&
-      services.runtime.state(binding.workspaceId!) !== "ready"
-    ) {
+    if (services.runtime.state(binding.workspaceId!) !== "ready") {
       return failure(
         tabGoblinError(
           "session_not_ready",
@@ -648,7 +682,7 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
         operationId,
         source: boundedText(`agent:${binding.agentId ?? "unknown"}`, 80),
         tabId: tabIdFromInput(input),
-        action: request.name,
+        action: toolName,
       });
 
       const ensureAuthorized = async (): Promise<void> => {
@@ -669,7 +703,7 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
 
       const response = await deadline.run((signal) =>
         dispatchBrowserTool(
-          request.name,
+          toolName,
           input,
           binding.workspaceId!,
           ownership,
@@ -679,6 +713,13 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
           ensureAuthorized,
         ),
       );
+      if (ownership.snapshot().generation !== lease.generation) {
+        throw tabGoblinError(
+          "timeout_uncertain",
+          "The browser lifecycle changed while the operation was dispatched; inspect state before continuing",
+          false,
+        );
+      }
       const checked = AdminResponseSchema.parse(response);
       lease.release("ok");
       const metadata = resultMetadata(checked);
@@ -700,13 +741,25 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
     deadline: RequestDeadline,
   ): Promise<AdminResponse> => {
     switch (request.op) {
+      case "health":
+        return { ok: true, protocolVersion: PROTOCOL_VERSION, gatewayInstanceId };
       case "status":
         return { ok: true, status: statusFor(request.workspaceId) };
+      case "tabs": {
+        if (services.runtime.state(request.workspaceId) !== "ready") {
+          throw tabGoblinError("session_not_ready", "The browser session is not ready", false);
+        }
+        deadline.check();
+        const browser = await services.browser(request.workspaceId);
+        deadline.check();
+        const tabs = await browser.listTabs(deadline.signal);
+        return { ok: true, tabs: TabSchema.array().max(100).parse(tabs.slice(0, 100)) };
+      }
       case "start":
-        await services.runtime.start(request.workspaceId);
+        await services.start(request.workspaceId);
         return { ok: true, status: statusFor(request.workspaceId) };
       case "stop":
-        await services.runtime.stop(request.workspaceId);
+        await services.stop(request.workspaceId);
         return { ok: true };
       case "activity":
         return { ok: true, activity: services.activity(request.workspaceId).list() };
@@ -715,7 +768,12 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
         return { ok: true, pairingCode: pair.code, pairingExpiresAt: pair.expiresAt };
       }
       case "return-to-agent":
-        await services.ownership(request.workspaceId).returnToAgent();
+        await recordManualTransition(
+          services.activity(request.workspaceId),
+          "manual-return-to-agent",
+          "paseo-panel",
+          () => services.ownership(request.workspaceId).returnToAgent(),
+        );
         return { ok: true, status: statusFor(request.workspaceId) };
       case "record-enrollment":
         enrollment.record(
@@ -735,12 +793,26 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
           binding: { agentId: binding.agentId!, workspaceId: binding.workspaceId! },
         };
       }
-      case "bind-enrollment":
-        enrollment.bind(request.cwd, request.agentId, request.workspaceId, {
-          agentGeneration: request.agentGeneration,
-          workspaceGeneration: request.workspaceGeneration,
-        });
+      case "bind-enrollment": {
+        const binding = enrollment.bind(
+          request.enrollment,
+          request.cwd,
+          request.agentId,
+          request.workspaceId,
+          {
+            agentGeneration: request.agentGeneration,
+            workspaceGeneration: request.workspaceGeneration,
+          },
+        );
+        if (!binding) {
+          throw tabGoblinError(
+            "auth_failed",
+            "Enrollment credential does not match a pending lifecycle record",
+            false,
+          );
+        }
         return { ok: true };
+      }
       case "session-open":
         enrollment.noteSessionOpen(request.agentId, request.workspaceId, request.purpose, {
           agentGeneration: request.agentGeneration,
@@ -780,9 +852,12 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
   };
 
   const handle = async (unknownRequest: unknown): Promise<AdminResponse> => {
-    const deadline = createRequestDeadline();
+    const parsed = AdminRequestSchema.safeParse(unknownRequest);
+    if (!parsed.success) return failure(invalidInput());
+    const timeoutMs = handlerTimeoutMs ?? gatewayOperationTimeoutMs(parsed.data);
+    const deadline = createRequestDeadline(timeoutMs);
     try {
-      return await handleWithDeadline(unknownRequest, deadline);
+      return await handleWithDeadline(parsed.data, deadline);
     } finally {
       deadline.dispose();
     }
@@ -872,7 +947,8 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
     }
 
     const created = createServer((request, response) => {
-      const deadline = createRequestDeadline();
+      const startedAt = performance.now();
+      let deadline = createRequestDeadline();
       void (async () => {
         try {
           if (request.method !== "POST" || request.url !== "/") {
@@ -883,7 +959,23 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
 
           const body = await readBody(request, deadline.signal);
           deadline.check();
-          const result = await handleWithDeadline(body, deadline);
+          let result: AdminResponse;
+          if (handlerTimeoutMs !== undefined) {
+            result = await handleWithDeadline(body, deadline);
+          } else {
+            const parsed = AdminRequestSchema.safeParse(body);
+            if (!parsed.success) {
+              result = failure(invalidInput());
+            } else {
+              const remainingMs = Math.max(
+                1,
+                gatewayOperationTimeoutMs(parsed.data) - (performance.now() - startedAt),
+              );
+              deadline.dispose();
+              deadline = createRequestDeadline(remainingMs);
+              result = await handleWithDeadline(parsed.data, deadline);
+            }
+          }
           writeJson(response, result.ok ? 200 : 400, result);
         } catch (error: unknown) {
           const tooLarge = error === REQUEST_TOO_LARGE;

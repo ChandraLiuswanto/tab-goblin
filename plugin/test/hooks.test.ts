@@ -6,12 +6,14 @@ import { ADMIN_SOCKET_ENV, ENROLLMENT_ENV } from "@tab-goblin/protocol";
 import { createConfigStore } from "../server/config-store.js";
 import { registerHooks, shouldInject } from "../server/hooks.js";
 import { createLifecycleCoordinator } from "../server/lifecycle-coordinator.js";
-import { defaultTabGoblinSettings } from "../shared/settings.js";
+import { createTabGoblinSettingsSchema } from "../shared/settings.js";
+import { testConnectionDefaults } from "./connection-defaults.js";
 
 const directories: string[] = [];
 afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
 
-const SETTINGS = { ...defaultTabGoblinSettings, enabled: true, enabledWorkspaceCwds: ["/w/one"], socketPath: "/run/tabgoblin.sock", bridgeArgs: ["bridge.mjs"], workspaceGenerations: { "ws-1": 3 }, agentGenerations: { "agent-1": 4 } };
+const defaultTabGoblinSettings = createTabGoblinSettingsSchema({ bridgeCommand: "node", bridgeArgs: [], socketPath: "/run/tabgoblin.sock" }).parse({});
+const SETTINGS = { ...defaultTabGoblinSettings, enabled: true, enabledWorkspaceCwds: ["/w/one"], bridgeArgs: ["bridge.mjs"], workspaceGenerations: { "ws-1": 3 }, agentGenerations: { "agent-1": 4 } };
 function fakeServer() { const before = new Map<string, any>(); const on = new Map<string, any>(); return { before: (name: string, fn: any) => (before.set(name, fn), () => before.delete(name)), on: (name: string, fn: any) => (on.set(name, fn), () => on.delete(name)), beforeHandlers: before, onHandlers: on } as any; }
 
 describe("Claude-only scoped injection", () => {
@@ -30,7 +32,7 @@ describe("Claude-only scoped injection", () => {
     expect(openSession).toHaveBeenCalledWith({ agentId: "agent-1", workspaceId: "ws-1", cwd: "/w/one", purpose: "history", enrollment: "synthetic-nonce" });
   });
   it("returns an archive callback promise while a real coordinator durably records delayed revocation", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "tabgoblin-hooks-")); directories.push(directory); const settings = createConfigStore(directory);
+    const directory = mkdtempSync(join(tmpdir(), "tabgoblin-hooks-")); directories.push(directory); const settings = createConfigStore(directory, testConnectionDefaults);
     await settings.update((current) => ({ ...current, workspaceGenerations: { "ws-1": 3 } }));
     let resolve!: (response: unknown) => void; const delayed = new Promise((done) => { resolve = done; });
     const lifecycle = createLifecycleCoordinator(settings, { request: vi.fn().mockReturnValue(delayed), notify: vi.fn(), close: vi.fn() } as any);

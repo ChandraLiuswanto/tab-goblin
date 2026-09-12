@@ -13,7 +13,7 @@ function bindInteractive(
   workspaceId = "ws-1",
 ) {
   registry.record(enrollment, cwd, workspaceId);
-  const binding = registry.bind(cwd, agentId, workspaceId);
+  const binding = registry.bind(enrollment, cwd, agentId, workspaceId);
   registry.noteSessionOpen(agentId, workspaceId, "interactive");
   return binding;
 }
@@ -41,7 +41,7 @@ describe("EnrollmentRegistry", () => {
     registry.record(NONCE, "/w/one", "ws-1");
     const resolving = registry.resolve(NONCE, 100);
     setTimeout(() => {
-      registry.bind("/w/one", "agent-1", "ws-1");
+      registry.bind(NONCE, "/w/one", "agent-1", "ws-1");
       registry.noteSessionOpen("agent-1", "ws-1", "interactive");
     }, 5);
 
@@ -56,26 +56,27 @@ describe("EnrollmentRegistry", () => {
   it("refuses history sessions and workspace-mismatched session notifications", async () => {
     const history = new EnrollmentRegistry();
     history.record(NONCE, "/w/one", "ws-1");
-    history.bind("/w/one", "agent-1", "ws-1");
+    history.bind(NONCE, "/w/one", "agent-1", "ws-1");
     history.noteSessionOpen("agent-1", "ws-1", "history");
     await expect(history.resolve(NONCE, 1)).rejects.toMatchObject({ code: "not_enrolled" });
 
     const mismatch = new EnrollmentRegistry();
     mismatch.record(NONCE, "/w/one", "ws-1");
-    mismatch.bind("/w/one", "agent-1", "ws-1");
+    mismatch.bind(NONCE, "/w/one", "agent-1", "ws-1");
     mismatch.noteSessionOpen("agent-1", "ws-2", "interactive");
     await expect(mismatch.resolve(NONCE, 1)).rejects.toMatchObject({ code: "not_enrolled" });
   });
 
-  it("binds the oldest unbound nonce for the exact cwd", () => {
+  it("binds only the exact pending nonce instead of falling back to another nonce with the same cwd", () => {
     const registry = new EnrollmentRegistry();
     registry.record(NONCE, "/w/one", "ws-1");
     registry.record(SECOND, "/w/one", "ws-1");
     registry.record(THIRD, "/w/two", "ws-1");
 
-    expect(registry.bind("/w/one", "agent-1", "ws-1")?.enrollment).toBe(NONCE);
-    expect(registry.bind("/w/one", "agent-2", "ws-1")?.enrollment).toBe(SECOND);
-    expect(registry.bind("/w/missing", "agent-3", "ws-1")).toBeNull();
+    expect(registry.bind(SECOND, "/w/one", "agent-2", "ws-1")?.enrollment).toBe(SECOND);
+    expect(registry.bind(NONCE, "/w/one", "agent-1", "ws-1")?.enrollment).toBe(NONCE);
+    expect(registry.bind(THIRD, "/w/missing", "agent-3", "ws-1")).toBeNull();
+    expect(registry.bind("44444444-4444-4444-8444-444444444444", "/w/two", "agent-3", "ws-1")).toBeNull();
   });
 
   it("expires pending enrollments and inactive bound credentials", async () => {
@@ -84,7 +85,7 @@ describe("EnrollmentRegistry", () => {
     pending.record(NONCE, "/w/one", "ws-1");
     clock = 1_001;
     pending.sweep();
-    expect(pending.bind("/w/one", "agent-1", "ws-1")).toBeNull();
+    expect(pending.bind(NONCE, "/w/one", "agent-1", "ws-1")).toBeNull();
 
     clock = 0;
     const bound = new EnrollmentRegistry({
@@ -170,6 +171,7 @@ describe("EnrollmentRegistry", () => {
 
     registry.revokeWorkspace("ws-a");
     expect(registry.bind(
+      NONCE,
       "/w/shared",
       "agent-b",
       "ws-b",
@@ -194,6 +196,7 @@ describe("EnrollmentRegistry", () => {
       expect.objectContaining({ code: "auth_failed" }),
     );
     expect(() => registry.bind(
+      NONCE,
       "/w/one",
       "agent-1",
       "ws-1",
@@ -211,12 +214,14 @@ describe("EnrollmentRegistry", () => {
     expect(workspaceGeneration).toBe(2);
     registry.record(THIRD, "/w/one", "ws-1", workspaceGeneration);
     expect(() => registry.bind(
+      THIRD,
       "/w/one",
       "agent-1",
       "ws-1",
       { agentGeneration: 0, workspaceGeneration: 0 },
     )).toThrow(expect.objectContaining({ code: "auth_failed" }));
     registry.bind(
+      THIRD,
       "/w/one",
       "agent-1",
       "ws-1",
@@ -237,6 +242,7 @@ describe("EnrollmentRegistry", () => {
     registry.record(NONCE, "/w/one", "ws-1", 0);
     expect(registry.revokeAgent("agent-1")).toBe(1);
     expect(() => registry.bind(
+      NONCE,
       "/w/one",
       "agent-1",
       "ws-1",
@@ -252,6 +258,7 @@ describe("EnrollmentRegistry", () => {
     const agentGeneration = registry.resetAgent("agent-1");
     expect(agentGeneration).toBe(2);
     registry.bind(
+      NONCE,
       "/w/one",
       "agent-1",
       "ws-1",
@@ -275,6 +282,37 @@ describe("EnrollmentRegistry", () => {
     expect(() => registry.revokeWorkspace("ws-4")).toThrow(
       expect.objectContaining({ code: "busy" }),
     );
+  });
+
+  it("requires gateway-issued resets to recover durable nonzero generations after restart", async () => {
+    const firstProcess = new EnrollmentRegistry();
+    const agentGeneration = firstProcess.resetAgent("durable-agent");
+    const workspaceGeneration = firstProcess.resetWorkspace("durable-workspace");
+    firstProcess.record(NONCE, "/w/durable", "durable-workspace", workspaceGeneration);
+    firstProcess.bind(NONCE, "/w/durable", "durable-agent", "durable-workspace", { agentGeneration, workspaceGeneration });
+    firstProcess.noteSessionOpen("durable-agent", "durable-workspace", "interactive", { agentGeneration, workspaceGeneration });
+    await expect(firstProcess.authorize(NONCE)).resolves.toMatchObject({ agentGeneration, workspaceGeneration });
+
+    // Restarting loses all enrollment nonces and lifecycle authority. A durable
+    // generation is rejected until this *new* registry issues its reset epoch.
+    const restarted = new EnrollmentRegistry();
+    expect(() => restarted.record(SECOND, "/w/durable", "durable-workspace", workspaceGeneration)).toThrow(
+      expect.objectContaining({ code: "auth_failed" }),
+    );
+    const restartedAgentGeneration = restarted.resetAgent("durable-agent");
+    const restartedWorkspaceGeneration = restarted.resetWorkspace("durable-workspace");
+    restarted.record(SECOND, "/w/durable", "durable-workspace", restartedWorkspaceGeneration);
+    restarted.bind(SECOND, "/w/durable", "durable-agent", "durable-workspace", { agentGeneration: restartedAgentGeneration, workspaceGeneration: restartedWorkspaceGeneration });
+    restarted.noteSessionOpen("durable-agent", "durable-workspace", "interactive", { agentGeneration: restartedAgentGeneration, workspaceGeneration: restartedWorkspaceGeneration });
+    await expect(restarted.authorize(SECOND)).resolves.toMatchObject({ agentGeneration: restartedAgentGeneration, workspaceGeneration: restartedWorkspaceGeneration });
+    await expect(restarted.authorize(NONCE)).rejects.toMatchObject({ code: "not_enrolled" });
+
+    // Replayed tombstones stay closed and cannot affect a same-cwd workspace.
+    const revoked = new EnrollmentRegistry();
+    revoked.revokeAgent("revoked-agent");
+    revoked.revokeWorkspace("revoked-workspace");
+    expect(() => revoked.record(THIRD, "/w/shared", "revoked-workspace", 1)).toThrow(expect.objectContaining({ code: "auth_failed" }));
+    revoked.record("44444444-4444-4444-8444-444444444444", "/w/shared", "other-workspace", 0);
   });
 
   it("revokes already-bound agent credentials without affecting another agent", async () => {

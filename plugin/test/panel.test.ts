@@ -5,9 +5,9 @@ import {
   describeState,
   initialEphemeralState,
   panelEphemeralReducer,
-  pollInterval,
   sanitizeTabs,
   statusResponseIssue,
+  tabSectionMode,
   viewerAddress,
 } from "../client/panel-model.js";
 import { filterActivity, sanitizeActivity } from "../client/activity-model.js";
@@ -123,12 +123,6 @@ describe("panel request safety", () => {
     expect(stale.pairing?.code).toBe("LATEST");
   });
 
-  it("backs status polling off after errors and caps it at thirty seconds", () => {
-    expect(pollInterval(0)).toBe(3_000);
-    expect(pollInterval(1)).toBe(6_000);
-    expect(pollInterval(9)).toBe(30_000);
-  });
-
   it("fails closed on cross-workspace and regressed ownership generations", () => {
     expect(statusResponseIssue({ ok: true, status: ready }, "ws-2", 0)).toBe("invalid_workspace_status");
     expect(statusResponseIssue({ ok: true, status: ready }, "ws-1", 4)).toBe("stale_ownership_generation");
@@ -144,6 +138,23 @@ describe("panel request safety", () => {
     const manual = { ...ready, ownership: { state: "manual" as const, generation: 4, owner: "viewer" as const } };
     expect(actionAvailability(manual, false, true).returnToAgent).toBe(true);
     expect(actionAvailability(ready, false, true).returnToAgent).toBe(false);
+  });
+});
+
+describe("tab rendering", () => {
+  it("hides retained tabs when a status refetch fails with stale ready data", () => {
+    expect(tabSectionMode({
+      statusQueryIsSuccess: false,
+      statusQueryIsError: true,
+      sessionState: "ready",
+      tabsQueryState: "success",
+      tabCount: 2,
+    })).toBe("status-unconfirmed");
+  });
+
+  it("shows tabs only when current status and tab queries both succeed", () => {
+    expect(tabSectionMode({ statusQueryIsSuccess: true, statusQueryIsError: false, sessionState: "ready", tabsQueryState: "success", tabCount: 2 })).toBe("tabs");
+    expect(tabSectionMode({ statusQueryIsSuccess: true, statusQueryIsError: false, sessionState: "ready", tabsQueryState: "success", tabCount: 0 })).toBe("empty");
   });
 });
 
@@ -175,7 +186,7 @@ describe("bounded rendering and viewer links", () => {
 describe("activity rendering", () => {
   const records = sanitizeActivity([
     { operationId: "1", source: "agent", tabId: "tab-1", action: "navigate", status: "ok", startedAt: "2026-09-12T00:00:00Z", endedAt: null, code: null, url: "https://example.test/?token=x", title: "Page" },
-    { operationId: "2", source: "viewer", tabId: "tab-1", action: "return-to-agent", status: "error", startedAt: "2026-09-12T00:01:00Z", endedAt: null, code: "busy", url: null, title: null },
+    { operationId: "2", source: "agent", tabId: "tab-1", action: "click", status: "error", startedAt: "2026-09-12T00:01:00Z", endedAt: null, code: "stale_ref", url: null, title: null },
   ]);
 
   it("renders newest first and keeps redacted bounded fields", () => {
@@ -184,8 +195,7 @@ describe("activity rendering", () => {
     expect(JSON.stringify(records)).not.toContain("token=x");
   });
 
-  it("filters errors and manual-control events behaviorally", () => {
+  it("filters errors behaviorally", () => {
     expect(filterActivity(records, "errors").map((record) => record.operationId)).toEqual(["2"]);
-    expect(filterActivity(records, "manual").map((record) => record.operationId)).toEqual(["2"]);
   });
 });

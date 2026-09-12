@@ -10,7 +10,10 @@ import {
   ENROLLMENT_ENV,
   ERROR_CODES,
   formatRef,
+  gatewayOperationTimeoutMs,
+  gatewayTransportTimeoutMs,
   isNavigableUrl,
+  MAX_UPLOAD_BYTES,
   MCP_SERVER_NAME,
   NetworkDiagnosticSchema,
   NETWORK_DIAGNOSTIC_LIMIT,
@@ -40,6 +43,47 @@ const HIGH_SURROGATE = String.fromCharCode(0xd83d);
 const LOW_SURROGATE = String.fromCharCode(0xde00);
 const REPLACEMENT = String.fromCharCode(0xfffd);
 const ELLIPSIS = String.fromCharCode(8230);
+
+describe("upload limits", () => {
+  it("exports one conservative byte cap for upload implementations", () => {
+    expect(MAX_UPLOAD_BYTES).toBe(32 * 1024 * 1024);
+  });
+});
+
+describe("operation budgets", () => {
+  it("keeps each outer transport budget above its bounded gateway operation", () => {
+    const requests = [
+      { op: "status", workspaceId: "ws-1" },
+      { op: "start", workspaceId: "ws-1" },
+      { op: "stop", workspaceId: "ws-1" },
+      {
+        op: "tool",
+        enrollment: "11111111-1111-4111-8111-111111111111",
+        workspaceId: "ws-1",
+        name: "tabgoblin_navigate",
+        input: { tabId: "t1", url: "https://example.com", timeoutMs: 30_000 },
+        source: "test",
+      },
+    ] as const;
+
+    expect(requests.map(gatewayOperationTimeoutMs)).toEqual([20_000, 75_000, 50_000, 45_000]);
+    expect(requests.map(gatewayTransportTimeoutMs)).toEqual([25_000, 80_000, 55_000, 50_000]);
+  });
+
+  it("includes cold browser attachment and local overhead around default actions", () => {
+    const request = {
+      op: "tool",
+      enrollment: "11111111-1111-4111-8111-111111111111",
+      workspaceId: "ws-1",
+      name: "tabgoblin_list_tabs",
+      input: {},
+      source: "test",
+    } as const;
+
+    expect(gatewayOperationTimeoutMs(request)).toBe(25_000);
+    expect(gatewayTransportTimeoutMs(request)).toBe(30_000);
+  });
+});
 
 describe("redactUrl", () => {
   it("strips userinfo, query and fragment", () => {
@@ -369,6 +413,11 @@ describe("admin and viewer wire contracts", () => {
       op: "status",
       workspaceId: "w1",
     });
+    expect(AdminRequestSchema.parse({ op: "tabs", workspaceId: "w1" })).toEqual({
+      op: "tabs",
+      workspaceId: "w1",
+    });
+    expect(AdminRequestSchema.parse({ op: "health" })).toEqual({ op: "health" });
     expect(
       AdminRequestSchema.safeParse({ op: "tool", workspaceId: "w1", name: "other", source: "a" })
         .success,
@@ -421,12 +470,19 @@ describe("admin and viewer wire contracts", () => {
       cwd: "/w/one",
       workspaceId: "w1",
     })).toMatchObject({ workspaceId: "w1", workspaceGeneration: 0 });
-    expect(AdminRequestSchema.parse({
+    expect(AdminRequestSchema.safeParse({
       op: "bind-enrollment",
       cwd: "/w/one",
       agentId: "a1",
       workspaceId: "w1",
-    })).toMatchObject({ agentGeneration: 0, workspaceGeneration: 0 });
+    }).success).toBe(false);
+    expect(AdminRequestSchema.parse({
+      op: "bind-enrollment",
+      enrollment,
+      cwd: "/w/one",
+      agentId: "a1",
+      workspaceId: "w1",
+    })).toMatchObject({ enrollment, agentGeneration: 0, workspaceGeneration: 0 });
     expect(AdminRequestSchema.parse({
       op: "session-open",
       agentId: "a1",
@@ -444,6 +500,11 @@ describe("admin and viewer wire contracts", () => {
     expect(AdminResponseSchema.parse({ ok: true, lifecycleGeneration: 2 })).toEqual({
       ok: true,
       lifecycleGeneration: 2,
+    });
+    expect(AdminResponseSchema.parse({ ok: true, protocolVersion: 1, gatewayInstanceId: "11111111-1111-4111-8111-111111111111" })).toEqual({
+      ok: true,
+      protocolVersion: 1,
+      gatewayInstanceId: "11111111-1111-4111-8111-111111111111",
     });
   });
 

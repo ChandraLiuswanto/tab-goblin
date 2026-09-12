@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
-import { tabGoblinError, type SessionState, type TabGoblinError } from "@tab-goblin/protocol";
+import {
+  RUNTIME_OPERATION_TIMEOUT_MS,
+  RUNTIME_START_TIMEOUT_MS,
+  RUNTIME_STOP_TIMEOUT_MS,
+  tabGoblinError,
+  type SessionState,
+  type TabGoblinError,
+} from "@tab-goblin/protocol";
 
 /**
  * T9 production executors MUST terminate the child process when this signal aborts.
@@ -26,9 +33,8 @@ export interface RuntimeSupervisorOptions {
   probe: (cdpUrl: string, signal?: AbortSignal) => Promise<boolean>;
   startTimeoutMs?: number;
   /**
-   * Overall staging-operation budget. Stop and startup cleanup use at least 30 seconds
-   * for discovery, then give a live container a fresh 30-second removal window so
-   * Podman's 20-second graceful stop always has bounded command overhead.
+   * Overall staging-operation budget. Stop and each startup cleanup use one absolute
+   * deadline of at least 30 seconds across discovery, graceful stop, and removal.
    */
   operationTimeoutMs?: number;
   /** Monotonic millisecond clock used for deadline accounting; defaults to performance.now. */
@@ -44,6 +50,7 @@ interface Entry {
   starting: Promise<RuntimeEndpoints> | null;
   stopping: Promise<void> | null;
   blocked: Promise<void> | null;
+  stagingCleanupPending: boolean;
 }
 
 interface PodmanResult {
@@ -52,9 +59,6 @@ interface PodmanResult {
   stderr: string;
 }
 
-const DEFAULT_START_TIMEOUT_MS = 60_000;
-const DEFAULT_OPERATION_TIMEOUT_MS = 30_000;
-const MIN_STOP_OPERATION_TIMEOUT_MS = 30_000;
 const MAX_TIMER_MS = 2_147_483_647;
 const GRACEFUL_STOP_SECONDS = 20;
 const POLL_INTERVAL_MS = 500;
@@ -122,15 +126,15 @@ export class RuntimeSupervisor {
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
 
   constructor(private readonly options: RuntimeSupervisorOptions) {
-    this.timeout = duration(options.startTimeoutMs, DEFAULT_START_TIMEOUT_MS, "startTimeoutMs");
+    this.timeout = duration(options.startTimeoutMs, RUNTIME_START_TIMEOUT_MS, "startTimeoutMs");
     this.operationTimeout = duration(
       options.operationTimeoutMs,
-      DEFAULT_OPERATION_TIMEOUT_MS,
+      RUNTIME_OPERATION_TIMEOUT_MS,
       "operationTimeoutMs",
     );
     this.stopOperationTimeout = Math.max(
       this.operationTimeout,
-      MIN_STOP_OPERATION_TIMEOUT_MS,
+      RUNTIME_STOP_TIMEOUT_MS,
     );
     this.monotonicNow = options.monotonicNow
       ?? (options.now ? guardLegacyClock(options.now) : () => performance.now());
@@ -175,15 +179,19 @@ export class RuntimeSupervisor {
       starting: null,
       stopping: null,
       blocked: null,
+      stagingCleanupPending: true,
     };
     this.entries.set(workspaceId, entry);
 
     const name = containerNameFor(workspaceId);
     const deadline = this.deadline(this.timeout);
-    entry.starting = this.withLifecycleLock(name, deadline, () => this.launch(workspaceId, deadline))
+    entry.starting = this.withLifecycleLock(name, deadline, () =>
+      this.launch(workspaceId, entry, deadline),
+    )
       .then((runtimeEndpoints) => {
         entry.state = "ready";
         entry.endpoints = runtimeEndpoints;
+        entry.stagingCleanupPending = true;
         return runtimeEndpoints;
       })
       .catch((error: unknown) => {
@@ -213,8 +221,14 @@ export class RuntimeSupervisor {
     const deadline = this.deadline(this.stopOperationTimeout);
     entry.stopping = this.withLifecycleLock(containerName, deadline, async () => {
       const state = await this.existingContainerState(containerName, workspaceId, deadline);
-      if (state === null) return;
-      await this.removeOwnedContainer(containerName, state, deadline);
+      if (state !== null) {
+        entry.stagingCleanupPending = true;
+        await this.removeOwnedContainer(containerName, state, deadline);
+      }
+      if (entry.stagingCleanupPending) {
+        await this.resetStagingVolume(workspaceId, deadline);
+        entry.stagingCleanupPending = false;
+      }
     })
       .then(() => {
         entry.state = "stopped";
@@ -225,7 +239,10 @@ export class RuntimeSupervisor {
         entry.endpoints = null;
         if (error instanceof DeadlineExceeded) {
           this.blockEntry(entry, error.quiesced);
-          throw error.failure;
+          throw tabGoblinError(
+            "timeout_uncertain",
+            "The browser runtime stop could not be proven complete; inspect state before continuing",
+          );
         }
         throw error;
       })
@@ -269,6 +286,7 @@ export class RuntimeSupervisor {
       starting: null,
       stopping: null,
       blocked: null,
+      stagingCleanupPending: true,
     };
   }
 
@@ -279,7 +297,11 @@ export class RuntimeSupervisor {
     });
   }
 
-  private async launch(workspaceId: string, deadline: number): Promise<RuntimeEndpoints> {
+  private async launch(
+    workspaceId: string,
+    entry: Entry,
+    deadline: number,
+  ): Promise<RuntimeEndpoints> {
     const containerName = containerNameFor(workspaceId);
     const volumeName = volumeNameFor(workspaceId);
     const stagingName = `${volumeName}-staging`;
@@ -299,17 +321,17 @@ export class RuntimeSupervisor {
       );
     }
 
+    await this.resetStagingVolume(workspaceId, deadline);
+    entry.stagingCleanupPending = false;
     await this.requireSuccess(
       ["volume", "create", "--ignore", volumeName],
       "prepare the browser profile volume",
       deadline,
     );
-    await this.requireSuccess(
-      ["volume", "create", "--ignore", stagingName],
-      "prepare the browser staging volume",
-      deadline,
-    );
 
+    // From the first container mutation onward, a later stop must reset staging
+    // even if startup fails before readiness is established.
+    entry.stagingCleanupPending = true;
     const run = await this.invoke([
       "run",
       "-d",
@@ -441,6 +463,7 @@ export class RuntimeSupervisor {
     const deadline = this.deadline(this.stopOperationTimeout);
     const state = await this.existingContainerState(containerName, workspaceId, deadline);
     if (state !== null) await this.removeOwnedContainer(containerName, state, deadline);
+    await this.resetStagingVolume(workspaceId, deadline);
   }
 
   private async publishedPort(
@@ -467,22 +490,42 @@ export class RuntimeSupervisor {
     state: string,
     deadline: number,
   ): Promise<void> {
-    let removalDeadline = deadline;
     if (!this.isStaleState(state)) {
-      removalDeadline = Math.max(
-        deadline,
-        this.deadline(MIN_STOP_OPERATION_TIMEOUT_MS),
-      );
       await this.requireSuccess(
         ["stop", "--ignore", "--time", String(GRACEFUL_STOP_SECONDS), containerName],
         "stop the browser runtime gracefully",
-        removalDeadline,
+        deadline,
       );
     }
     await this.requireSuccess(
       ["rm", "--ignore", containerName],
       "remove the stopped browser runtime",
-      removalDeadline,
+      deadline,
+    );
+  }
+
+  private async resetStagingVolume(workspaceId: string, deadline: number): Promise<void> {
+    const stagingName = `${volumeNameFor(workspaceId)}-staging`;
+    const exists = await this.invoke(
+      ["volume", "exists", stagingName],
+      "check the browser staging volume",
+      deadline,
+    );
+    if (exists.code === 0) {
+      // Deliberately omit --force: a volume attached to any live or uncertain
+      // container must make cleanup fail closed instead of deleting live data.
+      await this.requireSuccess(
+        ["volume", "rm", stagingName],
+        "clear the browser staging volume",
+        deadline,
+      );
+    } else if (exists.code !== 1) {
+      throw unavailable("Could not check the browser staging volume");
+    }
+    await this.requireSuccess(
+      ["volume", "create", stagingName],
+      "prepare the browser staging volume",
+      deadline,
     );
   }
 

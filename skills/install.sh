@@ -6,12 +6,24 @@ skills_root=${AGENTS_SKILLS_DIR:-"$HOME/.agents/skills"}
 destination="$skills_root/tab-goblin"
 destination_skill="$destination/SKILL.md"
 
-if [[ -e "$destination_skill" ]] && ! cmp -s "$source_dir/SKILL.md" "$destination_skill"; then
-  echo "Refusing to overwrite a different skill: $destination_skill" >&2
+if [[ -L "$destination" || -L "$destination_skill" ]]; then
+  echo "Refusing a symlinked skill destination: $destination" >&2
+  exit 1
+fi
+if [[ -e "$destination" && ! -d "$destination" ]]; then
+  echo "Refusing a non-directory skill destination: $destination" >&2
   exit 1
 fi
 
 mkdir -p -- "$destination"
+if [[ ! -d "$destination" || -L "$destination" ]]; then
+  echo "Refusing a non-directory skill destination: $destination" >&2
+  exit 1
+fi
+if [[ -e "$destination_skill" ]] && ! cmp -s "$source_dir/SKILL.md" "$destination_skill"; then
+  echo "Refusing to overwrite a different skill: $destination_skill" >&2
+  exit 1
+fi
 if [[ ! -e "$destination_skill" ]]; then
   cp -- "$source_dir/SKILL.md" "$destination_skill"
 fi

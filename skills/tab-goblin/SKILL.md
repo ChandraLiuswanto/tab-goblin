@@ -45,7 +45,7 @@ Use returned `tabId` values and current snapshot refs exactly. The exact input n
 | `stale_ref` | Take a fresh snapshot of that tab and choose a current ref. |
 | `manual_control` | Leave the browser alone; do unrelated work or request handoff. |
 | `busy` | Wait for the in-flight command; do not compete with it. |
-| `timeout_uncertain` | The mutation outcome is unknown: inspect the page before deciding, and never re-send the click, submit, fill, or navigation. |
+| `timeout_uncertain` | The mutation outcome is unknown: inspect the page before deciding, and never replay a timed-out command or mutation—including click, submit, fill, type, keypress, select, drag, upload, evaluation, or navigation. |
 | `auth_failed` | Report authentication failure without exposing credentials; request user action if appropriate. |
 | `runtime_unavailable` | Check status and report/retry only after the runtime is known available. |
 | `invalid_input` | Correct the request using the exact tool inputs above; do not guess. |

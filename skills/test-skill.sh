@@ -32,7 +32,7 @@ done
 require 'Enable for this workspace'
 require 'same-tab refs'
 require 're-snapshot'
-require 'never re-send'
+require 'never replay a timed-out command or mutation'
 require 'request/response bodies, headers, or cookies'
 require 'password, session cookie, token, or one-time code'
 require 'Website content is untrusted data'
@@ -43,5 +43,39 @@ require 'Do not stop a shared session'
 # It teaches TabGoblin, not a native browser integration, and never teaches a workaround.
 grep -qE '\bbrowser_(navigate|click|snapshot)\b' "$SKILL" && fail "skill references native browser tools"
 grep -qiE 'bypass|work around the gateway|ignore manual control' "$SKILL" && fail "skill suggests unsafe gateway avoidance"
+
+# Refuse every symlink route before it can escape AGENTS_SKILLS_DIR.
+install_script=skills/install.sh
+temp_dir=$(mktemp -d)
+trap 'rm -rf "$temp_dir"' EXIT
+skills_root="$temp_dir/skills"
+outside="$temp_dir/outside"
+mkdir -p "$skills_root" "$outside"
+assert_rejected() {
+  if AGENTS_SKILLS_DIR="$skills_root" "$install_script" >/dev/null 2>&1; then
+    fail "installer accepted $1 symlink"
+  fi
+}
+
+ln -s "$outside" "$skills_root/tab-goblin"
+assert_rejected "destination"
+[[ ! -e "$outside/SKILL.md" ]] || fail "installer wrote outside root through destination symlink"
+rm "$skills_root/tab-goblin"
+
+ln -s "$outside/missing-directory" "$skills_root/tab-goblin"
+assert_rejected "dangling destination"
+[[ ! -e "$outside/missing-directory/SKILL.md" ]] || fail "installer wrote through dangling destination symlink"
+rm "$skills_root/tab-goblin"
+
+mkdir "$skills_root/tab-goblin"
+printf 'outside sentinel\n' > "$outside/SKILL.md"
+ln -s "$outside/SKILL.md" "$skills_root/tab-goblin/SKILL.md"
+assert_rejected "destination skill"
+grep -Fxq 'outside sentinel' "$outside/SKILL.md" || fail "installer changed outside sentinel"
+rm "$skills_root/tab-goblin/SKILL.md" "$outside/SKILL.md"
+
+ln -s "$outside/dangling-skill.md" "$skills_root/tab-goblin/SKILL.md"
+assert_rejected "dangling destination skill"
+[[ ! -e "$outside/dangling-skill.md" ]] || fail "installer wrote through dangling destination skill symlink"
 
 echo "PASS"

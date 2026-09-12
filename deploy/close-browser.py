@@ -90,9 +90,10 @@ def main() -> int:
         sock.sendall(request.encode("ascii"))
         response = bytearray()
         while b"\r\n\r\n" not in response:
-            response.extend(sock.recv(4096))
-            if not response:
+            chunk = sock.recv(4096)
+            if not chunk:
                 return 1
+            response.extend(chunk)
         if b" 101 " not in response.split(b"\r\n", 1)[0]:
             return 1
 

@@ -83,7 +83,9 @@ function openPrivateFile(directoryFd: number, name: string): number {
 function readConfig(directoryFd: number, parse: (value: unknown) => TabGoblinSettings, defaults: TabGoblinSettings): TabGoblinSettings {
   try {
     const fd = openPrivateFile(directoryFd, CONFIG_FILE);
-    try { return parse(JSON.parse(readFileSync(fd, "utf8"))); }
+    // The bridge launch command is derived from the installed checkout, never edited by users.
+    // Persisted copies go stale across upgrades, so the server-derived value always wins.
+    try { return parse({ ...JSON.parse(readFileSync(fd, "utf8")), bridgeCommand: defaults.bridgeCommand, bridgeArgs: defaults.bridgeArgs }); }
     finally { closeSync(fd); }
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaults;

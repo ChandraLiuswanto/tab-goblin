@@ -41,7 +41,7 @@ describe("server-owned connection defaults", () => {
     expect(() => deriveServerConnectionDefaults({ installRoot: root, xdgRuntimeDir: "/run/user/123" })).toThrow(/npm run build/i);
   });
 
-  it("uses derived defaults on a clean install and never replaces a saved connection choice", async () => {
+  it("uses derived defaults on a clean install, keeps a saved socket path, and refreshes the bridge launch command", async () => {
     const { root, bridge } = installedCheckout();
     const initial = deriveServerConnectionDefaults({ installRoot: root, xdgRuntimeDir: "/run/user/123" });
     const configDirectory = directory();
@@ -51,7 +51,7 @@ describe("server-owned connection defaults", () => {
     await store.update((current) => ({ ...current, bridgeCommand: "/custom/node", bridgeArgs: ["/custom/bridge.mjs"], socketPath: "/custom/gateway.sock" }));
     const changedDefaults = { bridgeCommand: process.execPath, bridgeArgs: [bridge], socketPath: "/run/user/456/tabgoblin/gateway.sock" };
     expect(createConfigStore(configDirectory, changedDefaults).read()).toMatchObject({
-      bridgeCommand: "/custom/node", bridgeArgs: ["/custom/bridge.mjs"], socketPath: "/custom/gateway.sock",
+      bridgeCommand: process.execPath, bridgeArgs: [bridge], socketPath: "/custom/gateway.sock",
     });
   });
 });

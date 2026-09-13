@@ -30,6 +30,11 @@ describe("app-owned durable config", () => {
     expect(store.read()).toMatchObject({ socketPath: connection.socketPath, viewerUrl: "" });
   });
 
+  it("ignores stale persisted bridge command and args in favour of server-derived defaults", async () => {
+    const dir = directory(); const first = createConfigStore(dir, { ...testConnectionDefaults, bridgeCommand: "node", bridgeArgs: [] });
+    await first.update((current) => ({ ...current, enabled: true }));
+    expect(createConfigStore(dir, testConnectionDefaults).read()).toMatchObject({ enabled: true, bridgeCommand: testConnectionDefaults.bridgeCommand, bridgeArgs: testConnectionDefaults.bridgeArgs });
+  });
   it("rejects a symlink anywhere in the XDG state-home ancestor chain", () => {
     const root = directory(); const target = join(root, "target"); mkdirSync(target); const linked = join(root, "state-link"); symlinkSync(target, linked);
     const previous = process.env.XDG_STATE_HOME; process.env.XDG_STATE_HOME = linked;

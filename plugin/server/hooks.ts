@@ -17,10 +17,11 @@ export function shouldInject(settings: TabGoblinSettings, config: { cwd?: string
 export function registerHooks(server: PluginServerContext, dependencies: HookDependencies): () => void {
   const stopCreate = server.before("agent.create", ({ request }) => {
     try {
+      // bridgeCommand is process.execPath, which is the Electron binary when the daemon runs inside the desktop app; without this flag it boots the GUI instead of node.
       const config = request.config as unknown as { cwd?: string; provider?: string; mcpServers?: Record<string, unknown> };
       if (!shouldInject(dependencies.readSettings(), config)) return undefined;
       const settings = dependencies.readSettings();
-      return { ...request, config: { ...request.config, mcpServers: { ...(config.mcpServers ?? {}), [MCP_SERVER_NAME]: { type: "stdio", command: settings.bridgeCommand, args: settings.bridgeArgs } } } };
+      return { ...request, config: { ...request.config, mcpServers: { ...(config.mcpServers ?? {}), [MCP_SERVER_NAME]: { type: "stdio", command: settings.bridgeCommand, args: settings.bridgeArgs, env: { ELECTRON_RUN_AS_NODE: "1" } } } } };
     } catch { return undefined; }
   });
   const stopSessionOpen = server.before("agent.session_open", async ({ request }) => {

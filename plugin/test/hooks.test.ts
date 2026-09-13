@@ -25,7 +25,7 @@ describe("Claude-only scoped injection", () => {
     const server = fakeServer(); const openSession = vi.fn().mockResolvedValue({ socketPath: "/run/tabgoblin.sock", agentGeneration: 4, workspaceGeneration: 3 });
     registerHooks(server, { readSettings: () => SETTINGS, lifecycle: { openSession, revokeAgent: vi.fn(), revokeWorkspace: vi.fn() } as any, newEnrollment: () => "synthetic-nonce" });
     const created = server.beforeHandlers.get("agent.create")({ request: { config: { provider: "claude", cwd: "/w/one", mcpServers: {} }, env: { KEEP: "1" } } });
-    expect(created.config.mcpServers.tabgoblin).toEqual({ type: "stdio", command: "node", args: ["bridge.mjs"] });
+    expect(created.config.mcpServers.tabgoblin).toEqual({ type: "stdio", command: "node", args: ["bridge.mjs"], env: { ELECTRON_RUN_AS_NODE: "1" } });
     expect(JSON.stringify(created.config.mcpServers)).not.toContain("synthetic-nonce");
     const opened = await server.beforeHandlers.get("agent.session_open")({ request: { agentId: "agent-1", workspaceId: "ws-1", provider: "claude", cwd: "/w/one", purpose: "history", reason: "resume", env: { KEEP: "1" } } });
     expect(opened.env).toMatchObject({ KEEP: "1", [ADMIN_SOCKET_ENV]: "/run/tabgoblin.sock", [ENROLLMENT_ENV]: "synthetic-nonce" });

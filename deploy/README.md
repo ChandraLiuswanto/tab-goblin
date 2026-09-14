@@ -106,6 +106,10 @@ directory. In a new dedicated shell, rerun discovery only, then restore that ori
 path before retrying a targeted step:
 
 ```bash
+if [ -z "${origin:-}" ]; then
+  printf '%s\n' 'Missing rediscovered origin; run discovery before selecting a backup.' >&2
+  exit 1
+fi
 # Replace this with the original path printed by the initial backup block.
 backup_dir='/absolute/path/printed/earlier'
 if [ ! -f "$backup_dir/intended-origin" ] || [ ! -f "$backup_dir/serve-status-before.json" ]; then
@@ -199,12 +203,25 @@ if [ -z "${origin:-}" ] || [ -z "${backup_dir:-}" ] || [ ! -d "$backup_dir" ]; t
 fi
 dropin_dir="$HOME/.config/systemd/user/tabgoblin-gateway.service.d"
 dropin="$dropin_dir/50-tailscale-viewer.conf"
-if [ -e "$dropin" ]; then
-  cp -p "$dropin" "$backup_dir/50-tailscale-viewer.conf.before"
-else
-  : > "$backup_dir/50-tailscale-viewer.conf.was-absent"
+dropin_before="$backup_dir/50-tailscale-viewer.conf.before"
+dropin_absent="$backup_dir/50-tailscale-viewer.conf.was-absent"
+if [ -e "$dropin_before" ] && [ -e "$dropin_absent" ]; then
+  printf '%s\n' 'Conflicting original drop-in markers; stop and recover manually.' >&2
+  exit 1
 fi
-chmod 600 "$backup_dir"/50-tailscale-viewer.conf.*
+# Capture exactly once. On a retry, preserve the existing original marker.
+if [ ! -e "$dropin_before" ] && [ ! -e "$dropin_absent" ]; then
+  if [ -e "$dropin" ]; then
+    cp -p "$dropin" "$dropin_before"
+  else
+    : > "$dropin_absent"
+  fi
+fi
+for marker in "$dropin_before" "$dropin_absent"; do
+  if [ -e "$marker" ]; then
+    chmod 600 "$marker"
+  fi
+done
 install -d -m 700 "$dropin_dir"
 cat > "$dropin" <<EOF
 [Service]
@@ -293,9 +310,14 @@ if [ -z "${backup_dir:-}" ] || [ ! -d "$backup_dir" ]; then
 fi
 dropin_dir="$HOME/.config/systemd/user/tabgoblin-gateway.service.d"
 dropin="$dropin_dir/50-tailscale-viewer.conf"
-if [ -e "$backup_dir/50-tailscale-viewer.conf.before" ]; then
-  install -Dm600 "$backup_dir/50-tailscale-viewer.conf.before" "$dropin"
-elif [ -e "$backup_dir/50-tailscale-viewer.conf.was-absent" ]; then
+dropin_before="$backup_dir/50-tailscale-viewer.conf.before"
+dropin_absent="$backup_dir/50-tailscale-viewer.conf.was-absent"
+if [ -e "$dropin_before" ] && [ -e "$dropin_absent" ]; then
+  printf '%s\n' 'Conflicting original drop-in markers; stop and recover manually.' >&2
+  exit 1
+elif [ -e "$dropin_before" ]; then
+  install -Dm600 "$dropin_before" "$dropin"
+elif [ -e "$dropin_absent" ]; then
   rm -f "$dropin"
 else
   printf '%s\n' 'Missing drop-in backup; stop and recover it manually.' >&2

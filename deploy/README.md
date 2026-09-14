@@ -82,7 +82,22 @@ Tailscale Serve can terminate HTTPS for the viewer without making the gateway or
 browser transports public. Obtain explicit operator consent before making these
 persistent configuration changes. This procedure is for an operator; never use
 Tailscale Funnel, publish a raw gateway/browser port, change firewall rules, or reset
-unrelated Tailscale Serve or plugin settings.
+unrelated Tailscale Serve or plugin settings. Run this as the user that owns the
+user service and is authorized to change that node's Tailscale Serve configuration. If
+Tailscale requires an elevation or approval, obtain it for the exact Serve command;
+do not use broad `sudo` changes to the user service or plugin configuration.
+
+### Run the procedure in a dedicated shell
+
+The following command blocks deliberately share `origin` and `backup_dir`. Start a
+dedicated Bash session and run every subsequent block in **that same session**, in
+order. Do not paste the `set -euo pipefail` or `exit 1` guards into a regular
+interactive shell: a failed guard exits this dedicated shell, leaving the parent shell
+and the live configuration untouched. Start a fresh dedicated shell to retry.
+
+```bash
+bash --noprofile --norc
+```
 
 ### Discover and record the intended origin
 
@@ -91,40 +106,55 @@ another installation. `Self.DNSName` conventionally ends in a dot; remove that d
 use the resulting hostname with `https://` and **no trailing slash**:
 
 ```bash
-set -eu
+set -euo pipefail
 command -v jq >/dev/null
 dns_name="$(tailscale status --json | jq -r '.Self.DNSName')"
-test -n "$dns_name" && test "$dns_name" != "null"
+if [ -z "$dns_name" ] || [ "$dns_name" = "null" ]; then
+  printf '%s\n' 'Self.DNSName is unavailable; stop without changing configuration.' >&2
+  exit 1
+fi
 host_name="${dns_name%.}"
-test -n "$host_name"
+if [ -z "$host_name" ]; then
+  printf '%s\n' 'The derived MagicDNS hostname is empty; stop.' >&2
+  exit 1
+fi
 origin="https://${host_name}"
 printf 'Viewer origin: %s\n' "$origin"
 ```
 
 Before changing anything, create an owner-restricted backup directory. Record the
-existing Serve state and the currently configured plugin **Viewer URL** there (or in
-an equivalently private operator record). Do not record pairing codes, cookies, or
-other credentials.
+existing Serve state and the current plugin **Viewer URL** there. First open the
+plugin panel and **read** (do not edit) its Viewer URL; copy that exact value for the
+prompt below. A blank value records an initially unset Viewer URL. Do not record
+pairing codes, cookies, or other credentials.
 
 ```bash
-set -eu
+if [ -z "${origin:-}" ]; then
+  printf '%s\n' 'Missing origin; rerun discovery in this dedicated shell.' >&2
+  exit 1
+fi
 backup_dir="$(mktemp -d)"
 chmod 700 "$backup_dir"
 tailscale serve status --json > "$backup_dir/serve-status-before.json"
 chmod 600 "$backup_dir/serve-status-before.json"
 printf '%s\n' "$origin" > "$backup_dir/intended-origin"
 chmod 600 "$backup_dir/intended-origin"
-# Copy the current Viewer URL shown in the plugin panel; blank means it was unset.
 read -r -p 'Current TabGoblin Viewer URL: ' previous_viewer_url
 printf '%s\n' "$previous_viewer_url" > "$backup_dir/plugin-viewer-url-before"
 chmod 600 "$backup_dir/plugin-viewer-url-before"
 printf 'Private backup directory: %s\n' "$backup_dir"
 ```
 
-Inspect `serve-status-before.json` before proceeding. If it shows an existing HTTPS
-handler on port 443, a path that would be replaced, or another conflicting route,
-stop and report it; do not overwrite it. If the same private endpoint is already
-configured, leave it alone and record that no Serve change was made.
+Inspect the complete saved JSON before proceeding:
+
+```bash
+jq . "$backup_dir/serve-status-before.json"
+```
+
+If it shows a different HTTPS handler on port 443, a path that would be replaced, or
+another conflicting route, stop and report it; do not overwrite it. If the same
+private endpoint is already configured, leave it alone, record that no Serve change
+was made, and skip the later Serve command.
 
 ### Align the gateway and plugin settings
 
@@ -137,7 +167,10 @@ Back up only this dedicated drop-in before replacing it; do not edit the main un
 other drop-ins:
 
 ```bash
-set -eu
+if [ -z "${origin:-}" ] || [ -z "${backup_dir:-}" ] || [ ! -d "$backup_dir" ]; then
+  printf '%s\n' 'Missing origin or private backup; restart this dedicated procedure.' >&2
+  exit 1
+fi
 dropin_dir="$HOME/.config/systemd/user/tabgoblin-gateway.service.d"
 dropin="$dropin_dir/50-tailscale-viewer.conf"
 if [ -e "$dropin" ]; then
@@ -169,6 +202,10 @@ With operator consent and only after confirming that no conflicting Serve endpoi
 exists, expose the existing loopback listener privately to the tailnet:
 
 ```bash
+if [ -z "${origin:-}" ] || [ -z "${backup_dir:-}" ] || [ ! -d "$backup_dir" ]; then
+  printf '%s\n' 'Missing origin or private backup; restart this dedicated procedure.' >&2
+  exit 1
+fi
 tailscale serve --bg --https=443 http://127.0.0.1:8931
 ```
 
@@ -179,20 +216,28 @@ that a phone or other tailnet client can reach the viewer. Keep certificate vali
 enabled.
 
 ```bash
+if [ -z "${origin:-}" ]; then
+  printf '%s\n' 'Missing origin; restart this dedicated procedure.' >&2
+  exit 1
+fi
 systemctl --user is-active tabgoblin-gateway.service
 systemctl --user show tabgoblin-gateway.service \
   --property=Environment --property=ActiveState
 curl --fail --show-error --max-time 20 http://127.0.0.1:8931/
 tailscale serve status --json
 curl --fail --show-error --max-time 20 "$origin/"
-ss -ltn | grep -E '(:8931|:9222|:5900)'
+ss -ltn | grep ':8931'
+podman ps --filter name=tabgoblin- --format '{{.Names}} {{.Ports}}'
 ```
 
 Inspect the service environment for `TABGOBLIN_VIEWER_ORIGIN=$origin`, the Serve JSON
-for the HTTPS port-443 proxy to `http://127.0.0.1:8931`, and `ss` output to ensure the
-internal gateway, CDP, and VNC listeners remain on loopback only. In the plugin panel,
-confirm the generated viewer link begins with the same `$origin`; do not publish a
-link containing a credential or pairing value.
+for the HTTPS port-443 proxy to `http://127.0.0.1:8931`, and the `ss` output to ensure
+the gateway's port 8931 listener is on loopback. Podman may choose ephemeral host ports
+for CDP and VNC, so do not assume 9222 or 5900 are host ports: every mapping printed by
+`podman ps` must bind `127.0.0.1`. If it prints no running `tabgoblin-` container, the
+browser transport bindings were not verified. In the plugin panel, confirm the
+generated viewer link begins with the same `$origin`; do not publish a link containing
+a credential or pairing value.
 
 ### Roll back only this deployment
 
@@ -201,7 +246,10 @@ through the plugin panel, changing no other plugin fields. Then restore the dedi
 drop-in and restart the gateway:
 
 ```bash
-set -eu
+if [ -z "${backup_dir:-}" ] || [ ! -d "$backup_dir" ]; then
+  printf '%s\n' 'Missing private backup; do not attempt rollback commands.' >&2
+  exit 1
+fi
 dropin_dir="$HOME/.config/systemd/user/tabgoblin-gateway.service.d"
 dropin="$dropin_dir/50-tailscale-viewer.conf"
 if [ -e "$backup_dir/50-tailscale-viewer.conf.before" ]; then
@@ -220,6 +268,10 @@ If port 443 had no Serve endpoint before this procedure, remove only the endpoin
 created here:
 
 ```bash
+if [ -z "${backup_dir:-}" ] || [ ! -f "$backup_dir/serve-status-before.json" ]; then
+  printf '%s\n' 'Missing saved Serve state; do not remove an endpoint.' >&2
+  exit 1
+fi
 tailscale serve --https=443 off
 ```
 

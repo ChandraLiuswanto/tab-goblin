@@ -76,40 +76,158 @@ This is an operator action; the build and smoke-test scripts never enable servic
 Confirm that the gateway itself listens only on loopback before exposing it through
 Tailscale.
 
-## Private Tailscale viewer (operator consent required)
+## Private Tailscale viewer (explicit operator consent required)
 
-Before changing Tailscale Serve, record the existing configuration:
+Tailscale Serve can terminate HTTPS for the viewer without making the gateway or
+browser transports public. Obtain explicit operator consent before making these
+persistent configuration changes. This procedure is for an operator; never use
+Tailscale Funnel, publish a raw gateway/browser port, change firewall rules, or reset
+unrelated Tailscale Serve or plugin settings.
+
+### Discover and record the intended origin
+
+Ask Tailscale for the local node's MagicDNS name rather than copying a hostname from
+another installation. `Self.DNSName` conventionally ends in a dot; remove that dot and
+use the resulting hostname with `https://` and **no trailing slash**:
 
 ```bash
-tailscale serve status
+set -eu
+command -v jq >/dev/null
+dns_name="$(tailscale status --json | jq -r '.Self.DNSName')"
+test -n "$dns_name" && test "$dns_name" != "null"
+host_name="${dns_name%.}"
+test -n "$host_name"
+origin="https://${host_name}"
+printf 'Viewer origin: %s\n' "$origin"
 ```
 
-**Before enabling Serve**, set the gateway's allowed and advertised viewer origin to
-the exact HTTPS MagicDNS URL that Tailscale will provide (replace the placeholder;
-do not include a trailing slash). This is required for the viewer's origin checks and
-must match the URL configured in the TabGoblin plugin connection settings.
+Before changing anything, create an owner-restricted backup directory. Record the
+existing Serve state and the currently configured plugin **Viewer URL** there (or in
+an equivalently private operator record). Do not record pairing codes, cookies, or
+other credentials.
 
 ```bash
-systemctl --user edit tabgoblin-gateway.service
-# Add this drop-in content:
-# [Service]
-# Environment=TABGOBLIN_VIEWER_ORIGIN=https://your-host.your-tailnet.ts.net
+set -eu
+backup_dir="$(mktemp -d)"
+chmod 700 "$backup_dir"
+tailscale serve status --json > "$backup_dir/serve-status-before.json"
+chmod 600 "$backup_dir/serve-status-before.json"
+printf '%s\n' "$origin" > "$backup_dir/intended-origin"
+chmod 600 "$backup_dir/intended-origin"
+# Copy the current Viewer URL shown in the plugin panel; blank means it was unset.
+read -r -p 'Current TabGoblin Viewer URL: ' previous_viewer_url
+printf '%s\n' "$previous_viewer_url" > "$backup_dir/plugin-viewer-url-before"
+chmod 600 "$backup_dir/plugin-viewer-url-before"
+printf 'Private backup directory: %s\n' "$backup_dir"
+```
+
+Inspect `serve-status-before.json` before proceeding. If it shows an existing HTTPS
+handler on port 443, a path that would be replaced, or another conflicting route,
+stop and report it; do not overwrite it. If the same private endpoint is already
+configured, leave it alone and record that no Serve change was made.
+
+### Align the gateway and plugin settings
+
+The gateway reads `TABGOBLIN_VIEWER_ORIGIN` as an exact allowed origin and retains its
+loopback origin as well. Therefore the gateway environment value and the plugin's
+**Viewer URL** must both equal `$origin` exactly—scheme and hostname included, with no
+trailing slash.
+
+Back up only this dedicated drop-in before replacing it; do not edit the main unit or
+other drop-ins:
+
+```bash
+set -eu
+dropin_dir="$HOME/.config/systemd/user/tabgoblin-gateway.service.d"
+dropin="$dropin_dir/50-tailscale-viewer.conf"
+if [ -e "$dropin" ]; then
+  cp -p "$dropin" "$backup_dir/50-tailscale-viewer.conf.before"
+else
+  : > "$backup_dir/50-tailscale-viewer.conf.was-absent"
+fi
+chmod 600 "$backup_dir"/50-tailscale-viewer.conf.*
+install -d -m 700 "$dropin_dir"
+cat > "$dropin" <<EOF
+[Service]
+Environment=TABGOBLIN_VIEWER_ORIGIN=$origin
+EOF
+chmod 600 "$dropin"
 systemctl --user daemon-reload
 systemctl --user restart tabgoblin-gateway.service
 ```
 
-In the TabGoblin plugin panel, set **Viewer URL** to that same
-`https://your-host.your-tailnet.ts.net` origin. Only with explicit operator consent,
-publish the loopback gateway privately to the tailnet:
+In the TabGoblin plugin panel, set **only** **Viewer URL** to `$origin`. Preserve the
+connection's socket path, pairing state, and every other setting. Do not edit a
+settings database or replace the whole plugin configuration. Confirm that the
+loopback gateway is listening before proceeding:
+
+```bash
+ss -ltn | grep ':8931'
+```
+
+With operator consent and only after confirming that no conflicting Serve endpoint
+exists, expose the existing loopback listener privately to the tailnet:
 
 ```bash
 tailscale serve --bg --https=443 http://127.0.0.1:8931
 ```
 
-Never run that command as an implementer or use Tailscale Funnel. To restore the
-previous configuration, use the saved `tailscale serve status` output and the
-operator-approved Tailscale Serve command appropriate to that prior configuration;
-do not guess or overwrite a deployment's existing Serve routes.
+### Validate the private deployment
+
+These checks confirm the local configuration and HTTPS response; they do not prove
+that a phone or other tailnet client can reach the viewer. Keep certificate validation
+enabled.
+
+```bash
+systemctl --user is-active tabgoblin-gateway.service
+systemctl --user show tabgoblin-gateway.service \
+  --property=Environment --property=ActiveState
+curl --fail --show-error --max-time 20 http://127.0.0.1:8931/
+tailscale serve status --json
+curl --fail --show-error --max-time 20 "$origin/"
+ss -ltn | grep -E '(:8931|:9222|:5900)'
+```
+
+Inspect the service environment for `TABGOBLIN_VIEWER_ORIGIN=$origin`, the Serve JSON
+for the HTTPS port-443 proxy to `http://127.0.0.1:8931`, and `ss` output to ensure the
+internal gateway, CDP, and VNC listeners remain on loopback only. In the plugin panel,
+confirm the generated viewer link begins with the same `$origin`; do not publish a
+link containing a credential or pairing value.
+
+### Roll back only this deployment
+
+Use the private backup created above. Restore the previous plugin **Viewer URL** first
+through the plugin panel, changing no other plugin fields. Then restore the dedicated
+drop-in and restart the gateway:
+
+```bash
+set -eu
+dropin_dir="$HOME/.config/systemd/user/tabgoblin-gateway.service.d"
+dropin="$dropin_dir/50-tailscale-viewer.conf"
+if [ -e "$backup_dir/50-tailscale-viewer.conf.before" ]; then
+  install -Dm600 "$backup_dir/50-tailscale-viewer.conf.before" "$dropin"
+elif [ -e "$backup_dir/50-tailscale-viewer.conf.was-absent" ]; then
+  rm -f "$dropin"
+else
+  printf '%s\n' 'Missing drop-in backup; stop and recover it manually.' >&2
+  exit 1
+fi
+systemctl --user daemon-reload
+systemctl --user restart tabgoblin-gateway.service
+```
+
+If port 443 had no Serve endpoint before this procedure, remove only the endpoint
+created here:
+
+```bash
+tailscale serve --https=443 off
+```
+
+If a port-443 endpoint existed before the procedure, it was a conflict and this
+procedure should have stopped before changing it. Preserve that prior configuration:
+do **not** run `off`, `tailscale serve reset`, or a broad saved-config restore. Report
+the conflict and use the recorded pre-change state to obtain an operator-approved,
+targeted recovery command if an earlier manual change must be undone.
 
 ## Profile-data warning
 

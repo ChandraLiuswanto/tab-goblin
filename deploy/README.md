@@ -92,12 +92,34 @@ do not use broad `sudo` changes to the user service or plugin configuration.
 The following command blocks deliberately share `origin` and `backup_dir`. Start a
 dedicated Bash session and run every subsequent block in **that same session**, in
 order. Do not paste the `set -euo pipefail` or `exit 1` guards into a regular
-interactive shell: a failed guard exits this dedicated shell, leaving the parent shell
-and the live configuration untouched. Start a fresh dedicated shell to retry.
+interactive shell: a failed mutation guard exits this dedicated shell, leaving the
+parent shell untouched.
 
 ```bash
 bash --noprofile --norc
 ```
+
+The first successful backup is the **original** state. If a later mutation fails,
+leaves the dedicated shell, or a diagnostic check fails, do not rerun the initial
+backup block: it would capture already-mutated state. Keep the printed private backup
+directory. In a new dedicated shell, rerun discovery only, then restore that original
+path before retrying a targeted step:
+
+```bash
+# Replace this with the original path printed by the initial backup block.
+backup_dir='/absolute/path/printed/earlier'
+if [ ! -f "$backup_dir/intended-origin" ] || [ ! -f "$backup_dir/serve-status-before.json" ]; then
+  printf '%s\n' 'Original backup is missing or incomplete; stop and recover manually.' >&2
+  exit 1
+fi
+if [ "$(cat "$backup_dir/intended-origin")" != "$origin" ]; then
+  printf '%s\n' 'Current DNS origin differs from the original backup; stop.' >&2
+  exit 1
+fi
+```
+
+If the initial backup itself fails before any mutation, treat its directory as
+incomplete and start the whole procedure again; do not treat it as an original backup.
 
 ### Discover and record the intended origin
 
@@ -131,6 +153,10 @@ pairing codes, cookies, or other credentials.
 ```bash
 if [ -z "${origin:-}" ]; then
   printf '%s\n' 'Missing origin; rerun discovery in this dedicated shell.' >&2
+  exit 1
+fi
+if [ -n "${backup_dir:-}" ]; then
+  printf '%s\n' 'An original backup is already selected; do not overwrite it.' >&2
   exit 1
 fi
 backup_dir="$(mktemp -d)"
@@ -195,7 +221,14 @@ settings database or replace the whole plugin configuration. Confirm that the
 loopback gateway is listening before proceeding:
 
 ```bash
+# This is diagnostic: preserve the session and original backup on failure.
+set +e
 ss -ltn | grep ':8931'
+listen_status=$?
+set -e
+if [ "$listen_status" -ne 0 ]; then
+  printf '%s\n' 'Gateway port 8931 is not listening; investigate before enabling Serve.' >&2
+fi
 ```
 
 With operator consent and only after confirming that no conflicting Serve endpoint
@@ -220,6 +253,8 @@ if [ -z "${origin:-}" ]; then
   printf '%s\n' 'Missing origin; restart this dedicated procedure.' >&2
   exit 1
 fi
+# These are diagnostics: preserve the session and original backup on failure.
+set +e
 systemctl --user is-active tabgoblin-gateway.service
 systemctl --user show tabgoblin-gateway.service \
   --property=Environment --property=ActiveState
@@ -228,7 +263,13 @@ tailscale serve status --json
 curl --fail --show-error --max-time 20 "$origin/"
 ss -ltn | grep ':8931'
 podman ps --filter name=tabgoblin- --format '{{.Names}} {{.Ports}}'
+set -e
 ```
+
+A nonzero diagnostic result is a failed check to investigate, not an expected success.
+First HTTPS certificate provisioning after enabling Serve can require waiting and
+retrying the HTTPS `curl` after `tailscale serve status --json` shows the endpoint; do
+not assume other service, listener, certificate, or transport failures are transient.
 
 Inspect the service environment for `TABGOBLIN_VIEWER_ORIGIN=$origin`, the Serve JSON
 for the HTTPS port-443 proxy to `http://127.0.0.1:8931`, and the `ss` output to ensure
